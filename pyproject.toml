@@ -12,6 +12,7 @@ dependencies = [
     "click>=8.2.1",
     "torch>=2.7.0",
     "torch-geometric>=2.6.1",
+    "torchdiffeq>=0.2.5",
     "torchvision>=0.22.0",
 ]
 
