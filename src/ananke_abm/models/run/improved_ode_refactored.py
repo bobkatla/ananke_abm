@@ -29,7 +29,7 @@ from ananke_abm.data_generator.mock_1p import Person, create_mock_zone_graph, cr
 
 SHARED_CONFIG = {
     # Training parameters
-    'epochs': 1000,  # Reduced for faster testing, can be increased
+    'epochs': 1000,  # Reduced for faster testing
     'learning_rate': 0.002,
     'weight_decay': 1e-5,
     'grad_clip_norm': 1.0,
@@ -430,6 +430,52 @@ def evaluate_best_models(results, training_data, config=None):
                 print(f"   ❌ Evaluation failed: {e}")
                 final_results[name] = None
     
+    # Print detailed path comparison table
+    print("\n" + "="*80)
+    print("📋 DETAILED PATH PREDICTIONS TABLE")
+    print("="*80)
+    
+    if final_results:
+        # Get the actual path (same for all models)
+        actual_path = None
+        for name, result in final_results.items():
+            if result and 'actual_path' in result:
+                actual_path = result['actual_path']
+                break
+        
+        if actual_path:
+            # Create header
+            print(f"{'Time':<6} {'Actual':<8}", end="")
+            model_names = [name for name, result in final_results.items() if result]
+            for name in model_names:
+                print(f"{name:<12}", end="")
+            print()  # New line
+            print("-" * (6 + 8 + 12 * len(model_names)))
+            
+            # Print each time step
+            for i, actual_zone in enumerate(actual_path):
+                time_val = times[i].item() if hasattr(times[i], 'item') else times[i]
+                print(f"{time_val:<6.1f} {actual_zone+1:<8}", end="")  # 1-indexed zones
+                
+                for name in model_names:
+                    result = final_results[name]
+                    if result and 'predicted_path' in result:
+                        pred_zone = result['predicted_path'][i]
+                        # Mark violations with *
+                        if i > 0:
+                            prev_pred = result['predicted_path'][i-1]
+                            if adjacency_matrix[prev_pred, pred_zone] == 0:
+                                print(f"{pred_zone+1}*{'':<10}", end="")  # 1-indexed with violation marker
+                            else:
+                                print(f"{pred_zone+1:<12}", end="")  # 1-indexed
+                        else:
+                            print(f"{pred_zone+1:<12}", end="")  # 1-indexed
+                    else:
+                        print(f"{'ERROR':<12}", end="")
+                print()  # New line
+            
+            print("\nLegend: * = Physics violation (invalid transition)")
+    
     return final_results
 
 # =============================================================================
@@ -457,7 +503,7 @@ def plot_comprehensive_comparison(results, final_results):
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     
-    # 2. Final comparison bar chart
+    # 2. Final comparison bar chart with ACCURACY VALUES ON TOP
     if final_results:
         valid_results = {k: v for k, v in final_results.items() if v is not None}
         names = list(valid_results.keys())
@@ -467,17 +513,24 @@ def plot_comprehensive_comparison(results, final_results):
         x = range(len(names))
         bars = ax2.bar(x, accuracies, color=[colors[i % len(colors)] for i in range(len(names))])
         
-        # Add violation annotations
-        for i, (acc, viol) in enumerate(zip(accuracies, violations)):
-            status = "✅" if viol == 0 else f"⚠️{viol}"
-            ax2.text(i, acc + 1, status, ha='center', va='bottom', fontsize=10, fontweight='bold')
+        # Add BOTH accuracy values AND violation status on top
+        for i, (acc, viol, bar) in enumerate(zip(accuracies, violations, bars)):
+            # Accuracy value on top
+            ax2.text(i, acc + 1.5, f'{acc:.1f}%', ha='center', va='bottom', 
+                    fontsize=11, fontweight='bold', color='black')
+            
+            # Violation status below accuracy
+            status = "✓" if viol == 0 else f"✗{viol}"
+            ax2.text(i, acc + 0.5, status, ha='center', va='bottom', 
+                    fontsize=10, fontweight='bold', 
+                    color='green' if viol == 0 else 'red')
         
         ax2.set_title('Final Model Comparison')
         ax2.set_xlabel('Model')
         ax2.set_ylabel('Accuracy (%)')
         ax2.set_xticks(x)
         ax2.set_xticklabels(names, rotation=45)
-        ax2.set_ylim(0, 100)
+        ax2.set_ylim(0, max(accuracies) + 10)  # Extra space for labels
         ax2.grid(True, alpha=0.3)
     
     # 3. Parameter efficiency
@@ -595,6 +648,13 @@ def main(show_graph=False, config=None):
         print(f"   ✅ {perfect_models}/{len(final_results)} models achieve zero violations")
         print(f"   📊 Models successfully demonstrate physics-constrained learning")
         print(f"   🎯 Best accuracy with perfect physics: {max([r['accuracy'] for r in final_results.values() if r and r['violations'] == 0]):.1%}")
+        
+        print(f"\n🔍 IMPORTANT NOTES:")
+        print(f"   📋 The predicted path table shows zone transitions (1-indexed)")
+        print(f"   ⚠️  '*' marks indicate physics violations (impossible transitions)")
+        print(f"   💾 'Strict Physics' may show violations during TRAINING but has zero in FINAL EVALUATION")
+        print(f"      because we save and load the BEST model (with zero violations) for final testing")
+        print(f"   📊 The top-right plot now shows exact accuracy percentages on top of bars")
         
     return results, final_results
 
