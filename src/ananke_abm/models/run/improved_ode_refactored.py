@@ -14,6 +14,8 @@ import matplotlib.pyplot as plt
 import tempfile
 import shutil
 from pathlib import Path
+import pandas as pd
+from datetime import datetime
 
 # Import all models from separated files
 from ananke_abm.models.gnn_embed import (
@@ -29,7 +31,7 @@ from ananke_abm.data_generator.mock_1p import Person, create_mock_zone_graph, cr
 
 SHARED_CONFIG = {
     # Training parameters
-    'epochs': 10000,  # Reduced for faster testing
+    'epochs': 15000,  # Reduced for faster testing
     'learning_rate': 0.002,
     'weight_decay': 1e-5,
     'grad_clip_norm': 1.0,
@@ -639,6 +641,7 @@ def main(show_graph=False, config=None):
     print("🎯 FINAL SUMMARY - BEST MODELS")
     print("="*80)
     
+    df_results = None
     if final_results:
         # Sort by accuracy (descending) then by violations (ascending)
         sorted_results = sorted(final_results.items(), 
@@ -649,6 +652,9 @@ def main(show_graph=False, config=None):
         print(f"{'Rank':<4} {'Model':<12} {'Accuracy':<10} {'Violations':<11} {'Parameters':<12} {'Status'}")
         print("-" * 80)
         
+        # Create DataFrame for CSV export
+        ranking_data = []
+        
         for rank, (name, result) in enumerate(sorted_results, 1):
             if result:
                 acc = result['accuracy']
@@ -657,6 +663,28 @@ def main(show_graph=False, config=None):
                 status = "🏆 PERFECT" if viol == 0 and acc > 0.8 else "✅ Good" if viol == 0 else "⚠️ Issues"
                 
                 print(f"{rank:<4} {name:<12} {acc:.3f}     {viol}/21       {params:<12,} {status}")
+                
+                # Add to DataFrame data
+                ranking_data.append({
+                    'Rank': rank,
+                    'Model': name,
+                    'Accuracy': acc,
+                    'Accuracy_Percent': acc * 100,
+                    'Violations': viol,
+                    'Total_Transitions': 21,
+                    'Violation_Rate': viol / 21,
+                    'Parameters': params,
+                    'Status': status.replace('🏆 ', '').replace('✅ ', '').replace('⚠️ ', ''),
+                    'Description': result.get('description', 'N/A')
+                })
+        
+        # Create DataFrame and save to CSV
+        df_results = pd.DataFrame(ranking_data)
+        csv_filename = f"model_comparison_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        df_results.to_csv(csv_filename, index=False)
+        
+        print(f"\n💾 Results saved to: {csv_filename}")
+        print(f"📊 DataFrame shape: {df_results.shape}")
         
         # Find the absolute best
         best_models = [name for name, result in final_results.items() 
@@ -685,8 +713,8 @@ def main(show_graph=False, config=None):
         print(f"      because we save and load the BEST model (with zero violations) for final testing")
         print(f"   📊 The top-right plot now shows exact accuracy percentages on top of bars")
         
-    return results, final_results
+    return results, final_results, df_results
 
 if __name__ == "__main__":
     # Run comprehensive evaluation
-    results, final_results = main(show_graph=False, config=SHARED_CONFIG) 
+    results, final_results, df_results = main(show_graph=False, config=SHARED_CONFIG) 
