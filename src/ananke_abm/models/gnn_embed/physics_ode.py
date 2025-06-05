@@ -44,6 +44,9 @@ class PhysicsInformedODE(nn.Module):
             nn.Linear(32, embedding_dim)  # Desired velocity vector
         )
         
+        # Zone prediction layer (for standalone use)
+        self.zone_predictor = nn.Linear(embedding_dim, num_zones)
+        
         # Graph constraints
         self.adjacency_matrix = None
         self.person_attrs = None
@@ -86,8 +89,23 @@ class PhysicsInformedODE(nn.Module):
         
         return torch.stack(directions) if directions else torch.zeros(1, self.embedding_dim)
     
-    def forward(self, t, state):
-        """Compute physics-informed velocity: smooth flow along graph edges"""
+    def forward(self, t_or_person_attrs, state_or_times=None, zone_features=None, edge_index=None):
+        """
+        Overloaded forward method:
+        - For ODE: forward(t, state) -> velocity
+        - For standalone: forward(person_attrs, times, zone_features, edge_index) -> (logits, None)
+        """
+        
+        # Check if this is ODE usage (2 args) or standalone usage (4 args)
+        if state_or_times is not None and zone_features is None and edge_index is None:
+            # ODE usage: forward(t, state)
+            return self._ode_forward(t_or_person_attrs, state_or_times)
+        else:
+            # Standalone usage: forward(person_attrs, times, zone_features, edge_index)
+            return self._standalone_forward(t_or_person_attrs, state_or_times, zone_features, edge_index)
+    
+    def _ode_forward(self, t, state):
+        """Original ODE forward method"""
         
         # Handle time
         if isinstance(t, torch.Tensor):
@@ -127,6 +145,45 @@ class PhysicsInformedODE(nn.Module):
         constrained_velocity = constrained_velocity * 0.5
         
         return constrained_velocity
+
+    def _standalone_forward(self, person_attrs, times, zone_features, edge_index):
+        """Standalone prediction method for direct training"""
+        
+        # Set graph data
+        self.set_graph_data(zone_features, edge_index, person_attrs)
+        
+        # Simple approach: use neural network to predict zones directly
+        predictions = []
+        current_zone = 0  # Start at home
+        
+        for i, time in enumerate(times):
+            # Get current zone embedding (to match ODE input size)
+            current_zone_embedding = self.zone_embeddings[current_zone]
+            
+            # Encode time and person
+            t_tensor = torch.tensor([[time.item()]], dtype=torch.float32)
+            t_encoded = self.time_encoder(t_tensor).squeeze(0)
+            person_encoded = self.person_encoder(person_attrs)
+            
+            # Combine inputs - matching ODE format: [state + person + time] = [64 + 64 + 16] = 144
+            combined_input = torch.cat([current_zone_embedding, person_encoded, t_encoded])
+            
+            # Predict zone logits using flow network
+            embedding = self.flow_net(combined_input.unsqueeze(0)).squeeze(0)
+            zone_logits = self.zone_predictor(embedding)
+            
+            # Apply physics constraints (soft)
+            adjacency_row = self.adjacency_matrix[current_zone] 
+            penalty = 10.0
+            constrained_logits = zone_logits - penalty * (1 - adjacency_row)
+            
+            predictions.append(constrained_logits)
+            
+            # Update current zone for next prediction
+            current_zone = torch.argmax(constrained_logits).item()
+        
+        zone_logits = torch.stack(predictions)
+        return zone_logits, None
 
 class SmoothTrajectoryPredictor(nn.Module):
     """Predicts smooth trajectories that respect graph physics"""

@@ -29,7 +29,7 @@ from ananke_abm.data_generator.mock_1p import Person, create_mock_zone_graph, cr
 
 SHARED_CONFIG = {
     # Training parameters
-    'epochs': 1000,  # Reduced for faster testing
+    'epochs': 10000,  # Reduced for faster testing
     'learning_rate': 0.002,
     'weight_decay': 1e-5,
     'grad_clip_norm': 1.0,
@@ -80,13 +80,18 @@ def safe_model_save(model, filepath):
 
 def load_best_model(model_class, filepath, **model_kwargs):
     """Load the best saved model"""
-    model = model_class(**model_kwargs)
+    if model_class == SmoothTrajectoryPredictor:
+        # SmoothTrajectoryPredictor needs an ODE function
+        ode_func = PhysicsInformedODE(**model_kwargs)
+        model = model_class(ode_func, num_zones=model_kwargs['num_zones'])
+    else:
+        model = model_class(**model_kwargs)
+        
     if Path(filepath).exists():
         model.load_state_dict(torch.load(filepath))
-        print(f"✅ Loaded best model from {filepath}")
+        return model
     else:
-        print(f"⚠️  No saved model found at {filepath}, using untrained model")
-    return model
+        return None
 
 class BestModelTracker:
     """Track and save best models during training"""
@@ -275,6 +280,16 @@ def compare_all_models(training_data, config=None):
     # Define all models to compare
     models_to_test = [
         {
+            'name': 'PhysicsODE',
+            'class': PhysicsInformedODE,
+            'description': 'Continuous ODE dynamics'
+        },
+        # {
+        #     'name': 'TrajectoryODE',
+        #     'class': SmoothTrajectoryPredictor,
+        #     'description': 'ODE with trajectory prediction'
+        # },
+        {
             'name': 'Diffusion',
             'class': SimplifiedDiffusionModel,
             'description': 'Soft constraints with penalty'
@@ -314,10 +329,18 @@ def compare_all_models(training_data, config=None):
         print(f"{'='*60}")
         
         # Create model instance
-        model = model_class(
-            person_attrs_dim=config['person_attrs_dim'],
-            num_zones=config['num_zones']
-        )
+        if model_class == SmoothTrajectoryPredictor:
+            # SmoothTrajectoryPredictor needs an ODE function
+            ode_func = PhysicsInformedODE(
+                person_attrs_dim=config['person_attrs_dim'],
+                num_zones=config['num_zones']
+            )
+            model = model_class(ode_func, num_zones=config['num_zones'])
+        else:
+            model = model_class(
+                person_attrs_dim=config['person_attrs_dim'],
+                num_zones=config['num_zones']
+            )
         
         # Train model
         history, tracker = train_model_with_shared_config(model, name, training_data, config)
@@ -380,6 +403,12 @@ def evaluate_best_models(results, training_data, config=None):
             person_attrs_dim=config['person_attrs_dim'],
             num_zones=config['num_zones']
         )
+        
+        if model is None:
+            print(f"   ❌ Model file not found: {result['best_model_path']}")
+            final_results[name] = None
+            continue
+            
         model.eval()
         
         with torch.no_grad():
@@ -487,7 +516,7 @@ def plot_comprehensive_comparison(results, final_results):
     
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
     
-    colors = ['blue', 'green', 'red', 'orange', 'purple', 'brown']
+    colors = ['blue', 'green', 'red', 'orange', 'purple', 'brown', 'pink']
     
     # 1. Training accuracy curves
     for i, (name, result) in enumerate(results.items()):
