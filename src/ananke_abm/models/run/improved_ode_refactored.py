@@ -21,7 +21,8 @@ from datetime import datetime
 from ananke_abm.models.gnn_embed import (
     PhysicsInformedODE, SmoothTrajectoryPredictor,
     ImprovedStrictPhysicsModel, SimplifiedDiffusionModel,
-    HybridPhysicsModel, CurriculumPhysicsModel, EnsemblePhysicsModel
+    HybridPhysicsModel, CurriculumPhysicsModel, EnsemblePhysicsModel,
+    PhysicsDiffusionTrajectoryPredictor
 )
 from ananke_abm.data_generator.mock_1p import Person, create_mock_zone_graph, create_sarah_daily_pattern, create_training_data
 
@@ -31,7 +32,7 @@ from ananke_abm.data_generator.mock_1p import Person, create_mock_zone_graph, cr
 
 SHARED_CONFIG = {
     # Training parameters
-    'epochs': 15000,  # Reduced for faster testing
+    'epochs': 10000,  # Reduced for faster testing
     'learning_rate': 0.002,
     'weight_decay': 1e-5,
     'grad_clip_norm': 1.0,
@@ -86,6 +87,9 @@ def load_best_model(model_class, filepath, **model_kwargs):
         # SmoothTrajectoryPredictor needs an ODE function
         ode_func = PhysicsInformedODE(**model_kwargs)
         model = model_class(ode_func, num_zones=model_kwargs['num_zones'])
+    elif model_class == PhysicsDiffusionTrajectoryPredictor:
+        # PhysicsDiffusionTrajectoryPredictor has specific constructor
+        model = model_class(**model_kwargs)
     else:
         model = model_class(**model_kwargs)
         
@@ -224,7 +228,8 @@ def train_model_with_shared_config(model, model_name, training_data, config=None
                     if hasattr(model, 'forward') and 'training' in model.forward.__code__.co_varnames:
                         eval_logits, _ = model(person_attrs, times, zone_features, edge_index, training=False)
                     else:
-                        eval_logits = zone_logits
+                        # Always do a fresh evaluation pass, never reuse training logits!
+                        eval_logits, _ = model(person_attrs, times, zone_features, edge_index)
                     
                     predicted_zones = torch.argmax(eval_logits, dim=1)
                     accuracy = torch.mean((predicted_zones == zone_targets).float()).item()
@@ -306,15 +311,20 @@ def compare_all_models(training_data, config=None):
             'class': HybridPhysicsModel, 
             'description': 'Soft training + hard inference'
         },
+        # {
+        #     'name': 'Curriculum',
+        #     'class': CurriculumPhysicsModel,
+        #     'description': 'Progressive constraint hardening'
+        # },
+        # {
+        #     'name': 'Ensemble',
+        #     'class': EnsemblePhysicsModel,
+        #     'description': 'Combined soft + hard predictions'
+        # },
         {
-            'name': 'Curriculum',
-            'class': CurriculumPhysicsModel,
-            'description': 'Progressive constraint hardening'
-        },
-        {
-            'name': 'Ensemble',
-            'class': EnsemblePhysicsModel,
-            'description': 'Combined soft + hard predictions'
+            'name': 'DiffusionODE',
+            'class': PhysicsDiffusionTrajectoryPredictor,
+            'description': 'Physics-constrained diffusion with ODE dynamics'
         }
     ]
     
@@ -338,6 +348,14 @@ def compare_all_models(training_data, config=None):
                 num_zones=config['num_zones']
             )
             model = model_class(ode_func, num_zones=config['num_zones'])
+        elif model_class == PhysicsDiffusionTrajectoryPredictor:
+            # PhysicsDiffusionTrajectoryPredictor has different parameter names
+            model = model_class(
+                person_attrs_dim=config['person_attrs_dim'],
+                num_zones=config['num_zones'],
+                embedding_dim=64,
+                diffusion_strength=0.2
+            )
         else:
             model = model_class(
                 person_attrs_dim=config['person_attrs_dim'],
@@ -399,12 +417,22 @@ def evaluate_best_models(results, training_data, config=None):
         print(f"\n📈 Evaluating {name} (Best Model)...")
         
         # Load best model
-        model = load_best_model(
-            result['model_class'], 
-            result['best_model_path'],
-            person_attrs_dim=config['person_attrs_dim'],
-            num_zones=config['num_zones']
-        )
+        if result['model_class'] == PhysicsDiffusionTrajectoryPredictor:
+            model = load_best_model(
+                result['model_class'], 
+                result['best_model_path'],
+                person_attrs_dim=config['person_attrs_dim'],
+                num_zones=config['num_zones'],
+                embedding_dim=64,
+                diffusion_strength=0.2
+            )
+        else:
+            model = load_best_model(
+                result['model_class'], 
+                result['best_model_path'],
+                person_attrs_dim=config['person_attrs_dim'],
+                num_zones=config['num_zones']
+            )
         
         if model is None:
             print(f"   ❌ Model file not found: {result['best_model_path']}")
