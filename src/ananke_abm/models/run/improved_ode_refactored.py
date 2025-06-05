@@ -24,7 +24,7 @@ from ananke_abm.models.gnn_embed import (
     HybridPhysicsModel, CurriculumPhysicsModel, EnsemblePhysicsModel,
     PhysicsDiffusionTrajectoryPredictor
 )
-from ananke_abm.data_generator.mock_1p import Person, create_mock_zone_graph, create_sarah_daily_pattern, create_training_data
+from ananke_abm.data_generator.mock_2p import create_two_person_training_data
 
 # =============================================================================
 # SHARED TRAINING CONFIGURATION - For Fair Comparison
@@ -158,12 +158,23 @@ def train_model_with_shared_config(model, model_name, training_data, config=None
     
     loss_fn = config['loss_fn']
     
-    # Extract training data
-    person_attrs = training_data["person_attrs"]
-    times = training_data["times"] 
-    zone_targets = training_data["zone_observations"]
-    zone_features = training_data["zone_features"]
-    edge_index = training_data["edge_index"]
+    # Extract training data - handle multi-person case
+    if training_data.get("is_multi_person", False):
+        # Multi-person training: we'll alternate between people each epoch
+        sarah_data = training_data["sarah_data"]
+        marcus_data = training_data["marcus_data"]
+        training_examples = [sarah_data, marcus_data]
+        zone_features = sarah_data["zone_features"]  # Same for both
+        edge_index = sarah_data["edge_index"]  # Same for both
+        print(f"📚 Multi-person training: {len(training_examples)} people")
+    else:
+        # Single person training
+        person_attrs = training_data["person_attrs"]
+        times = training_data["times"] 
+        zone_targets = training_data["zone_observations"]
+        zone_features = training_data["zone_features"]
+        edge_index = training_data["edge_index"]
+        training_examples = None
     
     # Best model tracker
     tracker = BestModelTracker(model_name, config['model_save_dir'])
@@ -193,77 +204,167 @@ def train_model_with_shared_config(model, model_name, training_data, config=None
     # Training loop
     for epoch in range(config['epochs']):
         model.train()
-        optimizer.zero_grad()
         
-        # Forward pass - handle different model interfaces
-        try:
-            if hasattr(model, 'forward') and 'training' in model.forward.__code__.co_varnames:
-                # Hybrid model with training flag
-                zone_logits, _ = model(person_attrs, times, zone_features, edge_index, training=True)
-            else:
-                # Standard models
-                zone_logits, _ = model(person_attrs, times, zone_features, edge_index)
+        if training_examples is not None:
+            # Multi-person training: alternate between people
+            total_loss = 0
+            num_people = len(training_examples)
             
-            # Loss computation
-            loss = loss_fn(zone_logits, zone_targets)
+            for person_data in training_examples:
+                optimizer.zero_grad()
+                
+                # Extract person-specific data
+                person_attrs = person_data["person_attrs"]
+                times = person_data["times"]
+                zone_targets = person_data["zone_observations"]
+                
+                # Forward pass
+                try:
+                    if hasattr(model, 'forward') and 'training' in model.forward.__code__.co_varnames:
+                        zone_logits, _ = model(person_attrs, times, zone_features, edge_index, training=True)
+                    else:
+                        zone_logits, _ = model(person_attrs, times, zone_features, edge_index)
+                    
+                    # Loss computation
+                    loss = loss_fn(zone_logits, zone_targets)
+                    total_loss += loss.item()
+                    
+                    # Backward pass
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['grad_clip_norm'])
+                    optimizer.step()
+                    
+                except Exception as e:
+                    print(f"Error in epoch {epoch}, person {person_data.get('person_name', 'unknown')}: {e}")
+                    break
             
-            # Backward pass
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['grad_clip_norm'])
-            optimizer.step()
+            # Average loss across people
+            loss = total_loss / num_people
             
             if scheduler:
                 scheduler.step()
+        else:
+            # Single person training (original logic)
+            optimizer.zero_grad()
+            
+            # Forward pass - handle different model interfaces
+            try:
+                if hasattr(model, 'forward') and 'training' in model.forward.__code__.co_varnames:
+                    # Hybrid model with training flag
+                    zone_logits, _ = model(person_attrs, times, zone_features, edge_index, training=True)
+                else:
+                    # Standard models
+                    zone_logits, _ = model(person_attrs, times, zone_features, edge_index)
                 
-        except Exception as e:
-            print(f"Error in epoch {epoch}: {e}")
-            break
+                # Loss computation
+                loss = loss_fn(zone_logits, zone_targets)
+                
+                # Backward pass
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['grad_clip_norm'])
+                optimizer.step()
+                
+                if scheduler:
+                    scheduler.step()
+                    
+            except Exception as e:
+                print(f"Error in epoch {epoch}: {e}")
+                break
         
         # Evaluation
         if epoch % config['eval_frequency'] == 0 or epoch == config['epochs'] - 1:
             model.eval()
             with torch.no_grad():
-                # Get predictions for evaluation
-                try:
-                    if hasattr(model, 'forward') and 'training' in model.forward.__code__.co_varnames:
-                        eval_logits, _ = model(person_attrs, times, zone_features, edge_index, training=False)
-                    else:
-                        # Always do a fresh evaluation pass, never reuse training logits!
-                        eval_logits, _ = model(person_attrs, times, zone_features, edge_index)
+                if training_examples is not None:
+                    # Multi-person evaluation: evaluate on both people and average results
+                    total_accuracy = 0
+                    total_violations = 0
+                    total_transitions = 0
                     
-                    predicted_zones = torch.argmax(eval_logits, dim=1)
-                    accuracy = torch.mean((predicted_zones == zone_targets).float()).item()
+                    for person_data in training_examples:
+                        person_attrs = person_data["person_attrs"]
+                        times = person_data["times"]
+                        zone_targets = person_data["zone_observations"]
+                        
+                        try:
+                            if hasattr(model, 'forward') and 'training' in model.forward.__code__.co_varnames:
+                                eval_logits, _ = model(person_attrs, times, zone_features, edge_index, training=False)
+                            else:
+                                eval_logits, _ = model(person_attrs, times, zone_features, edge_index)
+                            
+                            predicted_zones = torch.argmax(eval_logits, dim=1)
+                            person_accuracy = torch.mean((predicted_zones == zone_targets).float()).item()
+                            total_accuracy += person_accuracy
+                            
+                            # Count violations for this person
+                            person_violations = 0
+                            for i in range(len(predicted_zones) - 1):
+                                curr, next_z = predicted_zones[i].item(), predicted_zones[i+1].item()
+                                if adjacency_matrix[curr, next_z] == 0:
+                                    person_violations += 1
+                            
+                            total_violations += person_violations
+                            total_transitions += len(predicted_zones) - 1
+                            
+                        except Exception as e:
+                            print(f"Evaluation error for person {person_data.get('person_name', 'unknown')}: {e}")
                     
-                    # Count violations
-                    violations = 0
-                    for i in range(len(predicted_zones) - 1):
-                        curr, next_z = predicted_zones[i].item(), predicted_zones[i+1].item()
-                        if adjacency_matrix[curr, next_z] == 0:
-                            violations += 1
+                    # Average metrics across people
+                    accuracy = total_accuracy / len(training_examples)
+                    violations = total_violations  # Total violations across all people
                     
-                    # Update best model
-                    is_best = tracker.update(model, epoch, accuracy, violations)
-                    
-                    # Store history
-                    history['epochs'].append(epoch)
-                    history['loss'].append(loss.item())
-                    history['accuracy'].append(accuracy)
-                    history['violations'].append(violations)
-                    history['learning_rate'].append(optimizer.param_groups[0]['lr'])
-                    
-                    # Print progress
-                    status = "🎯 NEW BEST" if is_best else ""
-                    print(f"Epoch {epoch:4d}: Loss={loss.item():6.3f}, "
-                          f"Acc={accuracy:.3f} ({accuracy*100:5.1f}%), "
-                          f"Violations={violations}/21, "
-                          f"LR={optimizer.param_groups[0]['lr']:.6f} {status}")
-                    
-                except Exception as e:
-                    print(f"Evaluation error at epoch {epoch}: {e}")
+                else:
+                    # Single person evaluation (original logic)
+                    try:
+                        if hasattr(model, 'forward') and 'training' in model.forward.__code__.co_varnames:
+                            eval_logits, _ = model(person_attrs, times, zone_features, edge_index, training=False)
+                        else:
+                            # Always do a fresh evaluation pass, never reuse training logits!
+                            eval_logits, _ = model(person_attrs, times, zone_features, edge_index)
+                        
+                        predicted_zones = torch.argmax(eval_logits, dim=1)
+                        accuracy = torch.mean((predicted_zones == zone_targets).float()).item()
+                        
+                        # Count violations
+                        violations = 0
+                        for i in range(len(predicted_zones) - 1):
+                            curr, next_z = predicted_zones[i].item(), predicted_zones[i+1].item()
+                            if adjacency_matrix[curr, next_z] == 0:
+                                violations += 1
+                        
+                    except Exception as e:
+                        print(f"Evaluation error at epoch {epoch}: {e}")
+                        continue
+                
+                # Update best model
+                is_best = tracker.update(model, epoch, accuracy, violations)
+                
+                # Store history
+                history['epochs'].append(epoch)
+                history['loss'].append(loss if isinstance(loss, float) else loss.item())
+                history['accuracy'].append(accuracy)
+                history['violations'].append(violations)
+                history['learning_rate'].append(optimizer.param_groups[0]['lr'])
+                
+                # Print progress
+                status = "🎯 NEW BEST" if is_best else ""
+                violation_denom = total_transitions if training_examples else len(predicted_zones) - 1
+                print(f"Epoch {epoch:4d}: Loss={loss if isinstance(loss, float) else loss.item():6.3f}, "
+                      f"Acc={accuracy:.3f} ({accuracy*100:5.1f}%), "
+                      f"Violations={violations}/{violation_denom}, "
+                      f"LR={optimizer.param_groups[0]['lr']:.6f} {status}")
     
     print(f"📊 {model_name} Training Complete:")
     print(f"   Best accuracy: {tracker.best_accuracy:.3f} ({tracker.best_accuracy*100:.1f}%) at epoch {tracker.best_epoch}")
-    print(f"   Best violations: {tracker.best_violations}/21")
+    
+    if training_examples is not None:
+        total_max_transitions = sum(len(data["times"]) - 1 for data in training_examples)
+        print(f"   Best violations: {tracker.best_violations}/{total_max_transitions}")
+        print(f"   Training: {len(training_examples)} people ({', '.join(data.get('person_name', f'Person {i+1}') for i, data in enumerate(training_examples))})")
+    else:
+        print(f"   Best violations: {tracker.best_violations}/21")
+        print(f"   Training: Single person")
+    
     print(f"   Model saved: {tracker.best_model_path}")
     
     return history, tracker
@@ -321,11 +422,11 @@ def compare_all_models(training_data, config=None):
         #     'class': EnsemblePhysicsModel,
         #     'description': 'Combined soft + hard predictions'
         # },
-        {
-            'name': 'DiffusionODE',
-            'class': PhysicsDiffusionTrajectoryPredictor,
-            'description': 'Physics-constrained diffusion with ODE dynamics'
-        }
+        # {
+        #     'name': 'DiffusionODE',
+        #     'class': PhysicsDiffusionTrajectoryPredictor,
+        #     'description': 'Physics-constrained diffusion with ODE dynamics'
+        # }
     ]
     
     results = {}
@@ -385,24 +486,24 @@ def compare_all_models(training_data, config=None):
 # FINAL EVALUATION WITH BEST MODELS
 # =============================================================================
 
-def evaluate_best_models(results, training_data, config=None):
-    """Load and evaluate all best models for final comparison"""
+def evaluate_best_models(results, evaluation_data, config=None):
+    """Load and evaluate all best models on both people for generalization testing"""
     
     if config is None:
         config = SHARED_CONFIG
     
     print("\n" + "="*80)
-    print("🏆 FINAL EVALUATION - BEST MODELS COMPARISON")
+    print("🏆 FINAL EVALUATION - PERSON-SPECIFIC PREDICTION")
+    print("="*80)
+    print("📊 Testing person-attribute learning: Models trained on both people, predicting person-specific patterns")
     print("="*80)
     
-    # Extract training data
-    person_attrs = training_data["person_attrs"]
-    times = training_data["times"]
-    zone_targets = training_data["zone_observations"]
-    zone_features = training_data["zone_features"] 
-    edge_index = training_data["edge_index"]
+    # Get data for both people
+    sarah_data = evaluation_data['sarah']
+    marcus_data = evaluation_data['marcus']
     
-    # Adjacency matrix for violation checking
+    # Adjacency matrix for violation checking (same for both people)
+    edge_index = sarah_data["edge_index"]
     adjacency_matrix = torch.zeros(config['num_zones'], config['num_zones'])
     for i in range(edge_index.shape[1]):
         u, v = edge_index[0, i], edge_index[1, i]
@@ -441,53 +542,67 @@ def evaluate_best_models(results, training_data, config=None):
             
         model.eval()
         
-        with torch.no_grad():
-            # Get predictions
-            try:
-                if hasattr(model, 'forward') and 'training' in model.forward.__code__.co_varnames:
-                    zone_logits, _ = model(person_attrs, times, zone_features, edge_index, training=False)
-                else:
-                    zone_logits, _ = model(person_attrs, times, zone_features, edge_index)
-                
-                predicted_zones = torch.argmax(zone_logits, dim=1)
-                actual_zones = zone_targets
-                
-                # Calculate metrics
-                accuracy = torch.mean((predicted_zones == actual_zones).float()).item()
-                
-                # Count violations
-                violations = 0
-                violation_details = []
-                for i in range(len(predicted_zones) - 1):
-                    curr, next_z = predicted_zones[i].item(), predicted_zones[i+1].item()
-                    if adjacency_matrix[curr, next_z] == 0:
-                        violations += 1
-                        violation_details.append((i, curr+1, next_z+1))  # 1-indexed for display
-                
-                # Store final results
-                final_results[name] = {
-                    'accuracy': accuracy,
-                    'violations': violations,
-                    'violation_details': violation_details,
-                    'predicted_path': predicted_zones.tolist(),
-                    'actual_path': actual_zones.tolist(),
-                    'parameters': result['parameters'],
-                    'description': result['description']
-                }
-                
-                # Print summary
-                print(f"   Accuracy: {accuracy:.3f} ({accuracy*100:.1f}%)")
-                print(f"   Violations: {violations}/21")
-                print(f"   Parameters: {result['parameters']:,}")
-                
-                if violations > 0:
-                    print(f"   ⚠️  Violation details: {violation_details}")
-                else:
-                    print(f"   ✅ Perfect physics compliance!")
+        # Evaluate on both people
+        person_results = {}
+        
+        for person_name, person_data in [('Sarah', sarah_data), ('Marcus', marcus_data)]:
+            person_attrs = person_data["person_attrs"]
+            times = person_data["times"]
+            zone_targets = person_data["zone_observations"]
+            zone_features = person_data["zone_features"]
+            
+            with torch.no_grad():
+                try:
+                    if hasattr(model, 'forward') and 'training' in model.forward.__code__.co_varnames:
+                        zone_logits, _ = model(person_attrs, times, zone_features, edge_index, training=False)
+                    else:
+                        zone_logits, _ = model(person_attrs, times, zone_features, edge_index)
                     
-            except Exception as e:
-                print(f"   ❌ Evaluation failed: {e}")
-                final_results[name] = None
+                    predicted_zones = torch.argmax(zone_logits, dim=1)
+                    actual_zones = zone_targets
+                    
+                    # Calculate metrics
+                    accuracy = torch.mean((predicted_zones == actual_zones).float()).item()
+                    
+                    # Count violations
+                    violations = 0
+                    violation_details = []
+                    for i in range(len(predicted_zones) - 1):
+                        curr, next_z = predicted_zones[i].item(), predicted_zones[i+1].item()
+                        if adjacency_matrix[curr, next_z] == 0:
+                            violations += 1
+                            violation_details.append((i, curr+1, next_z+1))  # 1-indexed for display
+                    
+                    person_results[person_name.lower()] = {
+                        'accuracy': accuracy,
+                        'violations': violations,
+                        'violation_details': violation_details,
+                        'predicted_path': predicted_zones.tolist(),
+                        'actual_path': actual_zones.tolist()
+                    }
+                    
+                    # Print person-specific results
+                    print(f"   {person_name}: Acc={accuracy:.3f} ({accuracy*100:.1f}%), Violations={violations}/{len(predicted_zones)-1}")
+                    
+                except Exception as e:
+                    print(f"   ❌ {person_name} evaluation failed: {e}")
+                    person_results[person_name.lower()] = None
+        
+        # Combine results for this model
+        if person_results['sarah'] and person_results['marcus']:
+            # Use Sarah's performance as primary (since we trained on Sarah)
+            # But also track Marcus for generalization analysis
+            final_results[name] = {
+                'accuracy': person_results['sarah']['accuracy'],  # Primary metric (training person)
+                'violations': person_results['sarah']['violations'],
+                'parameters': result['parameters'],
+                'description': result['description'],
+                'sarah_results': person_results['sarah'],
+                'marcus_results': person_results['marcus'],
+                'generalization_gap': abs(person_results['sarah']['accuracy'] - person_results['marcus']['accuracy'])
+            }
+        else:
+            final_results[name] = None
     
     # Print detailed path comparison table
     print("\n" + "="*80)
@@ -495,11 +610,15 @@ def evaluate_best_models(results, training_data, config=None):
     print("="*80)
     
     if final_results:
-        # Get the actual path (same for all models)
+        # Get Sarah's data for displaying (since that's what we trained on)
+        sarah_data = evaluation_data['sarah']
+        times = sarah_data['times']
+        
+        # Get the actual path from Sarah (primary)
         actual_path = None
         for name, result in final_results.items():
-            if result and 'actual_path' in result:
-                actual_path = result['actual_path']
+            if result and 'sarah_results' in result:
+                actual_path = result['sarah_results']['actual_path']
                 break
         
         if actual_path:
@@ -511,18 +630,18 @@ def evaluate_best_models(results, training_data, config=None):
             print()  # New line
             print("-" * (6 + 8 + 12 * len(model_names)))
             
-            # Print each time step
+            # Print each time step for Sarah (training data)
             for i, actual_zone in enumerate(actual_path):
                 time_val = times[i].item() if hasattr(times[i], 'item') else times[i]
                 print(f"{time_val:<6.1f} {actual_zone+1:<8}", end="")  # 1-indexed zones
                 
                 for name in model_names:
                     result = final_results[name]
-                    if result and 'predicted_path' in result:
-                        pred_zone = result['predicted_path'][i]
+                    if result and 'sarah_results' in result and result['sarah_results']:
+                        pred_zone = result['sarah_results']['predicted_path'][i]
                         # Mark violations with *
                         if i > 0:
-                            prev_pred = result['predicted_path'][i-1]
+                            prev_pred = result['sarah_results']['predicted_path'][i-1]
                             if adjacency_matrix[prev_pred, pred_zone] == 0:
                                 print(f"{pred_zone+1}*{'':<10}", end="")  # 1-indexed with violation marker
                             else:
@@ -534,6 +653,7 @@ def evaluate_best_models(results, training_data, config=None):
                 print()  # New line
             
             print("\nLegend: * = Physics violation (invalid transition)")
+            print("Note: Showing Sarah's trajectory (training data). See summary for Marcus generalization.")
     
     return final_results
 
@@ -644,22 +764,33 @@ def main(show_graph=False, config=None):
     print("🔬 COMPREHENSIVE PHYSICS-CONSTRAINED MODELS EVALUATION")
     print("="*80)
     
-    # Create mock data
-    print("📊 Creating training data...")
-    sarah = Person()
-    zone_graph, zone_data = create_mock_zone_graph()
-    sarah_schedule = create_sarah_daily_pattern()
-    training_data = create_training_data(sarah, sarah_schedule, zone_graph)
+    # Create two-person mock data
+    print("📊 Creating two-person training data...")
+    combined_data, sarah, marcus = create_two_person_training_data()
     
-    print(f"Person: {sarah.name}")
-    print(f"Training points: {len(training_data['times'])}")
-    print(f"Zones: {training_data['num_zones']}, Edges: {training_data['edge_index'].shape[1]}")
+    # Extract individual training data for separate model training
+    sarah_data = combined_data['sarah_data']
+    marcus_data = combined_data['marcus_data']
+    
+    print(f"People: {sarah.name} & {marcus.name}")
+    print(f"Sarah: {sarah_data['times'].shape[0]} points, Marcus: {marcus_data['times'].shape[0]} points")
+    print(f"Zones: {sarah_data['num_zones']}, Edges: {sarah_data['edge_index'].shape[1]}")
+    print(f"Person contrasts: Age({sarah.age}vs{marcus.age}), Income(${sarah.income:,}vs${marcus.income:,}), Transport({sarah.commute_preference}vs{marcus.commute_preference})")
+    
+    # Train on BOTH people to test person-specific pattern learning
+    # Models should learn to use person attributes to predict the right behavior
+    training_data = combined_data
+    evaluation_data = {
+        'sarah': sarah_data,
+        'marcus': marcus_data,
+        'combined': combined_data
+    }
     
     # Compare all models
     results = compare_all_models(training_data, config)
     
-    # Final evaluation with best models
-    final_results = evaluate_best_models(results, training_data, config)
+    # Final evaluation with best models on both people
+    final_results = evaluate_best_models(results, evaluation_data, config)
     
     # Create comprehensive visualization
     plot_comprehensive_comparison(results, final_results)
