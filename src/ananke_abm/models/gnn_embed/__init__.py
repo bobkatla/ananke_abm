@@ -3,19 +3,23 @@
 GNN-based embedding models for zone dynamics.
 """
 
-from .physics_ode import PhysicsInformedODE, SmoothTrajectoryPredictor
+from .physics_ode import PhysicsInformedODE
+from .physics_ode import SmoothTrajectoryPredictor
+from .diffusion import SimplifiedDiffusionModel  
 from .strict_physics import ImprovedStrictPhysicsModel
-from .diffusion import SimplifiedDiffusionModel
 from .hybrid import HybridPhysicsModel
 from .curriculum import CurriculumPhysicsModel
 from .ensemble import EnsemblePhysicsModel
+from .physics_diffusion_ode import PhysicsDiffusionODE, PhysicsDiffusionTrajectoryPredictor
 
 __all__ = [
     'PhysicsInformedODE',
     'SmoothTrajectoryPredictor', 
-    'ImprovedStrictPhysicsModel',
     'SimplifiedDiffusionModel',
+    'ImprovedStrictPhysicsModel',
     'HybridPhysicsModel',
     'CurriculumPhysicsModel',
-    'EnsemblePhysicsModel'
+    'EnsemblePhysicsModel',
+    'PhysicsDiffusionODE',
+    'PhysicsDiffusionTrajectoryPredictor'
 ] 
