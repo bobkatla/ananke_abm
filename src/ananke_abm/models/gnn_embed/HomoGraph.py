@@ -41,8 +41,8 @@ class HomoGraph:
         # Create edge_index in PyTorch Geometric format [2, num_edges]
         edge_list = []
         for edge_id in self.map_idx_to_edge_id:
-            src_idx = self.map_node_id_to_idx[edge_id[0]]
-            dst_idx = self.map_node_id_to_idx[edge_id[1]]
+            src_idx = self.map_node_id_to_idx[int(edge_id.split("_")[0])]
+            dst_idx = self.map_node_id_to_idx[int(edge_id.split("_")[1])]
             edge_list.append([src_idx, dst_idx])
         
         self.edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
@@ -56,7 +56,8 @@ class HomoGraph:
     
     def _validate_edges(self, node_ids: pd.Index, edge_ids: pd.Index):
         """Validate that edge IDs are proper tuples referencing existing nodes"""
-        for edge_id in edge_ids:
+        converted_edge_ids = [tuple(int(x) for x in edge_id.split("_")) for edge_id in edge_ids]
+        for edge_id in converted_edge_ids:
             if not isinstance(edge_id, tuple) or len(edge_id) != 2:
                 raise ValueError(f"edge_id must be tuple of (node1, node2), got {edge_id}")
             
@@ -71,8 +72,7 @@ class HomoGraph:
         reverse_edges = []
         
         for edge_id, features in edge_features.iterrows():
-            # Create reverse edge
-            reverse_edge_id = (edge_id[1], edge_id[0])
+            reverse_edge_id = f"{edge_id.split('_')[1]}_{edge_id.split('_')[0]}"
             
             # Only add if reverse doesn't already exist
             if reverse_edge_id not in edge_features.index:
