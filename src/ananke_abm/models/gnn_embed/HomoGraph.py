@@ -123,3 +123,23 @@ class HomoGraph:
     
     def __repr__(self) -> str:
         return f"HomoGraph(nodes={self.num_nodes}, edges={self.num_edges})"
+
+    def get_neighbors(self, node_id) -> List:
+        """Get neighboring node IDs for a given node"""
+        node_idx = self.map_node_id_to_idx[node_id]
+        neighbor_indices = self.edge_index[1][self.edge_index[0] == node_idx]
+        return [self.map_idx_to_node_id[idx.item()] for idx in neighbor_indices]
+
+    def get_edge_data(self, src_node_id, dst_node_id) -> torch.Tensor:
+        """Get edge features between two nodes"""
+        edge_id = (src_node_id, dst_node_id)
+        if edge_id in self.map_edge_id_to_idx:
+            edge_idx = self.map_edge_id_to_idx[edge_id]
+            return self.edge_features[edge_idx]
+        return None
+
+    @staticmethod
+    def batch_graphs(graphs: List['HomoGraph']) -> 'Data.Batch':
+        """Create batch from multiple HomoGraphs"""
+        data_list = [graph.get_data() for graph in graphs]
+        return Data.Batch.from_data_list(data_list)
