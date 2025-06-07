@@ -4,7 +4,7 @@ import networkx as nx
 import numpy as np
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
-from .mock_1p import create_mock_zone_graph  # Reuse the same zone structure
+from .mock_locations import create_mock_zone_graph  # Reuse the same zone structure
 
 @dataclass
 class Person:
@@ -269,112 +269,4 @@ def create_two_person_training_data():
     # Option 1: Use Sarah's data as the primary training format (with all person metadata)
     # This maintains compatibility while providing both people's data for evaluation
     
-    combined_data = {
-        # Primary training format (using Sarah's data structure)
-        "person_attrs": sarah_data["person_attrs"],  # [8] - Sarah's attrs for compatibility
-        "times": sarah_data["times"],  # [sarah_timepoints] - Sarah's times  
-        "zone_observations": sarah_data["zone_observations"],  # [sarah_timepoints] - Sarah's zones
-        "zone_features": sarah_data["zone_features"],  # Same for both
-        "edge_index": sarah_data["edge_index"],  # Same for both
-        "num_zones": sarah_data["num_zones"],
-        
-        # Additional data for both people
-        "person_names": [sarah.name, marcus.name],
-        "person_ids": [sarah.person_id, marcus.person_id],
-        "sarah_data": sarah_data,  # Complete Sarah data
-        "marcus_data": marcus_data,  # Complete Marcus data
-        
-        # For training frameworks that can handle multiple people
-        "both_people_data": [sarah_data, marcus_data],
-        "is_multi_person": True
-    }
-    
-    return combined_data, sarah, marcus
-
-def create_alternating_training_data():
-    """Create training data that alternates between Sarah and Marcus observations
-    
-    This creates a single sequence that interleaves observations from both people,
-    allowing models to learn person-specific patterns in a mixed training regime.
-    """
-    
-    # Get individual data
-    combined_data, sarah, marcus = create_two_person_training_data()
-    sarah_data = combined_data['sarah_data']
-    marcus_data = combined_data['marcus_data']
-    
-    # Create alternating sequence - we'll take turns between Sarah and Marcus
-    # This creates a mixed training signal where person attributes vary per timestep
-    
-    alternating_observations = []
-    person_attrs_per_timestep = []
-    
-    # Simple alternating pattern: Sarah, Marcus, Sarah, Marcus, etc.
-    max_length = max(len(sarah_data["times"]), len(marcus_data["times"]))
-    
-    for i in range(max_length):
-        # Add Sarah's observation if available
-        if i < len(sarah_data["times"]):
-            alternating_observations.append({
-                "time": sarah_data["times"][i],
-                "zone": sarah_data["zone_observations"][i],
-                "person_attrs": sarah_data["person_attrs"],
-                "person_name": "Sarah"
-            })
-            
-        # Add Marcus's observation if available  
-        if i < len(marcus_data["times"]):
-            alternating_observations.append({
-                "time": marcus_data["times"][i], 
-                "zone": marcus_data["zone_observations"][i],
-                "person_attrs": marcus_data["person_attrs"],
-                "person_name": "Marcus"
-            })
-    
-    # Sort by time to create chronological sequence
-    alternating_observations.sort(key=lambda x: x["time"])
-    
-    # Convert to tensor format
-    alternating_times = torch.tensor([obs["time"] for obs in alternating_observations])
-    alternating_zones = torch.tensor([obs["zone"] for obs in alternating_observations])
-    alternating_person_attrs = torch.stack([obs["person_attrs"] for obs in alternating_observations])
-    
-    alternating_data = {
-        "person_attrs": alternating_person_attrs,  # [total_timepoints, 8] - varies per timestep
-        "times": alternating_times,  # [total_timepoints] - chronologically ordered
-        "zone_observations": alternating_zones,  # [total_timepoints] - mixed people
-        "zone_features": sarah_data["zone_features"],  # Same for both
-        "edge_index": sarah_data["edge_index"],  # Same for both
-        "num_zones": sarah_data["num_zones"],
-        
-        # Metadata
-        "observation_metadata": alternating_observations,
-        "sarah_data": sarah_data,
-        "marcus_data": marcus_data,
-        "is_alternating": True
-    }
-    
-    return alternating_data, sarah, marcus
-
-if __name__ == "__main__":
-    # Test the two-person data generation
-    print("🧪 Testing Two-Person Data Generation")
-    print("="*50)
-    
-    # Test combined data
-    combined_data, sarah, marcus = create_two_person_training_data()
-    
-    print(f"👥 People Created:")
-    print(f"   Sarah: {sarah.name}, age {sarah.age}, {sarah.occupation}")
-    print(f"          Income: ${sarah.income:,}, Car: {sarah.has_car}, Flexibility: {sarah.activity_flexibility}")
-    print(f"   Marcus: {marcus.name}, age {marcus.age}, {marcus.occupation}")
-    print(f"           Income: ${marcus.income:,}, Car: {marcus.has_car}, Flexibility: {marcus.activity_flexibility}")
-    
-    print(f"\n📊 Combined Data:")
-    print(f"   Total time points: {len(combined_data['times'])}")
-    print(f"   Sarah points: {combined_data['sarah_length']}")
-    print(f"   Marcus points: {combined_data['marcus_length']}")
-    print(f"   Zones: {combined_data['num_zones']}")
-    print(f"   Person attributes shape: {combined_data['person_attrs'].shape}")
-    
-    print("\n✅ Two-person data generation working!") 
+    return sarah_data, marcus_data
