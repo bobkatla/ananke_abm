@@ -21,6 +21,7 @@ dependencies = [
     "pandas>=2.2.3",
     "plotly>=5.0",
     "scipy>=1.10",
+    "seaborn>=0.13.2",
     "torch>=2.7.0",
     "torch-geometric>=2.6.1",
     "torchdiffeq>=0.2.5",

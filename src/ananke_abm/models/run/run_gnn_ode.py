@@ -1,328 +1,161 @@
-from ananke_abm.data_generator.mock_2p import create_two_person_training_data
-from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
-from ananke_abm.models.gnn_embed.HomoGraph import HomoGraph
-from ananke_abm.models.gnn_embed.gnn_ode import GNNPhysicsODE, GNNODETrainer
+#!/usr/bin/env python3
+"""
+Runner script for the Batched Multi-Agent GNN-ODE Model.
+"""
+import os
+import sys
 import pandas as pd
-import torch
 import numpy as np
+from pathlib import Path
+import matplotlib.pyplot as plt
+import torch
 
-def create_location_graph():
-    """Create HomoGraph for locations with static spatial information only"""
+# Make the project root directory available
+# This allows us to import from ananke_abm
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
+
+try:
+    from ananke_abm.data_generator.load_data import load_mobility_data
+    from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
+    from ananke_abm.models.gnn_embed.graph_utils import prepare_household_batch
+    from ananke_abm.models.gnn_embed.gnn_ode import PhysicsGNNODE, GNNODETrainer, ModelTracker
+except ImportError as e:
+    print("--- IMPORT ERROR ---")
+    print(f"Failed to import a module. This is often a path issue.")
+    print(f"Current sys.path: {sys.path}")
+    print(f"Error: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+
+def plot_results(tracker: ModelTracker, save_dir: Path):
+    """Plots training statistics and saves them."""
+    print("📊 Plotting training results...")
     
-    # Get location data
-    zone_graph, zone_data = create_mock_zone_graph()
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+
+    # Plot Loss
+    color = 'tab:red'
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss', color=color)
+    ax1.plot(tracker.training_losses, color=color, label='Loss')
+    ax1.tick_params(axis='y', labelcolor=color)
+    ax1.grid(True, axis='y', linestyle='--', alpha=0.6)
     
-    # Create node features DataFrame (static location attributes)
-    node_data = []
-    for zone_id in sorted(zone_graph.nodes()):
-        zone_info = zone_graph.nodes[zone_id]
-        node_data.append({
-            'population_norm': zone_info["population"] / 10000.0,
-            'job_opportunities_norm': zone_info["job_opportunities"] / 5000.0,
-            'retail_accessibility': zone_info["retail_accessibility"],
-            'transit_accessibility': zone_info["transit_accessibility"],
-            'attractiveness': zone_info["attractiveness"],
-            'coord_x_norm': zone_info["coordinates"][0] / 5.0,
-            'coord_y_norm': zone_info["coordinates"][1] / 5.0,
+    # Instantiate a second y-axis for Accuracy
+    ax2 = ax1.twinx()
+    color = 'tab:blue'
+    ax2.set_ylabel('Accuracy (%)', color=color)
+    ax2.plot(tracker.accuracies, color=color, linestyle='--', label='Accuracy')
+    ax2.tick_params(axis='y', labelcolor=color)
+
+    if tracker.learning_rates:
+        ax3 = ax1.twinx()
+        ax3.spines['right'].set_position(('outward', 60))
+        color = 'tab:green'
+        ax3.set_ylabel('Learning Rate', color=color)
+        ax3.plot(tracker.learning_rates, color=color, linestyle=':', label='Learning Rate')
+        ax3.tick_params(axis='y', labelcolor=color)
+        ax3.set_yscale('log')
+
+    fig.tight_layout()
+    plt.title('GNN-ODE Training Statistics')
+    
+    # Collect all labels for a single legend
+    lines, labels = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    lines3, labels3 = (ax3.get_legend_handles_labels() if tracker.learning_rates else ([], []))
+    ax2.legend(lines + lines2 + lines3, labels + labels2 + labels3, loc='best')
+
+    save_path = save_dir / "gnn_ode_training_stats.png"
+    plt.savefig(save_path)
+    plt.close()
+    print(f"✅ Training plot saved to {save_path}")
+
+def main():
+    """Main execution function."""
+    SAVE_DIR = Path("saved_models/gnn_ode_run")
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # --- 1. Load and Prepare Data ---
+    # This function returns trajectories in a dict and people/zones as DataFrames
+    trajectories_dict, people_df, zones_df = load_mobility_data()
+    
+    # Convert the trajectories dict to a single DataFrame for batch preparation
+    traj_list = []
+    for person_name, data in trajectories_dict.items():
+        for t, z in zip(data['times'], data['zones']):
+            traj_list.append({
+                'person_id': data['person_id'],
+                'time': t,
+                'zone_id': z
+            })
+    trajectories_df = pd.DataFrame(traj_list)
+
+    # Define a single household for Sarah (ID 1) and Marcus (ID 2)
+    people_df['household_id'] = 0
+    people_df.loc[people_df['person_id'] == 1, 'household_id'] = 101
+    people_df.loc[people_df['person_id'] == 2, 'household_id'] = 101
+    
+    batch, true_trajectories, zone_id_to_idx, common_times = prepare_household_batch(trajectories_df, people_df)
+    
+    person_id_to_idx = {pid: i for i, pid in enumerate(sorted(people_df['person_id'].unique()))}
+
+    # Create the static location graph structure for the model
+    # The zones_df doesn't have edge info, so we get it from the source
+    zone_graph, _ = create_mock_zone_graph()
+    location_edge_index = torch.tensor(list(zone_graph.edges), dtype=torch.long).t().contiguous()
+    # Adjust for 1-based indexing if necessary (it's 1-based in the mock data)
+    if location_edge_index.min() == 1:
+        location_edge_index = location_edge_index - 1
+
+    # --- 2. Initialize Model and Trainer ---
+    model = PhysicsGNNODE(
+        num_people=batch.num_nodes,
+        num_zones=len(zone_id_to_idx),
+        location_edge_index=location_edge_index,
+        embedding_dim=32,
+        person_feature_dim=batch.x.shape[1]
+    )
+    
+    trainer = GNNODETrainer(model, lr=0.01, save_dir=SAVE_DIR)
+
+    # --- 3. Train the Model ---
+    print("\n--- 🚀 Starting Model Training ---")
+    trainer.train(batch, true_trajectories, person_id_to_idx, common_times, num_epochs=300)
+    print("--- ✅ Model Training Finished ---\n")
+
+    # --- 4. Evaluate and Save Predictions ---
+    print("--- 🔬 Evaluating Final Model ---")
+    trainer.load_best_model() 
+    results = trainer.evaluate(batch, true_trajectories, person_id_to_idx, common_times)
+    print(f"Final Model Accuracy: {results['accuracy']:.2f}%")
+
+    all_preds = []
+    for person_id, data in results['predictions'].items():
+        person_name = "Sarah" if person_id == 1 else "Marcus"
+        df = pd.DataFrame({
+            'time': data['times'],
+            'predicted_zone_id': [list(zone_id_to_idx.keys())[i] for i in data['pred_zones']],
+            'true_zone_id': [list(zone_id_to_idx.keys())[i] for i in data['true_zones']]
         })
+        df['person_id'] = person_id
+        df['person_name'] = person_name
+        all_preds.append(df)
     
-    node_features_df = pd.DataFrame(
-        node_data, 
-        index=pd.Index(sorted(zone_graph.nodes()), name='node_id')
-    )
-    
-    # Create edge features DataFrame (static connectivity attributes)
-    edge_data = []
-    edge_ids = []
-    for u, v, edge_info in zone_graph.edges(data=True):
-        edge_ids.append((u, v))
-        edge_data.append({
-            'distance_norm': edge_info["distance"] / 10.0,
-            'travel_time_norm': edge_info["travel_time"] / 60.0,
-        })
-    
-    edge_features_df = pd.DataFrame(
-        edge_data,
-        index=pd.Index([f"{u}_{v}" for u, v in edge_ids], name='edge_id')
-    )
-    
-    return HomoGraph(node_features_df, edge_features_df)
+    pred_df = pd.concat(all_preds, ignore_index=True)
+    pred_save_path = SAVE_DIR / "final_predictions.csv"
+    pred_df.to_csv(pred_save_path, index=False)
+    print(f"✅ Predictions saved to {pred_save_path}")
 
-def create_person_graph():
-    """Create HomoGraph for people with static demographic information only"""
+    # --- 5. Save Artifacts ---
+    trainer.tracker.save_training_data()
+    plot_results(trainer.tracker, SAVE_DIR)
     
-    # Get person data
-    sarah_data, marcus_data = create_two_person_training_data()
-    
-    # Extract static person attributes only (no trajectory data)
-    sarah_features = sarah_data["person_attrs"].numpy()
-    marcus_features = marcus_data["person_attrs"].numpy()
-    
-    feature_names = [
-        'age_norm', 'income_norm', 'employment_full_time', 'commute_car',
-        'activity_flexibility', 'social_tendency', 'household_size_norm', 'has_car'
-    ]
-    
-    node_features_df = pd.DataFrame(
-        [sarah_features, marcus_features],
-        columns=feature_names,
-        index=pd.Index([sarah_data["person_id"], marcus_data["person_id"]], name='node_id')
-    )
-    
-    # Create edges based on static relationships (could be social network, etc.)
-    # For now, simple demographic similarity
-    age_sim = 1 - abs(sarah_features[0] - marcus_features[0])
-    income_sim = 1 - abs(sarah_features[1] - marcus_features[1])
-    overall_sim = (age_sim + income_sim) / 2
-    
-    edge_features_df = pd.DataFrame(
-        [[overall_sim, 0.3]],  # similarity, interaction_strength
-        columns=['demographic_similarity', 'social_connection'],
-        index=pd.Index(["1_2"], name='edge_id')
-    )
-    
-    return HomoGraph(node_features_df, edge_features_df)
-
-def extract_trajectory_data():
-    """Extract trajectory data separately - this is what the ODE model will fit"""
-    
-    sarah_data, marcus_data = create_two_person_training_data()
-    
-    # Return trajectory snapshots (the temporal data to be modeled)
-    trajectories = {
-        "sarah": {
-            "person_id": sarah_data["person_id"],
-            "times": sarah_data["times"],
-            "zones": sarah_data["zone_observations"],
-            "name": sarah_data["person_name"]
-        },
-        "marcus": {
-            "person_id": marcus_data["person_id"],
-            "times": marcus_data["times"],
-            "zones": marcus_data["zone_observations"],
-            "name": marcus_data["person_name"]
-        }
-    }
-    
-    return trajectories
-
-def print_trajectory_comparison(results: dict):
-    """Print detailed comparison of predicted vs observed trajectories"""
-    
-    for person_name, result in results.items():
-        print(f"\n=== {person_name.upper()} TRAJECTORY ===")
-        print(f"Accuracy: {result['accuracy']:.3f}")
-        
-        observed = result['observed_zones']
-        predicted = result['predicted_zones']
-        times = result['times']
-        
-        print(f"{'Time':>6} {'Observed':>8} {'Predicted':>9} {'Match':>5}")
-        print("-" * 35)
-        
-        for i in range(min(15, len(times))):  # Show first 15 points
-            time_str = f"{times[i].item():.2f}"
-            obs_zone = observed[i].item()
-            pred_zone = predicted[i].item()
-            match = "✓" if obs_zone == pred_zone else "✗"
-            
-            print(f"{time_str:>6} {obs_zone:>8} {pred_zone:>9} {match:>5}")
-        
-        if len(times) > 15:
-            print(f"... ({len(times) - 15} more time points)")
-
-def check_physics_violations(results: dict, location_graph: HomoGraph):
-    """Check if any predicted transitions violate graph connectivity"""
-    
-    edge_index = location_graph.edge_index
-    
-    # Create adjacency set for fast lookup
-    adjacency = set()
-    for i in range(edge_index.shape[1]):
-        u, v = edge_index[0, i].item(), edge_index[1, i].item()
-        adjacency.add((u, v))
-        adjacency.add((v, u))  # Bidirectional
-    
-    # Add self-loops (can stay in same zone)
-    for i in range(8):  # 8 zones
-        adjacency.add((i, i))
-    
-    print("\n=== PHYSICS VIOLATION CHECK ===")
-    
-    total_transitions = 0
-    total_violations = 0
-    
-    for person_name, result in results.items():
-        predicted = result['predicted_zones']
-        violations = 0
-        transitions = 0
-        
-        print(f"\n{person_name.upper()} Physics Check:")
-        
-        for i in range(len(predicted) - 1):
-            current_zone = predicted[i].item()
-            next_zone = predicted[i + 1].item()
-            transitions += 1
-            
-            # Check if transition is allowed
-            if (current_zone, next_zone) not in adjacency:
-                violations += 1
-                times = result['times']
-                print(f"  ❌ VIOLATION: Zone {current_zone} → {next_zone} at t={times[i+1].item():.2f}")
-        
-        violation_rate = violations / transitions if transitions > 0 else 0
-        print(f"  Total transitions: {transitions}")
-        print(f"  Physics violations: {violations} ({violation_rate:.1%})")
-        
-        total_transitions += transitions
-        total_violations += violations
-    
-    overall_violation_rate = total_violations / total_transitions if total_transitions > 0 else 0
-    print(f"\n=== OVERALL PHYSICS SUMMARY ===")
-    print(f"Total transitions: {total_transitions}")
-    print(f"Physics violations: {total_violations} ({overall_violation_rate:.1%})")
-    
-    if overall_violation_rate == 0:
-        print("🎉 Perfect! No physics violations detected.")
-    elif overall_violation_rate < 0.1:
-        print("✅ Good physics compliance (< 10% violations)")
-    elif overall_violation_rate < 0.3:
-        print("⚠️  Moderate physics violations (10-30%)")
-    else:
-        print("❌ High physics violations (> 30%) - constraints not working well")
-    
-    return total_violations, total_transitions
-
-def show_graph_connectivity(location_graph: HomoGraph):
-    """Show the allowed transitions for reference"""
-    
-    edge_index = location_graph.edge_index
-    
-    print("\n=== GRAPH CONNECTIVITY REFERENCE ===")
-    
-    # Build adjacency lists
-    adjacency_lists = {i: set() for i in range(8)}
-    
-    for i in range(edge_index.shape[1]):
-        u, v = edge_index[0, i].item(), edge_index[1, i].item()
-        adjacency_lists[u].add(v)
-        adjacency_lists[v].add(u)
-    
-    # Add self-loops
-    for i in range(8):
-        adjacency_lists[i].add(i)
-    
-    for zone in range(8):
-        neighbors = sorted(list(adjacency_lists[zone]))
-        print(f"Zone {zone}: can transition to {neighbors}")
-    
-    total_allowed_transitions = sum(len(neighbors) for neighbors in adjacency_lists.values())
-    print(f"\nTotal allowed transitions: {total_allowed_transitions} out of {8*8} possible")
-
-def train_and_evaluate_model():
-    """Complete training and evaluation pipeline"""
-    
-    print("=== GNN-ODE Training & Evaluation ===")
-    
-    # Create graphs and trajectory data
-    print("\n1. Loading data...")
-    location_graph = create_location_graph()
-    person_graph = create_person_graph()
-    trajectories = extract_trajectory_data()
-    
-    print(f"   Location graph: {location_graph}")
-    print(f"   Person graph: {person_graph}")
-    print(f"   Trajectories: {list(trajectories.keys())}")
-    
-    # Create model
-    print("\n2. Creating GNN-ODE model...")
-    model = GNNPhysicsODE(
-        location_graph=location_graph,
-        person_graph=person_graph,
-        embedding_dim=64,
-        num_gnn_layers=2
-    )
-    
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"   Model parameters: {num_params:,}")
-    print(f"   Location embeddings shape: {model.location_embeddings.shape}")
-    print(f"   Person embeddings shape: {model.person_embeddings.shape}")
-    
-    # Create trainer
-    trainer = GNNODETrainer(model, lr=0.001)
-    
-    # Train model
-    print("\n3. Training model...")
-    trainer.train(trajectories, num_epochs=100, verbose=True)
-    
-    # Evaluate model
-    print("\n4. Evaluating model...")
-    results = trainer.evaluate(trajectories)
-    
-    # Print results
-    print("\n5. Results Summary:")
-    for person_name, result in results.items():
-        print(f"   {person_name}: {result['accuracy']:.1%} accuracy")
-    
-    # Detailed comparison
-    print_trajectory_comparison(results)
-    
-    return model, trainer, results
+    print("\n--- ✨ Run Complete ---")
+    print(f"All artifacts saved in: {SAVE_DIR.resolve()}")
 
 if __name__ == "__main__":
-    # Test the clean separation first
-    print("=== Clean Graph + Trajectory Separation ===")
-
-    # Create static graphs
-    print("\n=== Creating Location Graph (Static) ===")
-    location_graph = create_location_graph()
-    print(f"Location graph: {location_graph}")
-    print(f"Location schema: {location_graph.extract_schema()}")
-
-    print("\n=== Creating Person Graph (Static) ===")
-    person_graph = create_person_graph()
-    print(f"Person graph: {person_graph}")
-    print(f"Person schema: {person_graph.extract_schema()}")
-
-    print("\n=== Extracting Trajectory Data (Dynamic) ===")
-    trajectories = extract_trajectory_data()
-    print(f"Sarah trajectory: {len(trajectories['sarah']['times'])} time points")
-    print(f"Marcus trajectory: {len(trajectories['marcus']['times'])} time points")
-
-    # Show first few trajectory points
-    print(f"\nSarah first 5 points: {list(zip(trajectories['sarah']['times'][:5], trajectories['sarah']['zones'][:5]))}")
-    print(f"Marcus first 5 points: {list(zip(trajectories['marcus']['times'][:5], trajectories['marcus']['zones'][:5]))}")
-
-    print("\n=== Architecture Summary ===")
-    print("✓ Location Graph: Static spatial features + connectivity")
-    print("✓ Person Graph: Static demographic features + relationships") 
-    print("✓ Trajectory Data: Time-series of location visits (what ODE models)")
-    print("✓ Clean separation: Structure vs Dynamics")
-    print("✓ Ready for GNN-ODE: Graphs provide context, trajectories provide training data")
-    
-    print("\n" + "="*60)
-    
-    # Train and evaluate the model
-    model, trainer, results = train_and_evaluate_model()
-    
-    print("\n=== Final Summary ===")
-    print("✓ GNN embeddings capture location and person features")
-    print("✓ ODE learns movement dynamics in embedding space")
-    print("✓ Physics constraints from graph connectivity")
-    print("✓ Model trained and evaluated on 2-person dataset")
-    
-    overall_accuracy = np.mean([r['accuracy'] for r in results.values()])
-    print(f"✓ Overall accuracy: {overall_accuracy:.1%}")
-    
-    if overall_accuracy > 0.8:
-        print("🎉 Great performance! Model learned the movement patterns well.")
-    elif overall_accuracy > 0.6:
-        print("👍 Good performance! Model captured major movement patterns.")
-    else:
-        print("📊 Model is learning - may need more training or tuning.")
-
-    # Check physics violations
-    total_violations, total_transitions = check_physics_violations(results, location_graph)
-
-    # Show graph connectivity for reference
-    show_graph_connectivity(location_graph)
+    torch.manual_seed(42)
+    np.random.seed(42)
+    main()
