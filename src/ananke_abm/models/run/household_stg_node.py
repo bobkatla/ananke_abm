@@ -11,6 +11,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
 import warnings
+import os
 warnings.filterwarnings('ignore')
 
 from torchdiffeq import odeint
@@ -298,7 +299,12 @@ class STGNodeHousehold(nn.Module):
             print(f"ODE solver failed: {e}, using simple forward pass")
             # Fallback: just repeat initial state
             solution = initial_state.unsqueeze(0).expand(len(eval_times), -1, -1)
-        
+
+        # Check for NaN values from the ODE solver
+        if torch.isnan(solution).any():
+            print("⚠️ WARNING: NaN values detected in ODE solution. Clamping to 0.")
+            solution = torch.nan_to_num(solution, nan=0.0)
+
         # Predict zones at each time step
         zone_logits = self.zone_predictor(solution)  # [num_eval_times, num_people, num_zones]
         
@@ -493,13 +499,24 @@ def train_model():
     
     # Training loop with curriculum learning
     print(f"\n🚀 Training for {config.num_epochs} epochs...")
+    save_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '..', '..', 'saved_models')
+    save_dir = os.path.abspath(save_dir)
+    plot_dir = os.path.join(save_dir, 'plots')
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(plot_dir, exist_ok=True)
+
     losses = []
+    violation_rates = []
     best_loss = float('inf')
+    best_violation = float('inf')
+    best_model_state = None
     patience_counter = 0
     
     for epoch in range(config.num_epochs):
         optimizer.zero_grad()
         total_loss = 0.0
+        total_violations = 0
+        total_preds = 0
         
         # Train on each person's trajectory
         for person_idx in range(data['num_people']):
@@ -532,23 +549,19 @@ def train_model():
                 
                 # Forward pass
                 raw_predictions = model(initial_zones, initial_time, eval_times)
-                # raw_predictions shape: [num_eval_times, num_people, num_zones]
-                
-                # Apply physics constraints - use ground truth zones for training
                 ground_truth_zones = person_trajectory[start_idx:end_idx]
-                
-                # Create proper constraint tracking
                 constrained_predictions = raw_predictions.clone()
                 for t in range(1, len(eval_times)):
-                    prev_zone = ground_truth_zones[t-1].item()  # Use ground truth for training
-                    
-                    # Get valid transitions
+                    prev_zone = ground_truth_zones[t-1].item()
                     valid_mask = adjacency_matrix[prev_zone].clone()
-                    valid_mask[prev_zone] = 1.0  # Can stay
-                    
-                    # Apply hard constraints
+                    valid_mask[prev_zone] = 1.0
                     invalid_mask = (valid_mask == 0)
                     constrained_predictions[t, person_idx, invalid_mask] = -1e9
+                    # Track physics violations for this window
+                    pred_zone = torch.argmax(constrained_predictions[t, person_idx, :]).item()
+                    if valid_mask[pred_zone] == 0:
+                        total_violations += 1
+                    total_preds += 1
                 
                 # Target zones for this person
                 target_zones = person_trajectory[start_idx:end_idx]
@@ -567,18 +580,25 @@ def train_model():
             optimizer.step()
             
             loss_value = total_loss.item()
+            violation_rate = (total_violations / total_preds) if total_preds > 0 else 0
             losses.append(loss_value)
+            violation_rates.append(violation_rate)
             
             # Learning rate scheduling
             scheduler1.step(loss_value)
             scheduler2.step()
             
             # Early stopping check
-            if loss_value < best_loss:
+            if (loss_value < best_loss) and (violation_rate == 0):
                 best_loss = loss_value
-                patience_counter = 0
-            else:
-                patience_counter += 1
+                best_violation = violation_rate
+                best_model_state = {
+                    'model_state_dict': model.state_dict(),
+                    'config': config,
+                    'processor_zone_to_id': processor.zone_to_id,
+                    'processor_id_to_zone': processor.id_to_zone
+                }
+                torch.save(best_model_state, os.path.join(save_dir, 'household_stg_node_best.pth'))
             
             if (epoch + 1) % 50 == 0:
                 current_lr = optimizer.param_groups[0]['lr']
@@ -591,16 +611,36 @@ def train_model():
         else:
             print(f"   Epoch {epoch+1:4d}/{config.num_epochs} | No valid training windows")
     
+    # Plot and save training loss and violation rate
+    plt.figure()
+    plt.plot(losses, label='Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training Loss Curve')
+    plt.legend()
+    plt.savefig(os.path.join(plot_dir, 'training_loss_curve.png'), dpi=200, bbox_inches='tight')
+    plt.close()
+
+    plt.figure()
+    plt.plot(violation_rates, label='Physics Violation Rate')
+    plt.xlabel('Epoch')
+    plt.ylabel('Violation Rate')
+    plt.title('Physics Violation Rate Curve')
+    plt.legend()
+    plt.savefig(os.path.join(plot_dir, 'violation_rate_curve.png'), dpi=200, bbox_inches='tight')
+    plt.close()
+
     print(f"\n✅ Training completed! Final loss: {losses[-1] if losses else 'N/A'}")
-    
+    print(f"Best model saved to {os.path.join(save_dir, 'household_stg_node_best.pth')}")
     return model, data, processor, config, adjacency_matrix
 
-def evaluate_model(model, data, processor, config, adjacency_matrix):
+def evaluate_model(model, data, processor, config, adjacency_matrix, save_csv=False, csv_path=None):
     """Evaluate the trained model"""
     print("\n🔍 Evaluating Model Performance")
     print("=" * 50)
     
     model.eval()
+    predictions_records = []
     with torch.no_grad():
         trajectories_data = data['trajectories_data']
         times_data = data['times_data']
@@ -630,7 +670,7 @@ def evaluate_model(model, data, processor, config, adjacency_matrix):
                 predicted_zones = torch.argmax(constrained_predictions[:, person_idx, :], dim=-1)
                 
                 # Compare predictions with ground truth
-                for t in range(min(12, len(person_trajectory))):
+                for t in range(len(person_trajectory)):
                     true_zone = person_trajectory[t].item()
                     pred_zone = predicted_zones[t].item()
                     
@@ -657,6 +697,14 @@ def evaluate_model(model, data, processor, config, adjacency_matrix):
                     
                     time_val = person_times[t].item() if t < len(person_times) else t
                     print(f"   {time_val:4.1f} | {true_zone_name:9s} | {pred_zone_name:9s} | {match:5s} | {physics_ok:8s}")
+                    
+                    if save_csv and person_idx < 2:
+                        predictions_records.append({
+                            'person_id': person_idx,
+                            'time': time_val,
+                            'true_zone': true_zone_name,
+                            'predicted_zone': pred_zone_name
+                        })
         
         # Calculate overall metrics
         accuracy = total_correct / total_predictions if total_predictions > 0 else 0
@@ -665,9 +713,13 @@ def evaluate_model(model, data, processor, config, adjacency_matrix):
         print(f"\n📈 Overall Zone Prediction Accuracy: {accuracy:.4f} ({accuracy*100:.1f}%)")
         print(f"⚠️  Physics Violation Rate: {violation_rate:.4f} ({violation_rate*100:.1f}%)")
     
+    if save_csv and predictions_records and csv_path:
+        df = pd.DataFrame(predictions_records)
+        df.to_csv(csv_path, index=False)
+        print(f"Predictions for 2 persons saved to {csv_path}")
     return accuracy, violation_rate
 
-def visualize_results(model, data, processor, config):
+def visualize_results(model, data, processor, config, adjacency_matrix):
     """Visualize the prediction results"""
     print("\n🎨 Visualizing Results...")
     
@@ -692,8 +744,11 @@ def visualize_results(model, data, processor, config):
                 initial_time = person_times[0]
                 eval_times = person_times
                 
-                predictions = model(initial_zones, initial_time, eval_times)
-                predicted_zones = torch.argmax(predictions[:, person_idx, :], dim=-1)
+                raw_predictions = model(initial_zones, initial_time, eval_times)
+                
+                # Apply physics constraints to get the final predictions for plotting
+                constrained_predictions = model.apply_physics_constraints(raw_predictions, initial_zones)
+                predicted_zones = torch.argmax(constrained_predictions[:, person_idx, :], dim=-1)
                 
                 # Plot true vs predicted
                 true_zones = person_trajectory.numpy()
@@ -726,12 +781,14 @@ def main():
     try:
         # Train model
         model, data, processor, config, adjacency_matrix = train_model()
-        
-        # Evaluate model
-        accuracy, violation_rate = evaluate_model(model, data, processor, config, adjacency_matrix)
+        save_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '..', '..', 'saved_models')
+        save_dir = os.path.abspath(save_dir)
+        csv_path = os.path.join(save_dir, 'predictions_sample.csv')
+        # Evaluate model and save predictions for 2 persons
+        accuracy, violation_rate = evaluate_model(model, data, processor, config, adjacency_matrix, save_csv=True, csv_path=csv_path)
         
         # Visualize results
-        visualize_results(model, data, processor, config)
+        visualize_results(model, data, processor, config, adjacency_matrix)
         
         print(f"\n🎯 Final Results:")
         print(f"   Zone Prediction Accuracy: {accuracy*100:.1f}%")
