@@ -26,7 +26,7 @@ class HouseholdConfig:
     num_layers: int = 3  # Multiple layers for complexity
     num_zones: int = 10
     learning_rate: float = 0.001  # Lower learning rate for stability
-    num_epochs: int = 5000  # Extended training time
+    num_epochs: int = 20000  # Extended training time
     physics_weight: float = 1.0  # Not needed with hard constraints
     exploration_noise: float = 0.02  # Smaller noise for stability
     dropout: float = 0.1  # Regularization
@@ -176,6 +176,11 @@ class HouseholdODEFunc(nn.Module):
             for _ in range(config.num_layers)
         ])
         
+        # Attention projection layers
+        self.q_layers = nn.ModuleList([nn.Linear(config.hidden_dim, config.hidden_dim) for _ in range(config.num_layers)])
+        self.k_layers = nn.ModuleList([nn.Linear(config.hidden_dim, config.hidden_dim) for _ in range(config.num_layers)])
+        self.v_layers = nn.ModuleList([nn.Linear(config.hidden_dim, config.hidden_dim) for _ in range(config.num_layers)])
+        
         # Dropout for regularization
         self.dropout = nn.Dropout(config.dropout)
         
@@ -221,9 +226,18 @@ class HouseholdODEFunc(nn.Module):
                     other_members = torch.cat([h_individual[:i, :], h_individual[i+1:, :]], dim=0)
                     
                     if other_members.shape[0] > 0:
-                        # Attention-like mechanism for better interactions
-                        other_agg = torch.mean(other_members, dim=0, keepdim=True)
-                        interaction_input = torch.cat([member_i, other_agg], dim=-1)
+                        # Attention mechanism instead of mean aggregation
+                        q = self.q_layers[layer_idx](member_i)
+                        k = self.k_layers[layer_idx](other_members)
+                        v = self.v_layers[layer_idx](other_members)
+                        
+                        # Scaled dot-product attention
+                        d_k = q.size(-1)
+                        scores = torch.matmul(q, k.transpose(-2, -1)) / (d_k**0.5)
+                        attn_weights = F.softmax(scores, dim=-1)
+                        context = torch.matmul(attn_weights, v)
+
+                        interaction_input = torch.cat([member_i, context], dim=-1)
                         interaction = torch.relu(self.interaction_layers[layer_idx](interaction_input))
                     else:
                         interaction = member_i
@@ -605,7 +619,7 @@ def train_model():
                 print(f"   Epoch {epoch+1:4d}/{config.num_epochs} | Loss: {loss_value:.4f} | Best: {best_loss:.4f} | LR: {current_lr:.6f}")
                 
             # Early stopping if no improvement for too long
-            if patience_counter > 500 and epoch > 2000:
+            if patience_counter > 1000 and epoch > 2000:
                 print(f"   Early stopping at epoch {epoch+1} (no improvement for 500 epochs)")
                 break
         else:
