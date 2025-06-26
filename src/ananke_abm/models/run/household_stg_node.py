@@ -26,7 +26,7 @@ class HouseholdConfig:
     num_layers: int = 3  # Multiple layers for complexity
     num_zones: int = 10
     learning_rate: float = 0.001  # Lower learning rate for stability
-    num_epochs: int = 20000  # Extended training time
+    num_epochs: int = 10000  # Extended training time
     physics_weight: float = 1.0  # Not needed with hard constraints
     exploration_noise: float = 0.02  # Smaller noise for stability
     dropout: float = 0.1  # Regularization
@@ -164,9 +164,9 @@ class HouseholdODEFunc(nn.Module):
         # Input layer
         self.input_layer = nn.Linear(total_dim, config.hidden_dim)
         
-        # Multiple hidden layers for complexity
+        # GRU cells for the hidden layers for better temporal state management
         self.hidden_layers = nn.ModuleList([
-            nn.Linear(config.hidden_dim, config.hidden_dim) 
+            nn.GRUCell(config.hidden_dim + config.temporal_embed_dim, config.hidden_dim) 
             for _ in range(config.num_layers)
         ])
         
@@ -214,42 +214,41 @@ class HouseholdODEFunc(nn.Module):
         
         # Multi-layer processing with interactions
         for layer_idx in range(self.config.num_layers):
-            # Individual processing
-            h_individual = torch.relu(self.hidden_layers[layer_idx](h))
-            h_individual = self.layer_norms[layer_idx](h_individual)
-            
-            # Household interactions
-            if num_people > 1:
-                interactions = []
-                for i in range(num_people):
-                    member_i = h_individual[i:i+1, :]  # [1, hidden_dim]
-                    other_members = torch.cat([h_individual[:i, :], h_individual[i+1:, :]], dim=0)
-                    
-                    if other_members.shape[0] > 0:
-                        # Attention mechanism instead of mean aggregation
-                        q = self.q_layers[layer_idx](member_i)
-                        k = self.k_layers[layer_idx](other_members)
-                        v = self.v_layers[layer_idx](other_members)
-                        
-                        # Scaled dot-product attention
-                        d_k = q.size(-1)
-                        scores = torch.matmul(q, k.transpose(-2, -1)) / (d_k**0.5)
-                        attn_weights = F.softmax(scores, dim=-1)
-                        context = torch.matmul(attn_weights, v)
-
-                        interaction_input = torch.cat([member_i, context], dim=-1)
-                        interaction = torch.relu(self.interaction_layers[layer_idx](interaction_input))
-                    else:
-                        interaction = member_i
-                        
-                    interactions.append(interaction)
+            # 1. Perform interactions on the current state `h`
+            interactions = []
+            for i in range(num_people):
+                member_i = h[i:i+1, :]
+                other_members = torch.cat([h[:i, :], h[i+1:, :]], dim=0)
                 
-                h_interaction = torch.cat(interactions, dim=0)
-            else:
-                h_interaction = h_individual
+                if other_members.shape[0] > 0:
+                    # Attention mechanism
+                    q = self.q_layers[layer_idx](member_i)
+                    k = self.k_layers[layer_idx](other_members)
+                    v = self.v_layers[layer_idx](other_members)
+                    
+                    d_k = q.size(-1)
+                    scores = torch.matmul(q, k.transpose(-2, -1)) / (d_k**0.5)
+                    attn_weights = F.softmax(scores, dim=-1)
+                    context = torch.matmul(attn_weights, v)
+
+                    interaction_input = torch.cat([member_i, context], dim=-1)
+                    interaction = torch.relu(self.interaction_layers[layer_idx](interaction_input))
+                else:
+                    interaction = member_i
+                    
+                interactions.append(interaction)
             
-            # Residual connection
-            h = h + h_interaction
+            h_interacted = torch.cat(interactions, dim=0)
+
+            # 2. Gated update (GRU) with re-injected time
+            time_embed_re_injected = self.time_embed(t.unsqueeze(0).unsqueeze(0)).expand(num_people, -1)
+            gru_input = torch.cat([h_interacted, time_embed_re_injected], dim=-1)
+            
+            # Update hidden state using GRU
+            h = self.hidden_layers[layer_idx](gru_input, h)
+            
+            # Apply normalization and dropout
+            h = self.layer_norms[layer_idx](h)
             h = self.dropout(h)
         
         # Compute derivatives with appropriate magnitude
