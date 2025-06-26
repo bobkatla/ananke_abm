@@ -12,12 +12,14 @@ import matplotlib.pyplot as plt
 from dataclasses import dataclass
 import warnings
 import os
+import time
 warnings.filterwarnings('ignore')
 
 from torchdiffeq import odeint
 from ananke_abm.data_generator.mock_2p import create_two_person_training_data
 from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
 import networkx as nx
+from torch_geometric.nn import GCNConv
 
 @dataclass
 class HouseholdConfig:
@@ -35,303 +37,137 @@ class HouseholdConfig:
     person_feat_dim: int = 8 # UPDATED to use all features from mock_2p
     person_embed_dim: int = 32
 
-class ZoneEmbedding(nn.Module):
-    """Embedding layer for zones with spatial and temporal features"""
-    
-    def __init__(self, config: HouseholdConfig, num_zones: int):
-        super().__init__()
-        self.config = config
-        self.num_zones = num_zones
-        
-        # Zone embeddings based on features
-        self.zone_spatial = nn.Linear(2, config.zone_embed_dim // 2)  # x, y coords
-        self.zone_features = nn.Linear(9, config.zone_embed_dim // 2)  # zone type + amenities
-        
-        # Temporal embeddings
-        self.time_embed = nn.Linear(1, config.temporal_embed_dim)
-        
-        # Zone ID embedding for current location
-        self.zone_id_embed = nn.Embedding(num_zones, config.zone_embed_dim)
-        
-    def forward(self, zone_features, current_zone_ids, time_step):
-        """
-        Args:
-            zone_features: [batch, num_people, num_zones, features] - features for all zones
-            current_zone_ids: [batch, num_people] - current zone ID for each person
-            time_step: [batch, 1] - current time step
-        """
-        batch_size, num_people = current_zone_ids.shape
-        
-        # Get current zone features for each person
-        current_zone_features = []
-        for b in range(batch_size):
-            person_features = []
-            for p in range(num_people):
-                zone_id = current_zone_ids[b, p].item()
-                person_features.append(zone_features[b, p, zone_id])
-            current_zone_features.append(torch.stack(person_features))
-        current_zone_features = torch.stack(current_zone_features)  # [batch, num_people, features]
-        
-        # Embed spatial coordinates
-        spatial_coords = current_zone_features[:, :, :2]  # x, y
-        other_features = current_zone_features[:, :, 2:]  # zone types + amenities
-        
-        spatial_embed = self.zone_spatial(spatial_coords)
-        feature_embed = self.zone_features(other_features)
-        
-        zone_embed = torch.cat([spatial_embed, feature_embed], dim=-1)
-        
-        # Add zone ID embedding
-        zone_id_embed = self.zone_id_embed(current_zone_ids)
-        zone_embed = zone_embed + zone_id_embed
-        
-        # Temporal embedding
-        time_embed = self.time_embed(time_step.unsqueeze(-1))
-        time_embed = time_embed.expand(batch_size, num_people, -1)
-        
-        # Combine embeddings
-        combined_embed = torch.cat([zone_embed, time_embed], dim=-1)
-        
-        return combined_embed
-
-class HouseholdDynamics(nn.Module):
-    """Household movement dynamics with physics constraints"""
-    
+class HouseholdODEFunc(nn.Module):
+    """
+    Spatially-Conditioned ODE function. It evolves only the person's hidden state,
+    but is conditioned on the GNN-enhanced zone embeddings at every time step.
+    """
     def __init__(self, config: HouseholdConfig):
         super().__init__()
         self.config = config
         
-        total_embed_dim = config.zone_embed_dim + config.temporal_embed_dim
-        
-        # Household interaction network (fully connected)
-        self.household_gnn = nn.Linear(total_embed_dim, config.hidden_dim)
-        self.household_interaction = nn.Linear(config.hidden_dim * 2, config.hidden_dim)
-        
-        # Movement dynamics
-        self.movement_dynamics = nn.Linear(config.hidden_dim, config.hidden_dim)
-        
-    def forward(self, embeddings):
-        """
-        Args:
-            embeddings: [batch, num_people, embed_dim]
-        """
-        batch_size, num_people, embed_dim = embeddings.shape
-        
-        # Apply household GNN
-        h = torch.tanh(self.household_gnn(embeddings))
-        
-        # Household member interactions (fully connected)
-        interactions = []
-        for i in range(num_people):
-            member_i = h[:, i:i+1, :]  # [batch, 1, hidden_dim]
-            
-            if num_people > 1:
-                # Aggregate information from all other members
-                other_members = torch.cat([h[:, :i, :], h[:, i+1:, :]], dim=1)
-                
-                if other_members.shape[1] > 0:
-                    # Mean aggregation of other members
-                    other_agg = torch.mean(other_members, dim=1, keepdim=True)
-                    
-                    # Interaction between member i and others
-                    interaction = torch.cat([member_i, other_agg], dim=-1)
-                    interaction = torch.tanh(self.household_interaction(interaction))
-                else:
-                    interaction = member_i
-            else:
-                interaction = member_i
-                
-            interactions.append(interaction)
-        
-        h_interaction = torch.cat(interactions, dim=1)  # [batch, num_people, hidden_dim]
-        
-        # Movement dynamics
-        movement_features = torch.tanh(self.movement_dynamics(h_interaction))
-        
-        return movement_features
-
-class HouseholdODEFunc(nn.Module):
-    """Enhanced ODE function for continuous household movement dynamics"""
-    
-    def __init__(self, config: HouseholdConfig, zone_features: torch.Tensor):
-        super().__init__()
-        self.config = config
-        self.register_buffer('zone_features', zone_features)
-        
-        # Embedding layers
-        self.zone_embed = nn.Embedding(len(zone_features), config.zone_embed_dim)
+        # --- Layers for Person State Evolution ---
         self.time_embed = nn.Linear(1, config.temporal_embed_dim)
         
-        # Multi-layer household dynamics network
-        total_dim = config.zone_embed_dim + config.person_embed_dim + config.temporal_embed_dim
+        # Layer to predict current location from person's hidden state
+        self.location_predictor = nn.Linear(config.hidden_dim, config.num_zones)
         
-        # Input layer
-        self.input_layer = nn.Linear(total_dim, config.hidden_dim)
+        # GRU Cell to update person state
+        # Input: social context + spatial context + time context
+        gru_input_dim = config.hidden_dim + config.zone_embed_dim + config.temporal_embed_dim
+        self.gru_cell = nn.GRUCell(gru_input_dim, config.hidden_dim)
         
-        # GRU cells for the hidden layers for better temporal state management
-        self.hidden_layers = nn.ModuleList([
-            nn.GRUCell(config.hidden_dim + config.temporal_embed_dim, config.hidden_dim) 
-            for _ in range(config.num_layers)
-        ])
+        # Attention layers for social context
+        self.q_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
+        self.k_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
+        self.v_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
+        self.interaction_merger = nn.Linear(config.hidden_dim * 2, config.hidden_dim) # Merges self_state + social_context
         
-        # Interaction layers
-        self.interaction_layers = nn.ModuleList([
-            nn.Linear(config.hidden_dim * 2, config.hidden_dim)
-            for _ in range(config.num_layers)
-        ])
-        
-        # Attention projection layers
-        self.q_layers = nn.ModuleList([nn.Linear(config.hidden_dim, config.hidden_dim) for _ in range(config.num_layers)])
-        self.k_layers = nn.ModuleList([nn.Linear(config.hidden_dim, config.hidden_dim) for _ in range(config.num_layers)])
-        self.v_layers = nn.ModuleList([nn.Linear(config.hidden_dim, config.hidden_dim) for _ in range(config.num_layers)])
-        
-        # Dropout for regularization
+        # Normalization and Dropout
+        self.layer_norm = nn.LayerNorm(config.hidden_dim)
         self.dropout = nn.Dropout(config.dropout)
         
-        # Output projection
-        self.output_proj = nn.Linear(config.hidden_dim, total_dim)
-        
-        # Layer normalization for stability
-        self.layer_norms = nn.ModuleList([
-            nn.LayerNorm(config.hidden_dim)
-            for _ in range(config.num_layers)
-        ])
-        
-    def forward(self, t, state):
+    def forward(self, t, person_h, gnn_zone_embeds):
         """
         Args:
-            t: current time (scalar)
-            state: [num_people, embed_dim] - current state embeddings for each person
+            t: current time
+            person_h: current hidden states of all people [num_people, hidden_dim]
+            gnn_zone_embeds: Spatially-aware embeddings for all zones [num_zones, zone_embed_dim]
         """
-        num_people, embed_dim = state.shape
-        
-        # Add time information
-        time_embed = self.time_embed(t.unsqueeze(0).unsqueeze(0))  # [1, 1, time_dim]
-        time_embed = time_embed.expand(num_people, -1)  # [num_people, time_dim]
-        
-        # Re-combine dynamic part of state with static person features and new time
-        zone_part, person_part, _ = torch.split(
-            state, 
-            [self.config.zone_embed_dim, self.config.person_embed_dim, self.config.temporal_embed_dim], 
-            dim=-1
-        )
-        state_with_time = torch.cat([zone_part, person_part, time_embed], dim=-1)
-        
-        # Input layer
-        h = torch.relu(self.input_layer(state_with_time))
-        h = self.dropout(h)
-        
-        # Multi-layer processing with interactions
-        for layer_idx in range(self.config.num_layers):
-            # 1. Perform interactions on the current state `h`
-            interactions = []
-            for i in range(num_people):
-                member_i = h[i:i+1, :]
-                other_members = torch.cat([h[:i, :], h[i+1:, :]], dim=0)
-                
-                if other_members.shape[0] > 0:
-                    # Attention mechanism
-                    q = self.q_layers[layer_idx](member_i)
-                    k = self.k_layers[layer_idx](other_members)
-                    v = self.v_layers[layer_idx](other_members)
-                    
-                    d_k = q.size(-1)
-                    scores = torch.matmul(q, k.transpose(-2, -1)) / (d_k**0.5)
-                    attn_weights = F.softmax(scores, dim=-1)
-                    context = torch.matmul(attn_weights, v)
+        num_people = person_h.shape[0]
 
-                    interaction_input = torch.cat([member_i, context], dim=-1)
-                    interaction = torch.relu(self.interaction_layers[layer_idx](interaction_input))
-                else:
-                    interaction = member_i
-                    
-                interactions.append(interaction)
-            
-            h_interacted = torch.cat(interactions, dim=0)
+        # 1. Get Spatial Context
+        # Use current hidden state to get a "soft" location (probabilities over zones)
+        location_probs = F.softmax(self.location_predictor(person_h), dim=-1)
+        # Look up spatial context using these probabilities (weighted average of zone embeddings)
+        spatial_context = torch.matmul(location_probs, gnn_zone_embeds)
 
-            # 2. Gated update (GRU) with re-injected time
-            time_embed_re_injected = self.time_embed(t.unsqueeze(0).unsqueeze(0)).expand(num_people, -1)
-            gru_input = torch.cat([h_interacted, time_embed_re_injected], dim=-1)
-            
-            # Update hidden state using GRU
-            h = self.hidden_layers[layer_idx](gru_input, h)
-            
-            # Apply normalization and dropout
-            h = self.layer_norms[layer_idx](h)
-            h = self.dropout(h)
+        # 2. Get Social Context (Attention)
+        social_context_list = []
+        for i in range(num_people):
+            q = self.q_proj(person_h[i:i+1])
+            if num_people > 1:
+                other_person_h = torch.cat([person_h[:i], person_h[i+1:]])
+                k, v = self.k_proj(other_person_h), self.v_proj(other_person_h)
+                scores = torch.matmul(q, k.t()) / (self.config.hidden_dim**0.5)
+                attn = F.softmax(scores, dim=-1)
+                context = torch.matmul(attn, v)
+            else:
+                context = torch.zeros_like(person_h[i:i+1])
+            social_context_list.append(context)
+        social_context = torch.cat(social_context_list, dim=0)
+        h_interacted = self.interaction_merger(torch.cat([person_h, social_context], dim=-1))
         
-        # Compute derivatives with appropriate magnitude
-        dstate_dt = 0.1 * self.output_proj(h)  # Larger magnitude for better learning
+        # 3. Get Time Context
+        time_context = self.time_embed(t.expand(num_people, 1))
+
+        # 4. Update hidden state with GRU
+        gru_input = torch.cat([h_interacted, spatial_context, time_context], dim=-1)
+        d_person_h = self.gru_cell(gru_input, person_h) - person_h # Derivative is change from current state
         
-        # Add exploration noise during training
+        d_person_h = self.layer_norm(d_person_h)
+        
         if self.training:
-            noise = torch.randn_like(dstate_dt) * self.config.exploration_noise
-            dstate_dt = dstate_dt + noise
-        
-        return dstate_dt
+            d_person_h += torch.randn_like(d_person_h) * self.config.exploration_noise
+            
+        return d_person_h
 
 class STGNodeHousehold(nn.Module):
-    """STG-NODE model for household zone movement prediction"""
+    """Spatially-Conditioned STG-NODE model."""
     
-    def __init__(self, config: HouseholdConfig, num_zones: int, zone_features: torch.Tensor, person_features: torch.Tensor):
+    def __init__(self, config: HouseholdConfig, num_zones: int, zone_features: torch.Tensor, person_features: torch.Tensor, edge_index: torch.Tensor):
         super().__init__()
         self.config = config
         self.num_zones = num_zones
-        self.register_buffer('zone_features', zone_features)
+        self.register_buffer('static_zone_features', zone_features)
         self.register_buffer('person_features', person_features)
+        self.register_buffer('edge_index', edge_index)
+
+        # GNN Layer to create spatially-aware zone embeddings
+        self.zone_gnn = GCNConv(zone_features.shape[1], config.zone_embed_dim)
         
         # ODE function
-        self.ode_func = HouseholdODEFunc(config, zone_features)
+        self.ode_func = HouseholdODEFunc(config)
         
-        # Initial state embedding
-        self.zone_embed = nn.Embedding(num_zones, config.zone_embed_dim)
+        # Person embedders to create initial hidden state
         self.person_feature_embedder = nn.Linear(config.person_feat_dim, config.person_embed_dim)
-        self.time_embed = nn.Linear(1, config.temporal_embed_dim)
+        self.initial_state_mapper = nn.Linear(config.person_embed_dim + config.zone_embed_dim, config.hidden_dim)
         
-        # Output head for zone prediction
-        total_dim = config.zone_embed_dim + config.person_embed_dim + config.temporal_embed_dim
-        self.zone_predictor = nn.Linear(total_dim, num_zones)
+        # Final output predictor
+        self.zone_predictor = nn.Linear(config.hidden_dim, num_zones)
         
-        # Store adjacency matrix for physics constraints
         self.register_buffer('adjacency_matrix', torch.zeros(num_zones, num_zones))
         
-    def get_initial_state(self, initial_zones, initial_time):
-        """Get initial state embeddings including person features."""
-        num_people = len(initial_zones)
-        zone_embeds = self.zone_embed(initial_zones)
-        time_embed = self.time_embed(initial_time.unsqueeze(0).unsqueeze(0)).expand(num_people, -1)
+    def get_initial_state(self, initial_zones, gnn_zone_embeds):
+        """Get initial person hidden states."""
+        # Get embeddings for the specific zones people start in
+        initial_zone_context = gnn_zone_embeds[initial_zones]
         person_embeds = self.person_feature_embedder(self.person_features)
         
-        initial_state = torch.cat([zone_embeds, person_embeds, time_embed], dim=-1)
+        # Combine person features with their starting spatial context to create the initial hidden state
+        initial_state = torch.relu(self.initial_state_mapper(torch.cat([person_embeds, initial_zone_context], dim=-1)))
         return initial_state
         
     def forward(self, initial_zones, initial_time, eval_times):
         """
-        Args:
-            initial_zones: [num_people] - initial zone IDs for each person
-            initial_time: scalar - initial time
-            eval_times: [num_eval_times] - times to evaluate at
+        The forward pass now conditions the ODE on the GNN embeddings at every step.
         """
-        # Get initial state
-        initial_state = self.get_initial_state(initial_zones, initial_time)
-        
-        # Solve ODE
-        try:
-            # Use simple euler method for stability
-            solution = odeint(self.ode_func, initial_state, eval_times, method='euler')
-            # solution shape: [num_eval_times, num_people, embed_dim]
-        except Exception as e:
-            print(f"ODE solver failed: {e}, using simple forward pass")
-            # Fallback: just repeat initial state
-            solution = initial_state.unsqueeze(0).expand(len(eval_times), -1, -1)
-        
-        # Check for NaN values from the ODE solver
-        if torch.isnan(solution).any():
-            print("⚠️ WARNING: NaN values detected in ODE solution. Clamping to 0.")
-            solution = torch.nan_to_num(solution, nan=0.0)
+        # 1. Create spatially-aware zone embeddings using the GNN
+        gnn_zone_embeds = torch.relu(self.zone_gnn(self.static_zone_features, self.edge_index))
 
-        # Predict zones at each time step
-        zone_logits = self.zone_predictor(solution)  # [num_eval_times, num_people, num_zones]
+        # 2. Get initial person hidden states
+        initial_person_h = self.get_initial_state(initial_zones, gnn_zone_embeds)
+        
+        # 3. Solve ODE, passing GNN embeddings as context at each step using a lambda
+        person_h_solution = odeint(
+            lambda t, y: self.ode_func(t, y, gnn_zone_embeds), 
+            initial_person_h, 
+            eval_times, 
+            method='euler'
+        )
+        
+        # 4. Predict zones from the final evolved person states
+        zone_logits = self.zone_predictor(person_h_solution)
         
         return zone_logits
     
@@ -393,6 +229,7 @@ class HouseholdDataProcessor:
         num_people = 2
         num_zones = sarah_data['num_zones']
         zone_features = sarah_data['zone_features']
+        edge_index = sarah_data['edge_index'] # Extract GNN-compatible edge_index
 
         # Create the adjacency matrix from the shared zone graph
         zone_graph, _ = create_mock_zone_graph()
@@ -416,6 +253,7 @@ class HouseholdDataProcessor:
             'times_data': times_data,
             'common_time_grid': common_time_grid,
             'zone_features': zone_features,
+            'edge_index': edge_index, # Add edge_index for the GNN
             'num_zones': num_zones,
             'num_people': num_people,
             'person_names': self.person_names,
@@ -480,8 +318,8 @@ def train_model():
     config = HouseholdConfig()
     config.num_zones = data['num_zones']
     
-    # Create model
-    model = STGNodeHousehold(config, data['num_zones'], data['zone_features'], data['person_features'])
+    # Create model, passing the new edge_index
+    model = STGNodeHousehold(config, data['num_zones'], data['zone_features'], data['person_features'], data['edge_index'])
     model.set_adjacency_matrix(adjacency_matrix)  # Set physics constraints
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=1e-4)
     
@@ -606,7 +444,24 @@ def train_model():
                     'processor_zone_to_id': processor.zone_to_id,
                     'processor_id_to_zone': processor.id_to_zone
                 }
-                torch.save(best_model_state, os.path.join(save_dir, 'household_stg_node_best.pth'))
+                # --- ROBUST ATOMIC SAVE WITH RETRY ---
+                # On Windows, other processes (like antivirus) can briefly lock the destination file.
+                # We will retry the replace operation a few times to handle this.
+                model_path = os.path.join(save_dir, 'household_stg_node_best.pth')
+                tmp_model_path = model_path + '.tmp'
+                torch.save(best_model_state, tmp_model_path)
+                
+                retries = 5
+                for i in range(retries):
+                    try:
+                        os.replace(tmp_model_path, model_path)
+                        break # Success
+                    except PermissionError:
+                        if i < retries - 1:
+                            time.sleep(0.1) # Wait a moment for the lock to be released
+                        else:
+                            # Re-raise the exception after all retries have failed.
+                            raise
             else:
                 patience_counter += 1
             
@@ -644,197 +499,22 @@ def train_model():
     print(f"Best model saved to {os.path.join(save_dir, 'household_stg_node_best.pth')}")
     return model, data, processor, config, adjacency_matrix
 
-def evaluate_model(model, data, processor, config, adjacency_matrix):
-    """Evaluate the trained model and return detailed results."""
-    print("\n🔍 Evaluating Model Performance")
-    print("=" * 50)
-    
-    model.eval()
-    
-    person_results = {}
-    total_correct = 0
-    total_predictions = 0
-    total_violations = 0
-    
-    with torch.no_grad():
-        trajectories_data = data['trajectories_data']
-        times_data = data['times_data']
-        
-        for person_idx in range(data['num_people']):
-            person_trajectory = trajectories_data[person_idx]
-            person_times = times_data[person_idx]
-            
-            print(f"\n   Person {person_idx + 1} ({data['person_names'][person_idx]}):")
-            print("   Time | True Zone | Pred Zone | Match | Physics OK")
-            print("   -----|-----------|-----------|-------|----------")
-            
-            person_correct = 0
-            person_preds = 0
-            predicted_zones_list = []
-            
-            if len(person_trajectory) > 1:
-                initial_zones = torch.tensor([person_trajectory[0].item() for _ in range(data['num_people'])])
-                initial_time = person_times[0]
-                eval_times = person_times
-                
-                raw_predictions = model(initial_zones, initial_time, eval_times)
-                constrained_predictions = model.apply_physics_constraints(raw_predictions, initial_zones)
-                predicted_zones = torch.argmax(constrained_predictions[:, person_idx, :], dim=-1)
-                
-                for t in range(len(person_trajectory)):
-                    true_zone = person_trajectory[t].item()
-                    pred_zone = predicted_zones[t].item()
-                    predicted_zones_list.append(pred_zone)
-                    
-                    true_zone_name = str(processor.id_to_zone[true_zone])
-                    pred_zone_name = str(processor.id_to_zone[pred_zone])
-                    
-                    match = "✓" if true_zone == pred_zone else "✗"
-                    if true_zone == pred_zone:
-                        person_correct += 1
-                    
-                    if t > 0:
-                        prev_pred_zone = predicted_zones[t-1].item()
-                        is_compliant = (adjacency_matrix[prev_pred_zone, pred_zone] == 1 or prev_pred_zone == pred_zone)
-                        physics_ok = "✓" if is_compliant else "✗"
-                        if not is_compliant:
-                            total_violations += 1
-                            print(f"      VIOLATION: {prev_pred_zone} -> {pred_zone}")
-                    else:
-                        physics_ok = "✓"
-                    
-                    person_preds += 1
-                    time_val = person_times[t].item() if t < len(person_times) else t
-                    print(f"   {time_val:4.1f} | {true_zone_name:9s} | {pred_zone_name:9s} | {match:5s} | {physics_ok:8s}")
-            
-            total_correct += person_correct
-            total_predictions += person_preds
-            person_results[person_idx] = {
-                'accuracy': person_correct / person_preds if person_preds > 0 else 0,
-                'predicted_traj': predicted_zones_list,
-                'true_traj': person_trajectory.tolist(),
-                'times': person_times.tolist()
-            }
-
-    overall_accuracy = total_correct / total_predictions if total_predictions > 0 else 0
-    violation_rate = total_violations / total_predictions if total_predictions > 0 else 0
-    
-    print(f"\n📈 Overall Zone Prediction Accuracy: {overall_accuracy:.4f} ({overall_accuracy*100:.1f}%)")
-    print(f"⚠️  Physics Violation Rate: {violation_rate:.4f} ({violation_rate*100:.1f}%) ({total_violations}/{total_predictions})")
-    
-    return {
-        'overall_accuracy': overall_accuracy,
-        'violation_rate': violation_rate,
-        'person_results': person_results,
-        'total_violations': total_violations,
-        'total_predictions': total_predictions
-    }
-
-def visualize_results(eval_results, data, processor, config, plot_path=None):
-    """Visualize the prediction results in a dashboard."""
-    print("\n🎨 Visualizing Results Dashboard...")
-    
-    num_people = data['num_people']
-    fig = plt.figure(figsize=(16, 12))
-    gs = fig.add_gridspec(2, 2, height_ratios=[2, 1])
-
-    # Plot trajectories for first 2 people
-    for i in range(min(2, num_people)):
-        ax = fig.add_subplot(gs[0, i])
-        person_data = eval_results['person_results'][i]
-        acc = person_data['accuracy']
-        
-        ax.plot(person_data['times'], person_data['true_traj'], 'o-', label='True', linewidth=2, markersize=5)
-        ax.plot(person_data['times'], person_data['predicted_traj'], 's--', label='Predicted', linewidth=2, markersize=5)
-        ax.set_title(f"{data['person_names'][i]}'s Trajectory - Accuracy: {acc:.1%}")
-        ax.set_xlabel('Time (hours)')
-        ax.set_ylabel('Zone ID')
-        ax.legend()
-        ax.grid(True, alpha=0.4)
-        ax.set_ylim(-0.5, config.num_zones - 0.5)
-
-    # Plot accuracy bar chart
-    ax_bar = fig.add_subplot(gs[1, 0])
-    accuracies = [res['accuracy'] for res in eval_results['person_results'].values()]
-    person_names = data['person_names']
-    colors = plt.cm.viridis(np.linspace(0, 1, num_people))
-    
-    bars = ax_bar.bar(person_names, accuracies, color=colors)
-    ax_bar.set_title('Accuracy by Person')
-    ax_bar.set_ylabel('Accuracy')
-    ax_bar.set_ylim(0, 1)
-    for bar in bars:
-        height = bar.get_height()
-        ax_bar.text(bar.get_x() + bar.get_width() / 2.0, height, f'{height:.1%}', ha='center', va='bottom')
-
-    # Plot physics compliance pie chart
-    ax_pie = fig.add_subplot(gs[1, 1])
-    total_preds = eval_results['total_predictions']
-    total_violations = eval_results['total_violations']
-    compliant_preds = total_preds - total_violations
-    
-    sizes = [compliant_preds, total_violations]
-    labels = [f'Compliant ({compliant_preds})', f'Violations ({total_violations})']
-    colors = ['lightgreen', 'lightcoral']
-    explode = (0, 0.1) if total_violations > 0 else (0, 0)
-
-    ax_pie.pie(sizes, explode=explode, labels=labels, colors=colors, autopct='%1.1f%%', shadow=True, startangle=90)
-    ax_pie.axis('equal')
-    ax_pie.set_title(f'Physics Compliance ({total_preds} total predictions)')
-
-    fig.suptitle('GNN-ODE Evaluation Dashboard', fontsize=20)
-    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
-    
-    if plot_path:
-        plt.savefig(plot_path, dpi=300)
-        print(f"📊 Dashboard saved to '{plot_path}'")
-    plt.show()
-
 def main():
-    """Main function"""
+    """Main function to run model training."""
     print("🏠 Household Zone Movement Prediction using STG-NODE")
     print("Based on: Spatial-temporal graph neural ODE networks")
     print("=" * 60)
     
     try:
-        # Train model
-        model, data, processor, config, adjacency_matrix = train_model()
+        # Train model and save the best checkpoint
+        train_model()
         
-        save_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '..', '..', 'saved_models')
-        save_dir = os.path.abspath(save_dir)
-        plot_dir = os.path.join(save_dir, 'plots')
-        
-        # Evaluate model to get detailed results
-        eval_results = evaluate_model(model, data, processor, config, adjacency_matrix)
-        
-        # Save trajectory predictions for first 2 people to CSV
-        csv_path = os.path.join(save_dir, 'predictions_sample.csv')
-        records = []
-        for i in range(min(2, data['num_people'])):
-            person_res = eval_results['person_results'][i]
-            for t_idx, time in enumerate(person_res['times']):
-                records.append({
-                    'person_id': i,
-                    'person_name': data['person_names'][i],
-                    'time': time,
-                    'true_zone': processor.id_to_zone[person_res['true_traj'][t_idx]],
-                    'predicted_zone': processor.id_to_zone[person_res['predicted_traj'][t_idx]]
-                })
-        pd.DataFrame(records).to_csv(csv_path, index=False)
-        print(f"Predictions for 2 persons saved to {csv_path}")
-
-        # Visualize results using the new dashboard
-        plot_path = os.path.join(plot_dir, 'evaluation_dashboard.png')
-        visualize_results(eval_results, data, processor, config, plot_path=plot_path)
-        
-        print(f"\n🎯 Final Results:")
-        print(f"   Zone Prediction Accuracy: {eval_results['overall_accuracy']*100:.1f}%")
-        print(f"   Physics Violation Rate: {eval_results['violation_rate']*100:.1f}%")
-        print(f"\n💡 The model learned household movement patterns with physics constraints!")
-        print(f"   High accuracy with low violation rate indicates successful learning.")
+        print("\n✅ Training complete.")
+        print("To evaluate the best model and see visualizations, run:")
+        print("python -m src.ananke_abm.models.run.evaluate")
         
     except Exception as e:
-        print(f"❌ Error occurred: {e}")
+        print(f"❌ Error occurred during training: {e}")
         import traceback
         traceback.print_exc()
 
