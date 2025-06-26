@@ -28,7 +28,7 @@ class HouseholdConfig:
     num_layers: int = 3  # Multiple layers for complexity
     num_zones: int = 10
     learning_rate: float = 0.001  # Lower learning rate for stability
-    num_epochs: int = 10000  # Extended training time
+    num_epochs: int = 11000  # Extended training time
     physics_weight: float = 1.0  # Not needed with hard constraints
     exploration_noise: float = 0.02  # Smaller noise for stability
     dropout: float = 0.1  # Regularization
@@ -520,21 +520,31 @@ def train_model():
             person_trajectory = trajectories_data[person_idx]
             person_times = times_data[person_idx]
             
-            # Curriculum learning: start with shorter sequences, gradually increase
+            # Curriculum learning: start with shorter sequences, gradually increase, then focus on end-of-day
             if epoch < 1000:
                 max_window_size = 5  # Short sequences first
             elif epoch < 3000:
                 max_window_size = 8  # Medium sequences
-            else:
-                max_window_size = 12  # Full sequences
+            elif epoch < 7000:
+                max_window_size = 12 # Full sequences
+            else: # Stage 4: Focus on end-of-day sequences
+                max_window_size = 12
             
             window_size = min(max_window_size, len(person_trajectory) - 1)
             if window_size < 2:
                 continue
                 
-            # More overlapping windows for better coverage
+            # More overlapping windows for better coverage, plus end-anchored windows
             step_size = max(1, window_size // 3)
-            for start_idx in range(0, len(person_trajectory) - window_size, step_size):
+            start_indices = list(range(0, len(person_trajectory) - window_size, step_size))
+            
+            # In the end-of-day focus stage, add windows anchored to the end
+            if epoch >= 7000:
+                end_anchor_start = len(person_trajectory) - window_size
+                if end_anchor_start > 0 and end_anchor_start not in start_indices:
+                    start_indices.append(end_anchor_start)
+
+            for start_idx in start_indices:
                 end_idx = min(start_idx + window_size, len(person_trajectory))
                 if end_idx - start_idx < 2:
                     continue
@@ -588,6 +598,7 @@ def train_model():
             # Early stopping check
             if (loss_value < best_loss) and (violation_rate == 0):
                 best_loss = loss_value
+                patience_counter = 0 # Reset patience when a better model is found
                 best_violation = violation_rate
                 best_model_state = {
                     'model_state_dict': model.state_dict(),
@@ -596,6 +607,8 @@ def train_model():
                     'processor_id_to_zone': processor.id_to_zone
                 }
                 torch.save(best_model_state, os.path.join(save_dir, 'household_stg_node_best.pth'))
+            else:
+                patience_counter += 1
             
             if (epoch + 1) % 50 == 0:
                 current_lr = optimizer.param_groups[0]['lr']
