@@ -15,7 +15,9 @@ import os
 warnings.filterwarnings('ignore')
 
 from torchdiffeq import odeint
-from ananke_abm.data_generator.load_data import load_mobility_data, get_zone_adjacency_matrix
+from ananke_abm.data_generator.mock_2p import create_two_person_training_data
+from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
+import networkx as nx
 
 @dataclass
 class HouseholdConfig:
@@ -30,6 +32,8 @@ class HouseholdConfig:
     physics_weight: float = 1.0  # Not needed with hard constraints
     exploration_noise: float = 0.02  # Smaller noise for stability
     dropout: float = 0.1  # Regularization
+    person_feat_dim: int = 8 # UPDATED to use all features from mock_2p
+    person_embed_dim: int = 32
 
 class ZoneEmbedding(nn.Module):
     """Embedding layer for zones with spatial and temporal features"""
@@ -159,7 +163,7 @@ class HouseholdODEFunc(nn.Module):
         self.time_embed = nn.Linear(1, config.temporal_embed_dim)
         
         # Multi-layer household dynamics network
-        total_dim = config.zone_embed_dim + config.temporal_embed_dim
+        total_dim = config.zone_embed_dim + config.person_embed_dim + config.temporal_embed_dim
         
         # Input layer
         self.input_layer = nn.Linear(total_dim, config.hidden_dim)
@@ -205,8 +209,13 @@ class HouseholdODEFunc(nn.Module):
         time_embed = self.time_embed(t.unsqueeze(0).unsqueeze(0))  # [1, 1, time_dim]
         time_embed = time_embed.expand(num_people, -1)  # [num_people, time_dim]
         
-        # Combine with current state
-        state_with_time = torch.cat([state[:, :-self.config.temporal_embed_dim], time_embed], dim=-1)
+        # Re-combine dynamic part of state with static person features and new time
+        zone_part, person_part, _ = torch.split(
+            state, 
+            [self.config.zone_embed_dim, self.config.person_embed_dim, self.config.temporal_embed_dim], 
+            dim=-1
+        )
+        state_with_time = torch.cat([zone_part, person_part, time_embed], dim=-1)
         
         # Input layer
         h = torch.relu(self.input_layer(state_with_time))
@@ -264,33 +273,36 @@ class HouseholdODEFunc(nn.Module):
 class STGNodeHousehold(nn.Module):
     """STG-NODE model for household zone movement prediction"""
     
-    def __init__(self, config: HouseholdConfig, num_zones: int, zone_features: torch.Tensor):
+    def __init__(self, config: HouseholdConfig, num_zones: int, zone_features: torch.Tensor, person_features: torch.Tensor):
         super().__init__()
         self.config = config
         self.num_zones = num_zones
         self.register_buffer('zone_features', zone_features)
+        self.register_buffer('person_features', person_features)
         
         # ODE function
         self.ode_func = HouseholdODEFunc(config, zone_features)
         
         # Initial state embedding
         self.zone_embed = nn.Embedding(num_zones, config.zone_embed_dim)
+        self.person_feature_embedder = nn.Linear(config.person_feat_dim, config.person_embed_dim)
         self.time_embed = nn.Linear(1, config.temporal_embed_dim)
         
         # Output head for zone prediction
-        total_dim = config.zone_embed_dim + config.temporal_embed_dim
+        total_dim = config.zone_embed_dim + config.person_embed_dim + config.temporal_embed_dim
         self.zone_predictor = nn.Linear(total_dim, num_zones)
         
         # Store adjacency matrix for physics constraints
         self.register_buffer('adjacency_matrix', torch.zeros(num_zones, num_zones))
         
     def get_initial_state(self, initial_zones, initial_time):
-        """Get initial state embeddings"""
-        zone_embeds = self.zone_embed(initial_zones)  # [num_people, zone_embed_dim]
-        time_embed = self.time_embed(initial_time.unsqueeze(0).unsqueeze(0))  # [1, 1, time_dim]
-        time_embed = time_embed.expand(len(initial_zones), -1)  # [num_people, time_dim]
+        """Get initial state embeddings including person features."""
+        num_people = len(initial_zones)
+        zone_embeds = self.zone_embed(initial_zones)
+        time_embed = self.time_embed(initial_time.unsqueeze(0).unsqueeze(0)).expand(num_people, -1)
+        person_embeds = self.person_feature_embedder(self.person_features)
         
-        initial_state = torch.cat([zone_embeds, time_embed], dim=-1)
+        initial_state = torch.cat([zone_embeds, person_embeds, time_embed], dim=-1)
         return initial_state
         
     def forward(self, initial_zones, initial_time, eval_times):
@@ -312,7 +324,7 @@ class STGNodeHousehold(nn.Module):
             print(f"ODE solver failed: {e}, using simple forward pass")
             # Fallback: just repeat initial state
             solution = initial_state.unsqueeze(0).expand(len(eval_times), -1, -1)
-
+        
         # Check for NaN values from the ODE solver
         if torch.isnan(solution).any():
             print("⚠️ WARNING: NaN values detected in ODE solution. Clamping to 0.")
@@ -361,82 +373,54 @@ class STGNodeHousehold(nn.Module):
         return constrained_logits
 
 class HouseholdDataProcessor:
-    """Process mock data for household movement prediction"""
+    """Process mock data for household movement prediction from mock_2p"""
     
     def __init__(self):
         self.zone_to_id = {}
         self.id_to_zone = {}
+        self.person_names = []
         
     def process_data(self):
-        """Process the mock data"""
-        trajectories_dict, people_df, zones_df = load_mobility_data()
+        """Process the mock data from mock_2p"""
+        print("   Loading and processing data from mock_2p...")
+        sarah_data, marcus_data = create_two_person_training_data()
+
+        # Combine Sarah and Marcus into a two-person household for the multi-agent model
+        person_features = torch.stack([sarah_data['person_attrs'], marcus_data['person_attrs']])
+        trajectories_data = [sarah_data['zone_observations'], marcus_data['zone_observations']]
+        times_data = [sarah_data['times'], marcus_data['times']]
+        person_names = [sarah_data['person_name'], marcus_data['person_name']]
+        num_people = 2
+        num_zones = sarah_data['num_zones']
+        zone_features = sarah_data['zone_features']
+
+        # Create the adjacency matrix from the shared zone graph
+        zone_graph, _ = create_mock_zone_graph()
+        adj_matrix = nx.to_numpy_array(zone_graph, nodelist=sorted(zone_graph.nodes()))
         
-        # Create zone mappings
-        unique_zones = sorted(zones_df['zone_id'].unique())
-        self.zone_to_id = {zone: i for i, zone in enumerate(unique_zones)}
-        self.id_to_zone = {i: zone for zone, i in self.zone_to_id.items()}
-        
-        print(f"   Found {len(unique_zones)} unique zones: {unique_zones}")
-        print(f"   Found {len(trajectories_dict)} people in household")
-        
-        # Process zone features
-        zone_features = []
-        for zone_id in unique_zones:
-            zone_info = zones_df[zones_df['zone_id'] == zone_id].iloc[0]
-            features = np.array([
-                zone_info['x_coord'], zone_info['y_coord'],  # spatial
-                zone_info['zone_type_residential'], zone_info['zone_type_office'],
-                zone_info['zone_type_retail'], zone_info['zone_type_recreation'],
-                zone_info['zone_type_transport'],
-                zone_info['population'], zone_info['job_opportunities'],
-                zone_info['retail_accessibility'], zone_info['transit_accessibility']
-            ])
-            zone_features.append(features)
-        
-        zone_features = torch.tensor(zone_features, dtype=torch.float32)
-        
-        # Process trajectories
-        household_trajectories = []
-        for person_name, trajectory in trajectories_dict.items():
-            person_trajectory = []
-            zones = trajectory['zones']  # Array of zone IDs
-            for zone_id in zones:
-                mapped_zone_id = self.zone_to_id[int(zone_id)]
-                person_trajectory.append(mapped_zone_id)
-            household_trajectories.append(person_trajectory)
-            print(f"   Person {person_name}: {len(person_trajectory)} time steps, zones {min(person_trajectory)}-{max(person_trajectory)}")
-        
-        # Handle different trajectory lengths naturally with ODE approach
-        num_people = len(household_trajectories)
-        trajectory_lengths = [len(traj) for traj in household_trajectories]
-        max_seq_len = max(trajectory_lengths)
-        
-        print(f"   Trajectory lengths: {trajectory_lengths}")
-        print(f"   Using common time grid with max length: {max_seq_len}")
-        
-        # Store trajectories with their actual data and corresponding times
-        trajectories_data = []
-        times_data = []
-        
-        for p, trajectory in enumerate(household_trajectories):
-            person_name = list(trajectories_dict.keys())[p]
-            person_times = trajectories_dict[person_name]['times']
-            
-            trajectories_data.append(torch.tensor(trajectory, dtype=torch.long))
-            times_data.append(torch.tensor(person_times, dtype=torch.float32))
-        
-        # Create a common time grid for evaluation
+        # Create zone mappings for visualization/CSV output
+        self.zone_to_id = {i + 1: i for i in range(num_zones)}
+        self.id_to_zone = {i: i + 1 for i in range(num_zones)}
+        self.person_names = person_names
+
+        # Create a common time grid for the ODE solver
         all_times = torch.cat(times_data)
         min_time, max_time = all_times.min(), all_times.max()
-        common_time_grid = torch.linspace(min_time, max_time, max_seq_len)
+        max_seq_len = max(len(t) for t in trajectories_data)
+        common_time_grid = torch.linspace(min_time.item(), max_time.item(), max_seq_len)
+
+        print(f"   Successfully processed data for: {person_names}")
         
         return {
             'trajectories_data': trajectories_data,
             'times_data': times_data,
             'common_time_grid': common_time_grid,
             'zone_features': zone_features,
-            'num_zones': len(unique_zones),
-            'num_people': num_people
+            'num_zones': num_zones,
+            'num_people': num_people,
+            'person_names': self.person_names,
+            'person_features': person_features,
+            'adjacency_matrix': torch.tensor(adj_matrix, dtype=torch.float32)
         }
 
 def physics_constraint_loss(predictions, current_zones, adjacency_matrix):
@@ -478,7 +462,7 @@ def train_model():
     print("🏠 Training Household Zone Movement Prediction Model")
     print("=" * 60)
     
-    # Process data
+    # Process data using the new processor
     print("📊 Processing mock data...")
     processor = HouseholdDataProcessor()
     data = processor.process_data()
@@ -486,10 +470,10 @@ def train_model():
     print(f"   Number of people: {data['num_people']}")
     print(f"   Zone features shape: {data['zone_features'].shape}")
     print(f"   Number of zones: {data['num_zones']}")
-    print(f"   Common time grid: {data['common_time_grid'].shape}")
+    print(f"   Person features shape: {data['person_features'].shape}")
     
-    # Get adjacency matrix
-    adjacency_matrix = torch.tensor(get_zone_adjacency_matrix(), dtype=torch.float32)
+    # Get adjacency matrix directly from the new data processor
+    adjacency_matrix = data['adjacency_matrix']
     print(f"   Adjacency matrix shape: {adjacency_matrix.shape}")
     
     # Configuration
@@ -497,7 +481,7 @@ def train_model():
     config.num_zones = data['num_zones']
     
     # Create model
-    model = STGNodeHousehold(config, data['num_zones'], data['zone_features'])
+    model = STGNodeHousehold(config, data['num_zones'], data['zone_features'], data['person_features'])
     model.set_adjacency_matrix(adjacency_matrix)  # Set physics constraints
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=1e-4)
     
@@ -647,143 +631,151 @@ def train_model():
     print(f"Best model saved to {os.path.join(save_dir, 'household_stg_node_best.pth')}")
     return model, data, processor, config, adjacency_matrix
 
-def evaluate_model(model, data, processor, config, adjacency_matrix, save_csv=False, csv_path=None):
-    """Evaluate the trained model"""
+def evaluate_model(model, data, processor, config, adjacency_matrix):
+    """Evaluate the trained model and return detailed results."""
     print("\n🔍 Evaluating Model Performance")
     print("=" * 50)
     
     model.eval()
-    predictions_records = []
+    
+    person_results = {}
+    total_correct = 0
+    total_predictions = 0
+    total_violations = 0
+    
     with torch.no_grad():
         trajectories_data = data['trajectories_data']
         times_data = data['times_data']
         
-        total_correct = 0
-        total_predictions = 0
-        violations = 0
-        
-        # Evaluate each person's trajectory
         for person_idx in range(data['num_people']):
             person_trajectory = trajectories_data[person_idx]
             person_times = times_data[person_idx]
             
-            print(f"\n   Person {person_idx + 1}:")
+            print(f"\n   Person {person_idx + 1} ({data['person_names'][person_idx]}):")
             print("   Time | True Zone | Pred Zone | Match | Physics OK")
             print("   -----|-----------|-----------|-------|----------")
             
-            # Predict trajectory starting from first position
+            person_correct = 0
+            person_preds = 0
+            predicted_zones_list = []
+            
             if len(person_trajectory) > 1:
                 initial_zones = torch.tensor([person_trajectory[0].item() for _ in range(data['num_people'])])
                 initial_time = person_times[0]
                 eval_times = person_times
                 
-                # Get predictions
                 raw_predictions = model(initial_zones, initial_time, eval_times)
                 constrained_predictions = model.apply_physics_constraints(raw_predictions, initial_zones)
                 predicted_zones = torch.argmax(constrained_predictions[:, person_idx, :], dim=-1)
                 
-                # Compare predictions with ground truth
                 for t in range(len(person_trajectory)):
                     true_zone = person_trajectory[t].item()
                     pred_zone = predicted_zones[t].item()
+                    predicted_zones_list.append(pred_zone)
                     
                     true_zone_name = str(processor.id_to_zone[true_zone])
                     pred_zone_name = str(processor.id_to_zone[pred_zone])
                     
                     match = "✓" if true_zone == pred_zone else "✗"
+                    if true_zone == pred_zone:
+                        person_correct += 1
                     
-                    # Check physics (if not first step)
                     if t > 0:
-                        # Use PREDICTED previous zone for physics check (not ground truth)
                         prev_pred_zone = predicted_zones[t-1].item()
-                        physics_ok = "✓" if (adjacency_matrix[prev_pred_zone, pred_zone] == 1 or 
-                                           prev_pred_zone == pred_zone) else "✗"
-                        
-                        if adjacency_matrix[prev_pred_zone, pred_zone] == 0 and prev_pred_zone != pred_zone:
-                            violations += 1
+                        is_compliant = (adjacency_matrix[prev_pred_zone, pred_zone] == 1 or prev_pred_zone == pred_zone)
+                        physics_ok = "✓" if is_compliant else "✗"
+                        if not is_compliant:
+                            total_violations += 1
                             print(f"      VIOLATION: {prev_pred_zone} -> {pred_zone}")
                     else:
-                        physics_ok = "✓"  # First step is always valid
+                        physics_ok = "✓"
                     
-                    total_correct += (true_zone == pred_zone)
-                    total_predictions += 1
-                    
+                    person_preds += 1
                     time_val = person_times[t].item() if t < len(person_times) else t
                     print(f"   {time_val:4.1f} | {true_zone_name:9s} | {pred_zone_name:9s} | {match:5s} | {physics_ok:8s}")
-                    
-                    if save_csv and person_idx < 2:
-                        predictions_records.append({
-                            'person_id': person_idx,
-                            'time': time_val,
-                            'true_zone': true_zone_name,
-                            'predicted_zone': pred_zone_name
-                        })
-        
-        # Calculate overall metrics
-        accuracy = total_correct / total_predictions if total_predictions > 0 else 0
-        violation_rate = violations / total_predictions if total_predictions > 0 else 0
-        
-        print(f"\n📈 Overall Zone Prediction Accuracy: {accuracy:.4f} ({accuracy*100:.1f}%)")
-        print(f"⚠️  Physics Violation Rate: {violation_rate:.4f} ({violation_rate*100:.1f}%)")
-    
-    if save_csv and predictions_records and csv_path:
-        df = pd.DataFrame(predictions_records)
-        df.to_csv(csv_path, index=False)
-        print(f"Predictions for 2 persons saved to {csv_path}")
-    return accuracy, violation_rate
-
-def visualize_results(model, data, processor, config, adjacency_matrix):
-    """Visualize the prediction results"""
-    print("\n🎨 Visualizing Results...")
-    
-    model.eval()
-    with torch.no_grad():
-        trajectories_data = data['trajectories_data']
-        times_data = data['times_data']
-        
-        # Create visualization
-        num_people = data['num_people']
-        fig, axes = plt.subplots(num_people, 1, figsize=(12, 4*num_people))
-        if num_people == 1:
-            axes = [axes]
-        
-        for person_idx in range(num_people):
-            person_trajectory = trajectories_data[person_idx]
-            person_times = times_data[person_idx]
             
-            # Get predictions for this person
-            if len(person_trajectory) > 1:
-                initial_zones = torch.tensor([person_trajectory[0].item() for _ in range(num_people)])
-                initial_time = person_times[0]
-                eval_times = person_times
-                
-                raw_predictions = model(initial_zones, initial_time, eval_times)
-                
-                # Apply physics constraints to get the final predictions for plotting
-                constrained_predictions = model.apply_physics_constraints(raw_predictions, initial_zones)
-                predicted_zones = torch.argmax(constrained_predictions[:, person_idx, :], dim=-1)
-                
-                # Plot true vs predicted
-                true_zones = person_trajectory.numpy()
-                pred_zones = predicted_zones.numpy()
-                time_points = person_times.numpy()
-                
-                axes[person_idx].plot(time_points, true_zones, 'o-', 
-                                    label='True', linewidth=2, markersize=6)
-                axes[person_idx].plot(time_points, pred_zones, 's--', 
-                                    label='Predicted', linewidth=2, markersize=6)
-                axes[person_idx].set_title(f'Person {person_idx + 1} - Zone Movement Over Time')
-                axes[person_idx].set_xlabel('Time (hours)')
-                axes[person_idx].set_ylabel('Zone ID')
-                axes[person_idx].legend()
-                axes[person_idx].grid(True, alpha=0.3)
-                axes[person_idx].set_ylim(-0.5, config.num_zones - 0.5)
+            total_correct += person_correct
+            total_predictions += person_preds
+            person_results[person_idx] = {
+                'accuracy': person_correct / person_preds if person_preds > 0 else 0,
+                'predicted_traj': predicted_zones_list,
+                'true_traj': person_trajectory.tolist(),
+                'times': person_times.tolist()
+            }
+
+    overall_accuracy = total_correct / total_predictions if total_predictions > 0 else 0
+    violation_rate = total_violations / total_predictions if total_predictions > 0 else 0
+    
+    print(f"\n📈 Overall Zone Prediction Accuracy: {overall_accuracy:.4f} ({overall_accuracy*100:.1f}%)")
+    print(f"⚠️  Physics Violation Rate: {violation_rate:.4f} ({violation_rate*100:.1f}%) ({total_violations}/{total_predictions})")
+    
+    return {
+        'overall_accuracy': overall_accuracy,
+        'violation_rate': violation_rate,
+        'person_results': person_results,
+        'total_violations': total_violations,
+        'total_predictions': total_predictions
+    }
+
+def visualize_results(eval_results, data, processor, config, plot_path=None):
+    """Visualize the prediction results in a dashboard."""
+    print("\n🎨 Visualizing Results Dashboard...")
+    
+    num_people = data['num_people']
+    fig = plt.figure(figsize=(16, 12))
+    gs = fig.add_gridspec(2, 2, height_ratios=[2, 1])
+
+    # Plot trajectories for first 2 people
+    for i in range(min(2, num_people)):
+        ax = fig.add_subplot(gs[0, i])
+        person_data = eval_results['person_results'][i]
+        acc = person_data['accuracy']
         
-        plt.tight_layout()
-        plt.savefig('household_zone_movement_prediction.png', dpi=300, bbox_inches='tight')
-        plt.show()
-        
-        print("📊 Visualization saved as 'household_zone_movement_prediction.png'")
+        ax.plot(person_data['times'], person_data['true_traj'], 'o-', label='True', linewidth=2, markersize=5)
+        ax.plot(person_data['times'], person_data['predicted_traj'], 's--', label='Predicted', linewidth=2, markersize=5)
+        ax.set_title(f"{data['person_names'][i]}'s Trajectory - Accuracy: {acc:.1%}")
+        ax.set_xlabel('Time (hours)')
+        ax.set_ylabel('Zone ID')
+        ax.legend()
+        ax.grid(True, alpha=0.4)
+        ax.set_ylim(-0.5, config.num_zones - 0.5)
+
+    # Plot accuracy bar chart
+    ax_bar = fig.add_subplot(gs[1, 0])
+    accuracies = [res['accuracy'] for res in eval_results['person_results'].values()]
+    person_names = data['person_names']
+    colors = plt.cm.viridis(np.linspace(0, 1, num_people))
+    
+    bars = ax_bar.bar(person_names, accuracies, color=colors)
+    ax_bar.set_title('Accuracy by Person')
+    ax_bar.set_ylabel('Accuracy')
+    ax_bar.set_ylim(0, 1)
+    for bar in bars:
+        height = bar.get_height()
+        ax_bar.text(bar.get_x() + bar.get_width() / 2.0, height, f'{height:.1%}', ha='center', va='bottom')
+
+    # Plot physics compliance pie chart
+    ax_pie = fig.add_subplot(gs[1, 1])
+    total_preds = eval_results['total_predictions']
+    total_violations = eval_results['total_violations']
+    compliant_preds = total_preds - total_violations
+    
+    sizes = [compliant_preds, total_violations]
+    labels = [f'Compliant ({compliant_preds})', f'Violations ({total_violations})']
+    colors = ['lightgreen', 'lightcoral']
+    explode = (0, 0.1) if total_violations > 0 else (0, 0)
+
+    ax_pie.pie(sizes, explode=explode, labels=labels, colors=colors, autopct='%1.1f%%', shadow=True, startangle=90)
+    ax_pie.axis('equal')
+    ax_pie.set_title(f'Physics Compliance ({total_preds} total predictions)')
+
+    fig.suptitle('GNN-ODE Evaluation Dashboard', fontsize=20)
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    
+    if plot_path:
+        plt.savefig(plot_path, dpi=300)
+        print(f"📊 Dashboard saved to '{plot_path}'")
+    plt.show()
 
 def main():
     """Main function"""
@@ -794,18 +786,37 @@ def main():
     try:
         # Train model
         model, data, processor, config, adjacency_matrix = train_model()
+        
         save_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '..', '..', 'saved_models')
         save_dir = os.path.abspath(save_dir)
-        csv_path = os.path.join(save_dir, 'predictions_sample.csv')
-        # Evaluate model and save predictions for 2 persons
-        accuracy, violation_rate = evaluate_model(model, data, processor, config, adjacency_matrix, save_csv=True, csv_path=csv_path)
+        plot_dir = os.path.join(save_dir, 'plots')
         
-        # Visualize results
-        visualize_results(model, data, processor, config, adjacency_matrix)
+        # Evaluate model to get detailed results
+        eval_results = evaluate_model(model, data, processor, config, adjacency_matrix)
+        
+        # Save trajectory predictions for first 2 people to CSV
+        csv_path = os.path.join(save_dir, 'predictions_sample.csv')
+        records = []
+        for i in range(min(2, data['num_people'])):
+            person_res = eval_results['person_results'][i]
+            for t_idx, time in enumerate(person_res['times']):
+                records.append({
+                    'person_id': i,
+                    'person_name': data['person_names'][i],
+                    'time': time,
+                    'true_zone': processor.id_to_zone[person_res['true_traj'][t_idx]],
+                    'predicted_zone': processor.id_to_zone[person_res['predicted_traj'][t_idx]]
+                })
+        pd.DataFrame(records).to_csv(csv_path, index=False)
+        print(f"Predictions for 2 persons saved to {csv_path}")
+
+        # Visualize results using the new dashboard
+        plot_path = os.path.join(plot_dir, 'evaluation_dashboard.png')
+        visualize_results(eval_results, data, processor, config, plot_path=plot_path)
         
         print(f"\n🎯 Final Results:")
-        print(f"   Zone Prediction Accuracy: {accuracy*100:.1f}%")
-        print(f"   Physics Violation Rate: {violation_rate*100:.1f}%")
+        print(f"   Zone Prediction Accuracy: {eval_results['overall_accuracy']*100:.1f}%")
+        print(f"   Physics Violation Rate: {eval_results['violation_rate']*100:.1f}%")
         print(f"\n💡 The model learned household movement patterns with physics constraints!")
         print(f"   High accuracy with low violation rate indicates successful learning.")
         
