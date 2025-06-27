@@ -27,6 +27,7 @@ dependencies = [
     "torchdiffeq>=0.2.5",
     "torchvision>=0.22.0",
     "wandb>=0.20.0",
+    "fastdtw==0.3.4",
 ]
 
 [project.optional-dependencies]

@@ -56,18 +56,28 @@ def evaluate_model(model, data, processor, config, adjacency_matrix):
                 eval_times = person_times
                 
                 raw_predictions = model(initial_zones, initial_time, eval_times)
-                # The prediction from the new model might not need this apply_physics_constraints
-                # For now, we assume it's part of the model's responsibility.
-                # If apply_physics_constraints is a method on the model, this will work.
-                try:
-                    constrained_predictions = model.apply_physics_constraints(raw_predictions, initial_zones)
-                except AttributeError:
-                     # Fallback if the method doesn't exist on the new model
-                    print("   (Note: `apply_physics_constraints` not found, using raw predictions)")
-                    constrained_predictions = raw_predictions
 
-                predicted_zones = torch.argmax(constrained_predictions[:, person_idx, :], dim=-1)
+                # --- FIX: Apply hard physics constraints sequentially during evaluation ---
+                constrained_logits = raw_predictions.clone()
+                predicted_zones = torch.zeros(len(eval_times), dtype=torch.long)
                 
+                for t in range(len(eval_times)):
+                    if t == 0:
+                        # For the first step, the "previous" zone is the initial known zone
+                        prev_zone = initial_zones[person_idx].item()
+                    else:
+                        # For subsequent steps, the "previous" zone is the one we predicted in the last step
+                        prev_zone = predicted_zones[t-1].item()
+                        
+                    # Apply constraints based on the previous zone
+                    valid_mask = adjacency_matrix[prev_zone].clone()
+                    valid_mask[prev_zone] = 1.0  # Can stay in the same zone
+                    invalid_mask = (valid_mask == 0)
+                    constrained_logits[t, person_idx, invalid_mask] = -1e9
+                    
+                    # Make prediction based on constrained logits
+                    predicted_zones[t] = torch.argmax(constrained_logits[t, person_idx, :])
+
                 for t in range(len(person_trajectory)):
                     true_zone = person_trajectory[t].item()
                     pred_zone = predicted_zones[t].item()
@@ -209,12 +219,18 @@ def main():
         adjacency_matrix = data['adjacency_matrix']
 
         # Re-create the model and load its state
-        model = STGNodeHousehold(config, data['num_zones'], data['zone_features'], data['person_features'], data['edge_index'])
+        model = STGNodeHousehold(
+            config, 
+            data['num_zones'], 
+            data['zone_features'], 
+            data['person_features'], 
+            data['edge_index_phys'], 
+            data['edge_index_sem']
+        )
         model.load_state_dict(best_model_data['model_state_dict'])
         
-        # If the model has the set_adjacency_matrix method, call it.
-        if hasattr(model, 'set_adjacency_matrix'):
-            model.set_adjacency_matrix(adjacency_matrix)
+        # The set_adjacency_matrix method has been removed.
+        # The adjacency matrix is passed directly to evaluation functions.
         
         # Run evaluation
         eval_results = evaluate_model(model, data, processor, config, adjacency_matrix)

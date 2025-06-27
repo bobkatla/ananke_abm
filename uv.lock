@@ -135,6 +135,7 @@ dependencies = [
     { name = "click" },
     { name = "cvxpy" },
     { name = "dgl" },
+    { name = "fastdtw" },
     { name = "folium" },
     { name = "igraph" },
     { name = "jax" },
@@ -173,6 +174,7 @@ requires-dist = [
     { name = "click", specifier = ">=8.2.1" },
     { name = "cvxpy", specifier = ">=1.3" },
     { name = "dgl", specifier = ">=1.1" },
+    { name = "fastdtw", specifier = "==0.3.4" },
     { name = "folium", specifier = ">=0.19.7" },
     { name = "igraph", specifier = ">=0.11.8" },
     { name = "ipykernel", marker = "extra == 'dev'", specifier = ">=6.29.5" },
@@ -618,6 +620,15 @@ sdist = { url = "https://files.pythonhosted.org/packages/91/50/a9d80c47ff289c611
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7b/8f/c4d9bafc34ad7ad5d8dc16dd1347ee0e507a52c3adb6bfa8887e1c6a26ba/executing-2.2.0-py2.py3-none-any.whl", hash = "sha256:11387150cad388d62750327a53d3339fad4888b39a6fe233c3afbb54ecffd3aa", size = 26702, upload-time = "2025-01-22T15:41:25.929Z" },
 ]
+
+[[package]]
+name = "fastdtw"
+version = "0.3.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/99/43/30f2d8db076f216b15c10db663b46e22d1750b1ebacd7af6e62b83d6ab98/fastdtw-0.3.4.tar.gz", hash = "sha256:2350fa6ec36bcad186eaf81f46eff35181baf04e324f522de8aeb43d0243f64f", size = 133402, upload-time = "2019-10-07T16:02:29.982Z" }
 
 [[package]]
 name = "filelock"
