@@ -25,6 +25,7 @@ from scipy.spatial.distance import euclidean
 from fastdtw import fastdtw
 
 from ananke_abm.models.run.ode_components import ODEFunc, ODEBlock
+from ananke_abm.models.run.cvae_components import Encoder, LatentVariable
 
 @dataclass
 class HouseholdConfig:
@@ -42,9 +43,39 @@ class HouseholdConfig:
     person_feat_dim: int = 8 # UPDATED to use all features from mock_2p
     person_embed_dim: int = 32
     ode_hidden_dim: int = 64 # Hidden dim for the layers inside the ODE function
+    latent_dim: int = 16 # Dimension of the CVAE latent space
+    encoder_hidden_dim: int = 64 # Hidden dim for the encoder GRU
+    kld_weight: float = 0.001 # Weight for the KL Divergence loss term
+
+class STG_CVAE(nn.Module):
+    """
+    The main Spatio-Temporal Graph CVAE model.
+    It contains the Encoder and the GNN-ODE Decoder.
+    """
+    def __init__(self, config: HouseholdConfig, num_zones: int, zone_features: torch.Tensor, person_features: torch.Tensor, edge_index_phys: torch.Tensor, edge_index_sem: torch.Tensor):
+        super().__init__()
+        self.encoder = Encoder(num_zones, config.encoder_hidden_dim, config.latent_dim)
+        self.latent_sampler = LatentVariable()
+        self.decoder = STGNodeHousehold(config, num_zones, zone_features, person_features, edge_index_phys, edge_index_sem)
+
+    def forward(self, agent_trajectories, initial_zones, initial_time, eval_times):
+        """
+        Processes a batch of trajectories, one for each agent.
+        """
+        # agent_trajectories shape: [num_agents, seq_len]
+        # Encode all agent trajectories in a batch to get agent-specific distributions
+        mu, log_var = self.encoder(agent_trajectories)
+        
+        # Sample a batch of agent-specific latent vectors
+        z = self.latent_sampler(mu, log_var) # z shape: [num_agents, latent_dim]
+        
+        # Decode using the GNN-ODE model, conditioned on the batch of z vectors
+        recon_trajectories = self.decoder(initial_zones, initial_time, eval_times, z)
+        
+        return recon_trajectories, mu, log_var
 
 class STGNodeHousehold(nn.Module):
-    """Spatially-Conditioned STG-NODE model."""
+    """Spatially-Conditioned STG-NODE model (now the Decoder)."""
     
     def __init__(self, config: HouseholdConfig, num_zones: int, zone_features: torch.Tensor, person_features: torch.Tensor, edge_index_phys: torch.Tensor, edge_index_sem: torch.Tensor):
         super().__init__()
@@ -65,36 +96,37 @@ class STGNodeHousehold(nn.Module):
         
         # Person embedders to create initial hidden state
         self.person_feature_embedder = nn.Linear(config.person_feat_dim, config.person_embed_dim)
-        # The input to the initial state mapper now includes embeddings from both GNNs
-        initial_state_input_dim = config.person_embed_dim + (config.zone_embed_dim * 2)
+        # The input to the initial state mapper now includes embeddings from both GNNs AND the latent vector z
+        initial_state_input_dim = config.person_embed_dim + (config.zone_embed_dim * 2) + config.latent_dim
         self.initial_state_mapper = nn.Linear(initial_state_input_dim, config.hidden_dim)
         
         # Final output predictor
         self.zone_predictor = nn.Linear(config.hidden_dim, num_zones)
         
-    def get_initial_state(self, initial_zones, phys_zone_embeds, sem_zone_embeds):
-        """Get initial person hidden states."""
+    def get_initial_state(self, initial_zones, phys_zone_embeds, sem_zone_embeds, z_batch):
+        """Get initial person hidden states, conditioned on a batch of latent vectors."""
         # Get embeddings for the specific zones people start in from both graphs
         initial_phys_context = phys_zone_embeds[initial_zones]
         initial_sem_context = sem_zone_embeds[initial_zones]
         
         person_embeds = self.person_feature_embedder(self.person_features)
         
-        # Combine person features with their starting spatial and semantic context
-        combined_context = torch.cat([person_embeds, initial_phys_context, initial_sem_context], dim=-1)
+        # z_batch is already [num_agents, latent_dim], no expansion needed
+        # Combine person features, contexts, and the corresponding agent's latent vector
+        combined_context = torch.cat([person_embeds, initial_phys_context, initial_sem_context, z_batch], dim=-1)
         initial_state = torch.relu(self.initial_state_mapper(combined_context))
         return initial_state
         
-    def forward(self, initial_zones, initial_time, eval_times):
+    def forward(self, initial_zones, initial_time, eval_times, z_batch):
         """
-        The forward pass now uses two GNNs and a generic ODEBlock.
+        The forward pass is now conditioned on a batch of agent-specific z vectors.
         """
         # 1. Create spatially-aware and semantically-aware zone embeddings
         phys_zone_embeds = torch.relu(self.zone_gnn_phys(self.static_zone_features, self.edge_index_phys))
         sem_zone_embeds = torch.relu(self.zone_gnn_sem(self.static_zone_features, self.edge_index_sem))
 
-        # 2. Get initial person hidden states
-        initial_person_h = self.get_initial_state(initial_zones, phys_zone_embeds, sem_zone_embeds)
+        # 2. Get initial person hidden states, passing the batch of z vectors
+        initial_person_h = self.get_initial_state(initial_zones, phys_zone_embeds, sem_zone_embeds, z_batch)
         
         # 3. Solve ODE
         # The ODE solver requires the time points to be sorted and start from the initial state's time
@@ -288,8 +320,8 @@ def train_model():
     config = HouseholdConfig()
     config.num_zones = data['num_zones']
     
-    # Create model, passing the new edge_indices
-    model = STGNodeHousehold(
+    # Create the top-level CVAE model
+    model = STG_CVAE(
         config, 
         data['num_zones'], 
         data['zone_features'], 
@@ -326,102 +358,101 @@ def train_model():
     for epoch in range(config.num_epochs):
         optimizer.zero_grad()
         total_loss = 0.0
+        total_recon_loss = 0.0
+        total_kld_loss = 0.0
         total_violations = 0
         total_preds = 0
         
-        # Train on each person's trajectory
-        for person_idx in range(data['num_people']):
-            person_trajectory = trajectories_data[person_idx]
-            person_times = times_data[person_idx]
-            
-            # Curriculum learning: start with shorter sequences, gradually increase, then focus on end-of-day
-            if epoch < 1000:
-                max_window_size = 5  # Short sequences first
-            elif epoch < 3000:
-                max_window_size = 8  # Medium sequences
-            elif epoch < 7000:
-                max_window_size = 12 # Full sequences
-            else: # Stage 4: Focus on end-of-day sequences
-                max_window_size = 12
-            
-            window_size = min(max_window_size, len(person_trajectory) - 1)
-            if window_size < 2:
-                continue
-                
-            # More overlapping windows for better coverage, plus end-anchored windows
-            step_size = max(1, window_size // 3)
-            start_indices = list(range(0, len(person_trajectory) - window_size, step_size))
-            
-            # In the end-of-day focus stage, add windows anchored to the end
-            if epoch >= 7000:
-                end_anchor_start = len(person_trajectory) - window_size
-                if end_anchor_start > 0 and end_anchor_start not in start_indices:
-                    start_indices.append(end_anchor_start)
+        # We need a consistent window for all people in the household
+        # We'll use the curriculum learning window size on the shortest trajectory in the household
+        shortest_traj_len = min(len(t) for t in trajectories_data)
 
-            for start_idx in start_indices:
-                end_idx = min(start_idx + window_size, len(person_trajectory))
-                if end_idx - start_idx < 2:
-                    continue
-                
-                # Get initial conditions
-                initial_zones = torch.tensor([person_trajectory[start_idx].item() for _ in range(data['num_people'])])
-                initial_time = person_times[start_idx]
-                eval_times = person_times[start_idx:end_idx]
-                
-                # Forward pass - model handles ODEs internally
-                raw_predictions = model(initial_zones, initial_time, eval_times)
-                
-                ground_truth_zones = person_trajectory[start_idx:end_idx]
-                
-                # The model's output corresponds to eval_times.
-                # The shape should be [len(eval_times), num_people, num_zones]
-                constrained_predictions = raw_predictions.clone()
+        if epoch < 1000:
+            max_window_size = 5
+        elif epoch < 3000:
+            max_window_size = 8
+        elif epoch < 7000:
+            max_window_size = 12
+        else:
+            max_window_size = 12
+        
+        window_size = min(max_window_size, shortest_traj_len - 1)
+        if window_size < 2:
+            continue
+            
+        step_size = max(1, window_size // 3)
+        start_indices = list(range(0, shortest_traj_len - window_size, step_size))
+        
+        if epoch >= 7000:
+            end_anchor_start = shortest_traj_len - window_size
+            if end_anchor_start > 0 and end_anchor_start not in start_indices:
+                start_indices.append(end_anchor_start)
 
+        for start_idx in start_indices:
+            end_idx = start_idx + window_size
+            
+            # Prepare a batch of trajectories for all agents
+            agent_trajectories_batch = torch.stack([
+                traj[start_idx:end_idx] for traj in trajectories_data
+            ])
+            
+            # Prepare initial conditions
+            initial_zones = agent_trajectories_batch[:, 0]
+            initial_time = times_data[0][start_idx] # Assume common time grid for household
+            eval_times = times_data[0][start_idx:end_idx]
+
+            # Forward pass through the CVAE with the batch of trajectories
+            raw_predictions, mu, log_var = model(agent_trajectories_batch, initial_zones, initial_time, eval_times)
+            
+            ground_truth_zones = agent_trajectories_batch
+            
+            # --- Physics Constraints and Violation Tracking ---
+            constrained_predictions = raw_predictions.clone()
+            for p in range(data['num_people']):
                 for t in range(len(eval_times)): 
                     if t > 0:
-                        # Apply constraint based on previous ground_truth state
-                        prev_zone = ground_truth_zones[t-1].item()
+                        prev_zone = ground_truth_zones[p, t-1].item()
                         valid_mask = adjacency_matrix[prev_zone].clone()
-                        valid_mask[prev_zone] = 1.0 # Can stay in the same zone
+                        valid_mask[prev_zone] = 1.0 
                         invalid_mask = (valid_mask == 0)
-                        constrained_predictions[t, person_idx, invalid_mask] = -1e9
+                        constrained_predictions[t, p, invalid_mask] = -1e9
                     
-                    # Track physics violations for this window
-                    pred_zone = torch.argmax(constrained_predictions[t, person_idx, :]).item()
+                    pred_zone = torch.argmax(constrained_predictions[t, p, :]).item()
                     
                     if t > 0:
-                        prev_zone = ground_truth_zones[t-1].item()
+                        prev_zone = ground_truth_zones[p, t-1].item()
                         is_valid = adjacency_matrix[prev_zone, pred_zone] == 1.0 or pred_zone == prev_zone
                         if not is_valid:
                             total_violations += 1
                     total_preds += 1
-                
-                # Target zones for this person (matches the length of predictions)
-                target_zones = person_trajectory[start_idx:end_idx]
-                
-                # Calculate prediction loss for this person only
-                person_pred = constrained_predictions[:, person_idx, :]  # [num_eval_times, num_zones]
-                
-                # Ensure target and prediction lengths match
-                if person_pred.shape[0] != target_zones.shape[0]:
-                    # This can happen if the ODE solver returns a different number of steps
-                    # This indicates a bug in how we handle time steps.
-                    # For now, we will skip this batch to avoid a crash.
-                    print(f"Warning: Mismatch in prediction ({person_pred.shape[0]}) and target ({target_zones.shape[0]}) lengths. Skipping batch.")
-                    continue
+            
+            # --- CVAE Loss Calculation ---
+            # Reshape for loss calculation: [Time, People, Zones] -> [Time * People, Zones]
+            # Target shape: [People, Time] -> [Time * People]
+            pred_for_loss = constrained_predictions.transpose(0, 1).reshape(-1, config.num_zones)
+            target_for_loss = ground_truth_zones.reshape(-1)
 
-                pred_loss = F.cross_entropy(person_pred, target_zones)
-                
-                # NO separate physics loss needed - constraints are HARD enforced
-                # Just use the prediction loss on constrained predictions
-                total_loss += pred_loss
-        
+            # 1. Reconstruction Loss (calculated across all agents at once)
+            recon_loss = F.cross_entropy(pred_for_loss, target_for_loss)
+            
+            # 2. KL Divergence Loss (summed across all agents)
+            kld_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+            
+            # 3. Total Loss (ELBO)
+            loss = recon_loss + config.kld_weight * kld_loss
+            total_loss += loss
+            total_recon_loss += recon_loss.item()
+            total_kld_loss += kld_loss.item()
+
         if total_loss > 0:
             # Backward pass
             total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Gradient clipping
             optimizer.step()
             
             loss_value = total_loss.item()
+            recon_loss_val = total_recon_loss
+            kld_loss_val = total_kld_loss
             violation_rate = (total_violations / total_preds) if total_preds > 0 else 0
             losses.append(loss_value)
             violation_rates.append(violation_rate)
@@ -464,7 +495,7 @@ def train_model():
             
             if (epoch + 1) % 50 == 0:
                 current_lr = optimizer.param_groups[0]['lr']
-                print(f"   Epoch {epoch+1:4d}/{config.num_epochs} | Loss: {loss_value:.4f} | Best: {best_loss:.4f} | LR: {current_lr:.6f}")
+                print(f"   Epoch {epoch+1:4d}/{config.num_epochs} | Total Loss: {loss_value:.4f} | Recon: {recon_loss_val:.4f} | KLD: {kld_loss_val:.4f} | Best: {best_loss:.4f} | LR: {current_lr:.6f}")
                 
             # Early stopping if no improvement for too long
             if patience_counter > 1000 and epoch > 2000:
