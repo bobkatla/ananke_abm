@@ -10,6 +10,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import warnings
+from torchdiffeq import odeint_adjoint as odeint
 
 warnings.filterwarnings('ignore')
 
@@ -17,7 +18,8 @@ warnings.filterwarnings('ignore')
 from ananke_abm.models.run.household_stg_node import (
     STG_CVAE,
     HouseholdDataProcessor,
-    HouseholdConfig
+    HouseholdConfig,
+    STGNodeDynamics
 )
 
 # --- COPIED FROM household_stg_node.py ---
@@ -57,13 +59,23 @@ def evaluate_model(model, data, processor, config, adjacency_matrix, num_samples
             all_predicted_trajectories = []
 
             for s in range(num_samples):
-                # For evaluation, we sample a batch of z vectors from a standard normal distribution,
-                # one for each person in the household.
-                z_batch = torch.randn(data['num_people'], config.latent_dim)
+                # For evaluation, we sample a batch of initial z vectors (z0)
+                z0_batch = torch.randn(data['num_people'], config.latent_dim)
                 
-                # Decode to get a single trajectory prediction
-                raw_predictions = model.decoder(initial_zones, initial_time, eval_times, z_batch)
+                # Get the initial physical state from the ground truth start
+                x0 = model.combined_ode_func.physical_dynamics_func.get_initial_state(initial_zones, z0_batch)
+
+                # Solve the combined ODE system
+                _, x_solution = odeint(
+                    model.combined_ode_func,
+                    (z0_batch, x0),
+                    eval_times,
+                    method='dopri5'
+                )
                 
+                # Decode the solution to get zone logits
+                raw_predictions = model.combined_ode_func.physical_dynamics_func.zone_predictor(x_solution)
+
                 # Apply hard physics constraints to the person we are currently evaluating
                 constrained_logits = raw_predictions.clone()
                 predicted_zones = torch.zeros(len(eval_times), dtype=torch.long)

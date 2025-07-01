@@ -25,7 +25,8 @@ from scipy.spatial.distance import euclidean
 from fastdtw import fastdtw
 
 from ananke_abm.models.run.ode_components import ODEFunc, ODEBlock
-from ananke_abm.models.run.cvae_components import Encoder, LatentVariable
+from ananke_abm.models.run.cvae_components import Encoder, LatentVariable, LatentODEFunc
+from torchdiffeq import odeint_adjoint as odeint
 
 @dataclass
 class HouseholdConfig:
@@ -46,41 +47,71 @@ class HouseholdConfig:
     latent_dim: int = 16 # Dimension of the CVAE latent space
     encoder_hidden_dim: int = 64 # Hidden dim for the encoder GRU
     kld_weight: float = 0.001 # Weight for the KL Divergence loss term
+    latent_ode_hidden_dim: int = 32 # Hidden dim for the latent ODE function
+
+class CombinedODEFunc(nn.Module):
+    """Combines latent and physical dynamics for simultaneous solving."""
+    def __init__(self, latent_ode_func, physical_dynamics_func):
+        super().__init__()
+        self.latent_ode_func = latent_ode_func
+        self.physical_dynamics_func = physical_dynamics_func
+
+    def forward(self, t, state):
+        z, x = state # Unpack the combined state
+        dz_dt = self.latent_ode_func(t, z)
+        dx_dt = self.physical_dynamics_func(t, x, z)
+        return (dz_dt, dx_dt)
 
 class STG_CVAE(nn.Module):
     """
-    The main Spatio-Temporal Graph CVAE model.
-    It contains the Encoder and the GNN-ODE Decoder.
+    The main Hierarchical Latent ODE CVAE model.
     """
     def __init__(self, config: HouseholdConfig, num_zones: int, zone_features: torch.Tensor, person_features: torch.Tensor, edge_index_phys: torch.Tensor, edge_index_sem: torch.Tensor):
         super().__init__()
+        self.config = config
         self.encoder = Encoder(num_zones, config.encoder_hidden_dim, config.latent_dim)
         self.latent_sampler = LatentVariable()
-        self.decoder = STGNodeHousehold(config, num_zones, zone_features, person_features, edge_index_phys, edge_index_sem)
+        
+        # Instantiate the two dynamic functions
+        latent_dynamics = LatentODEFunc(config.latent_dim, config.latent_ode_hidden_dim)
+        physical_dynamics = STGNodeDynamics(config, zone_features, person_features, edge_index_phys, edge_index_sem)
+        
+        # The main ODE function is a combination of both
+        self.combined_ode_func = CombinedODEFunc(latent_dynamics, physical_dynamics)
 
-    def forward(self, agent_trajectories, initial_zones, initial_time, eval_times):
-        """
-        Processes a batch of trajectories, one for each agent.
-        """
-        # agent_trajectories shape: [num_agents, seq_len]
-        # Encode all agent trajectories in a batch to get agent-specific distributions
-        mu, log_var = self.encoder(agent_trajectories)
+    def forward(self, agent_trajectories, initial_time, eval_times):
+        # 1. Encode the full trajectories to get the *initial* latent state, z0
+        mu_0, log_var_0 = self.encoder(agent_trajectories)
+        z_0 = self.latent_sampler(mu_0, log_var_0)
         
-        # Sample a batch of agent-specific latent vectors
-        z = self.latent_sampler(mu, log_var) # z shape: [num_agents, latent_dim]
+        # 2. Get the initial physical state, x0
+        initial_zones = agent_trajectories[:, 0]
+        x_0 = self.combined_ode_func.physical_dynamics_func.get_initial_state(initial_zones, z_0)
         
-        # Decode using the GNN-ODE model, conditioned on the batch of z vectors
-        recon_trajectories = self.decoder(initial_zones, initial_time, eval_times, z)
+        # 3. Set up the combined initial state and solve the hierarchical ODE
+        combined_state_0 = (z_0, x_0)
         
-        return recon_trajectories, mu, log_var
+        # The ODE solver handles the temporal evolution of both z and x
+        _, x_solution = odeint(
+            self.combined_ode_func,
+            combined_state_0,
+            eval_times,
+            method='dopri5'
+        )
+        
+        # 4. Predict zones from the final evolved physical states
+        zone_logits = self.combined_ode_func.physical_dynamics_func.zone_predictor(x_solution)
 
-class STGNodeHousehold(nn.Module):
-    """Spatially-Conditioned STG-NODE model (now the Decoder)."""
-    
-    def __init__(self, config: HouseholdConfig, num_zones: int, zone_features: torch.Tensor, person_features: torch.Tensor, edge_index_phys: torch.Tensor, edge_index_sem: torch.Tensor):
+        return zone_logits, mu_0, log_var_0
+
+class STGNodeDynamics(nn.Module):
+    """
+    Defines the dynamics of the agent states (dx/dt), conditioned on z(t).
+    This is NOT a full model, but a component of the combined ODE.
+    """
+    def __init__(self, config: HouseholdConfig, zone_features: torch.Tensor, person_features: torch.Tensor, edge_index_phys: torch.Tensor, edge_index_sem: torch.Tensor):
         super().__init__()
         self.config = config
-        self.num_zones = num_zones
         self.register_buffer('static_zone_features', zone_features)
         self.register_buffer('person_features', person_features)
         self.register_buffer('edge_index_phys', edge_index_phys)
@@ -90,61 +121,43 @@ class STGNodeHousehold(nn.Module):
         self.zone_gnn_phys = GCNConv(zone_features.shape[1], config.zone_embed_dim)
         self.zone_gnn_sem = GCNConv(zone_features.shape[1], config.zone_embed_dim)
         
-        # ODE function and block
-        ode_func = ODEFunc(config.hidden_dim, config.ode_hidden_dim, config.temporal_embed_dim)
-        self.ode_block = ODEBlock(ode_func)
-        
         # Person embedders to create initial hidden state
         self.person_feature_embedder = nn.Linear(config.person_feat_dim, config.person_embed_dim)
-        # The input to the initial state mapper now includes embeddings from both GNNs AND the latent vector z
         initial_state_input_dim = config.person_embed_dim + (config.zone_embed_dim * 2) + config.latent_dim
         self.initial_state_mapper = nn.Linear(initial_state_input_dim, config.hidden_dim)
         
-        # Final output predictor
-        self.zone_predictor = nn.Linear(config.hidden_dim, num_zones)
+        # The ODE function for the physical state
+        self.physical_ode_func = nn.Sequential(
+            nn.Linear(config.hidden_dim + config.latent_dim, config.ode_hidden_dim),
+            nn.Tanh(),
+            nn.Linear(config.ode_hidden_dim, config.hidden_dim)
+        )
         
-    def get_initial_state(self, initial_zones, phys_zone_embeds, sem_zone_embeds, z_batch):
-        """Get initial person hidden states, conditioned on a batch of latent vectors."""
-        # Get embeddings for the specific zones people start in from both graphs
+        # Final output predictor
+        self.zone_predictor = nn.Linear(config.hidden_dim, config.num_zones)
+        
+    def get_initial_state(self, initial_zones, z0):
+        """Get initial person hidden states, conditioned on initial latent vector z0."""
+        # Pre-compute GNN embeddings once
+        phys_zone_embeds = torch.relu(self.zone_gnn_phys(self.static_zone_features, self.edge_index_phys))
+        sem_zone_embeds = torch.relu(self.zone_gnn_sem(self.static_zone_features, self.edge_index_sem))
+        
         initial_phys_context = phys_zone_embeds[initial_zones]
         initial_sem_context = sem_zone_embeds[initial_zones]
         
         person_embeds = self.person_feature_embedder(self.person_features)
         
-        # z_batch is already [num_agents, latent_dim], no expansion needed
-        # Combine person features, contexts, and the corresponding agent's latent vector
-        combined_context = torch.cat([person_embeds, initial_phys_context, initial_sem_context, z_batch], dim=-1)
+        combined_context = torch.cat([person_embeds, initial_phys_context, initial_sem_context, z0], dim=-1)
         initial_state = torch.relu(self.initial_state_mapper(combined_context))
         return initial_state
         
-    def forward(self, initial_zones, initial_time, eval_times, z_batch):
-        """
-        The forward pass is now conditioned on a batch of agent-specific z vectors.
-        """
-        # 1. Create spatially-aware and semantically-aware zone embeddings
-        phys_zone_embeds = torch.relu(self.zone_gnn_phys(self.static_zone_features, self.edge_index_phys))
-        sem_zone_embeds = torch.relu(self.zone_gnn_sem(self.static_zone_features, self.edge_index_sem))
-
-        # 2. Get initial person hidden states, passing the batch of z vectors
-        initial_person_h = self.get_initial_state(initial_zones, phys_zone_embeds, sem_zone_embeds, z_batch)
-        
-        # 3. Solve ODE
-        # The ODE solver requires the time points to be sorted and start from the initial state's time
-        ode_eval_times = torch.unique(torch.cat([initial_time.reshape(1), eval_times]))
-        
-        # The ODEBlock handles the temporal evolution
-        person_h_solution = self.ode_block(initial_person_h, ode_eval_times)
-        
-        # We only need the outputs at the original eval_times
-        # Find the indices in the solution that correspond to our desired eval_times
-        time_indices = [torch.where(ode_eval_times == t)[0] for t in eval_times]
-        solution_indices = torch.tensor([idx[0] if len(idx) > 0 else -1 for idx in time_indices]).long()
-        final_solution = person_h_solution[solution_indices]
-
-        # 4. Predict zones from the final evolved person states
-        zone_logits = self.zone_predictor(final_solution)
-        
-        return zone_logits
+    def forward(self, t, x, z):
+        """Computes dx/dt, the derivative of the physical system state."""
+        # The input x is the current hidden state from the ODE solver.
+        # The input z is the current latent state from the ODE solver.
+        input_for_ode = torch.cat([x, z], dim=-1)
+        dx_dt = self.physical_ode_func(input_for_ode)
+        return dx_dt
 
 def compute_semantic_adjacency(trajectories, num_zones, threshold=0.5):
     """
@@ -397,12 +410,11 @@ def train_model():
             ])
             
             # Prepare initial conditions
-            initial_zones = agent_trajectories_batch[:, 0]
             initial_time = times_data[0][start_idx] # Assume common time grid for household
             eval_times = times_data[0][start_idx:end_idx]
 
             # Forward pass through the CVAE with the batch of trajectories
-            raw_predictions, mu, log_var = model(agent_trajectories_batch, initial_zones, initial_time, eval_times)
+            raw_predictions, mu, log_var = model(agent_trajectories_batch, initial_time, eval_times)
             
             ground_truth_zones = agent_trajectories_batch
             
@@ -493,13 +505,13 @@ def train_model():
             else:
                 patience_counter += 1
             
-            if (epoch + 1) % 50 == 0:
+            if (epoch + 1) % 10 == 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 print(f"   Epoch {epoch+1:4d}/{config.num_epochs} | Total Loss: {loss_value:.4f} | Recon: {recon_loss_val:.4f} | KLD: {kld_loss_val:.4f} | Best: {best_loss:.4f} | LR: {current_lr:.6f}")
                 
             # Early stopping if no improvement for too long
             if patience_counter > 1000 and epoch > 2000:
-                print(f"   Early stopping at epoch {epoch+1} (no improvement for 500 epochs)")
+                print(f"   Early stopping at epoch {epoch+1} (no improvement for 1000 epochs)")
                 break
         else:
             print(f"   Epoch {epoch+1:4d}/{config.num_epochs} | No valid training windows")

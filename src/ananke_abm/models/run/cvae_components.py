@@ -30,4 +30,19 @@ class LatentVariable(nn.Module):
     def forward(self, mu, log_var):
         std = torch.exp(0.5 * log_var)
         eps = torch.randn_like(std)
-        return mu + eps * std 
+        return mu + eps * std
+
+class LatentODEFunc(nn.Module):
+    """
+    Defines the dynamics of the latent variable z, i.e., dz/dt.
+    """
+    def __init__(self, latent_dim, hidden_dim):
+        super(LatentODEFunc, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+
+    def forward(self, t, z):
+        return self.net(z) 
