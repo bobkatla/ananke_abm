@@ -24,10 +24,11 @@ dependencies = [
     "seaborn>=0.13.2",
     "torch>=2.7.0",
     "torch-geometric>=2.6.1",
-    "torchdiffeq>=0.2.5",
+    "torchdiffeq>=0.2.3",
     "torchvision>=0.22.0",
     "wandb>=0.20.0",
-    "fastdtw==0.3.4",
+    "fastdtw>=0.3.4",
+    "torchcde==0.2.5",
 ]
 
 [project.optional-dependencies]
