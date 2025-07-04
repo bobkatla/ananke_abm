@@ -29,6 +29,7 @@ dependencies = [
     "wandb>=0.20.0",
     "fastdtw>=0.3.4",
     "torchcde==0.2.5",
+    "scikit-learn>=1.7.0",
 ]
 
 [project.optional-dependencies]
