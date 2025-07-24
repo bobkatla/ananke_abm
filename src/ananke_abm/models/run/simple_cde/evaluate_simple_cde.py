@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
 import os
+import pandas as pd
 
 # To make the script runnable, we need to import the model and config classes
 from ananke_abm.models.run.simple_cde.household_simple_cde import (
@@ -117,6 +118,7 @@ def evaluate_model():
 
     # Store results
     accepted_trajectories = []
+    all_violation_masks = []
     total_physics_violations = 0
 
     # Main loop over each person
@@ -125,35 +127,42 @@ def evaluate_model():
         
         best_trajectory_for_person = None
         min_violations_for_person = float('inf')
+        best_violations_mask_for_person = []
 
         # Rejection sampling loop
         for retry in range(max_retries):
             # Start with the ground truth history for this person
             generated_y_person = full_y[person_idx, :config.history_length].clone().unsqueeze(0)
             current_violations = 0
+            violations_mask = [False] * full_seq_len # Init mask for the full length
             
             # Autoregressive generation loop for the full trajectory
             with torch.no_grad():
-                for i in range(config.history_length, full_seq_len - config.prediction_length):
-                    start_idx = i - config.history_length
+                for i in range(config.history_length, full_seq_len):
                     history_end_idx = i
-                    cde_end_idx = i + config.prediction_length
 
-                    y_history = generated_y_person[:, start_idx:history_end_idx]
-                    
-                    # Path construction for a SINGLE person
+                    y_history = generated_y_person[:, -config.history_length:]
                     person_embeds = person_embeds_all[person_idx].unsqueeze(0)
                     home_zone_embeds = home_zone_embeds_all[person_idx].unsqueeze(0)
-                    y_cde_actual = full_y[person_idx, history_end_idx - 1 : cde_end_idx].unsqueeze(0)
+                    
+                    # --- Create a self-driven CDE path without looking at ground truth ---
+                    last_generated_zone = generated_y_person[:, -1:]
+                    y_cde_path_plausible = last_generated_zone.repeat(1, config.prediction_length)
+                    cde_zone_embeds = model.zone_embedder(y_cde_path_plausible)
+
+                    # Handle time features for the final step to prevent index error
+                    if i < full_seq_len - 1:
+                        cde_time_feats = time_features[i-1 : i-1 + config.prediction_length]
+                    else: # On the last step, just repeat the last known time feature
+                        cde_time_feats = time_features[i-1:i].repeat(1, 2).view(config.prediction_length, -1)
+
+                    cde_times = torch.linspace(0, 1, config.prediction_length).to(device)
 
                     history_zone_embeds = model.zone_embedder(y_history)
                     static_embeds = torch.cat([person_embeds, home_zone_embeds], dim=1)
                     expanded_static_embeds = static_embeds.unsqueeze(1).expand(-1, config.history_length, -1)
                     history_path = torch.cat([history_zone_embeds, expanded_static_embeds], dim=2)
                     
-                    cde_zone_embeds = model.zone_embedder(y_cde_actual)
-                    cde_times = full_times[history_end_idx - 1 : cde_end_idx]
-                    cde_time_feats = time_features[history_end_idx - 1 : cde_end_idx]
                     cde_time_path = cde_time_feats.unsqueeze(0)
                     
                     cde_path_values = torch.cat([cde_time_path, cde_zone_embeds], dim=2)
@@ -171,21 +180,25 @@ def evaluate_model():
                     new_zone = generated_y_person[0, -1].item()
                     if (prev_zone, new_zone) not in valid_transitions:
                         current_violations += 1
+                        violations_mask[i] = True # Mark violation at the current step
             
             # After generating a full trajectory, check for acceptance
             if current_violations == 0:
                 min_violations_for_person = 0
                 best_trajectory_for_person = generated_y_person.squeeze(0)
+                best_violations_mask_for_person = violations_mask
                 break
             
             if current_violations < min_violations_for_person:
                 min_violations_for_person = current_violations
                 best_trajectory_for_person = generated_y_person.squeeze(0)
-
+                best_violations_mask_for_person = violations_mask
+        
         if min_violations_for_person > 0:
             print(f"   ⚠️  Warning: Could not find a 0-violation trajectory for person {person_idx + 1}. Best had {min_violations_for_person} violations.")
         
         accepted_trajectories.append(best_trajectory_for_person)
+        all_violation_masks.append(best_violations_mask_for_person)
         total_physics_violations += min_violations_for_person
 
     # Combine accepted trajectories into a single tensor for evaluation
@@ -216,6 +229,9 @@ def evaluate_model():
     plt.savefig(cm_path)
     plt.close()
     print(f"   -> Saved to {cm_path}")
+
+    # --- Save detailed trajectory data to CSV for debugging ---
+    save_trajectories_to_csv(full_y, generated_y, all_violation_masks, data['person_names'], save_dir)
 
     # --- Plot Trajectory Comparison ---
     print("📊 Plotting full autoregressive trajectory...")
@@ -248,6 +264,51 @@ def evaluate_model():
     plot_loss_curve(save_dir)
 
     print("\n✅ Evaluation complete.")
+
+
+def save_trajectories_to_csv(actual_y, generated_y, violation_masks, person_names, save_dir):
+    """
+    Saves a detailed comparison of actual vs. generated trajectories to a CSV file.
+    
+    Args:
+        actual_y (Tensor): The ground truth trajectories.
+        generated_y (Tensor): The generated trajectories.
+        violation_masks (list of list of bool): For each person, a list indicating if a violation occurred at that step.
+        person_names (list of str): The names of the people.
+        save_dir (str): The directory to save the file in.
+    """
+    print("📋 Saving detailed trajectory comparison to CSV...")
+    
+    num_people, seq_len = actual_y.shape
+    gen_seq_len = generated_y.shape[1]
+    
+    records = []
+    for p_idx in range(num_people):
+        for t_idx in range(seq_len):
+            actual_zone_val = actual_y[p_idx, t_idx].item()
+            is_violation = violation_masks[p_idx][t_idx] if t_idx < len(violation_masks[p_idx]) else False
+            
+            # Check if the generated trajectory is long enough for this timestep
+            if t_idx < gen_seq_len:
+                generated_zone_val = generated_y[p_idx, t_idx].item()
+                is_correct_val = actual_zone_val == generated_zone_val
+            else:
+                generated_zone_val = 'N/A' # Use a placeholder for missing steps
+                is_correct_val = False
+
+            records.append({
+                "Person": person_names[p_idx],
+                "Time_Step": t_idx,
+                "Actual_Zone": actual_zone_val,
+                "Generated_Zone": generated_zone_val,
+                "Is_Violation": is_violation,
+                "Is_Correct": is_correct_val
+            })
+            
+    df = pd.DataFrame(records)
+    csv_path = os.path.join(save_dir, 'trajectory_comparison.csv')
+    df.to_csv(csv_path, index=False)
+    print(f"   -> Saved to {csv_path}")
 
 
 if __name__ == "__main__":
