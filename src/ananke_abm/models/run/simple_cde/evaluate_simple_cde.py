@@ -83,7 +83,7 @@ def evaluate_model():
         padding_idx=data['padding_value']
     ).to(device)
 
-    save_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '..', '..', 'saved_models', 'encoder_decoder_cde')
+    save_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '..', '..', 'saved_models', 'encoder_decoder_cde22')
     model_path = os.path.join(save_dir, 'enc_dec_cde_best.pth')
     
     if not os.path.exists(model_path):
@@ -94,73 +94,102 @@ def evaluate_model():
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
-    # --- Autoregressive Prediction ---
-    print("🤖 Generating full trajectory via autoregressive rollout...")
-    
+    # --- Autoregressive Prediction with Rejection Sampling ---
+    print("🤖 Generating trajectories via rejection sampling...")
+
+    # Get data and move to device
     full_times = data['times'].to(device)
-    time_features = data['time_features'].to(device) # Get new features
+    time_features = data['time_features'].to(device)
     full_y = data['trajectories_y'].to(device)
     person_features_raw = data['person_features_raw'].to(device)
-    people_edge_index = data['people_edge_index'].to(device) # Get social graph
+    people_edge_index = data['people_edge_index'].to(device)
     num_people, full_seq_len = full_y.shape
     
-    # Start with the ground truth history
-    generated_y = full_y[:, :config.history_length].clone()
-    physics_violations = 0
+    max_retries = 10
 
+    # Pre-compute embeddings for all people once
     with torch.no_grad():
-        person_embeds = model.person_feature_embedder(person_features_raw)
-        # Apply social GNN to get context-aware person embeddings
-        social_context = model.social_gnn(person_embeds, people_edge_index)
-        person_embeds = person_embeds + social_context
+        person_embeds_all = model.person_feature_embedder(person_features_raw)
+        social_context = model.social_gnn(person_embeds_all, people_edge_index)
+        person_embeds_all = person_embeds_all + social_context
+        home_zone_ids_all = full_y[:, 0].to(device)
+        home_zone_embeds_all = model.zone_embedder(home_zone_ids_all)
+
+    # Store results
+    accepted_trajectories = []
+    total_physics_violations = 0
+
+    # Main loop over each person
+    for person_idx in range(num_people):
+        print(f"   -> Generating for person {person_idx + 1}/{num_people}...")
         
-        home_zone_ids = full_y[:, 0].to(device)
-        home_zone_embeds = model.zone_embedder(home_zone_ids)
+        best_trajectory_for_person = None
+        min_violations_for_person = float('inf')
 
-        for i in range(config.history_length, full_seq_len - config.prediction_length):
-            start_idx = i - config.history_length
-            history_end_idx = i
-            cde_end_idx = i + config.prediction_length
+        # Rejection sampling loop
+        for retry in range(max_retries):
+            # Start with the ground truth history for this person
+            generated_y_person = full_y[person_idx, :config.history_length].clone().unsqueeze(0)
+            current_violations = 0
+            
+            # Autoregressive generation loop for the full trajectory
+            with torch.no_grad():
+                for i in range(config.history_length, full_seq_len - config.prediction_length):
+                    start_idx = i - config.history_length
+                    history_end_idx = i
+                    cde_end_idx = i + config.prediction_length
 
-            # Use the *generated* history for prediction
-            y_history = generated_y[:, start_idx:history_end_idx]
-            
-            # The CDE path still needs a real start point
-            y_cde_start = generated_y[:, history_end_idx - 1].unsqueeze(1)
-            y_cde_end_actual_time = full_times[cde_end_idx -1] # Use actual time for CDE solve
-            
-            # This is tricky - we need a plausible *next* step for the CDE control.
-            # We'll use the *actual* next step's location to define the path, 
-            # but the LSTM context comes from the generated sequence.
-            y_cde_actual = full_y[:, history_end_idx - 1 : cde_end_idx]
+                    y_history = generated_y_person[:, start_idx:history_end_idx]
+                    
+                    # Path construction for a SINGLE person
+                    person_embeds = person_embeds_all[person_idx].unsqueeze(0)
+                    home_zone_embeds = home_zone_embeds_all[person_idx].unsqueeze(0)
+                    y_cde_actual = full_y[person_idx, history_end_idx - 1 : cde_end_idx].unsqueeze(0)
 
-            history_zone_embeds = model.zone_embedder(y_history)
-            static_embeds = torch.cat([person_embeds, home_zone_embeds], dim=1)
-            expanded_static_embeds = static_embeds.unsqueeze(1).expand(-1, config.history_length, -1)
-            history_path = torch.cat([history_zone_embeds, expanded_static_embeds], dim=2)
-            
-            cde_zone_embeds = model.zone_embedder(y_cde_actual)
-            cde_times = full_times[history_end_idx - 1 : cde_end_idx]
-            
-            # Use new cyclical time features for the CDE path
-            cde_time_feats = time_features[history_end_idx - 1 : cde_end_idx]
-            cde_time_path = cde_time_feats.unsqueeze(0).expand(num_people, -1, -1)
-            
-            cde_path_values = torch.cat([cde_time_path, cde_zone_embeds], dim=2)
-            cde_coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(cde_path_values)
-            
-            pred_logits = model(history_path, cde_coeffs, cde_times)
-            pred_class = torch.argmax(pred_logits, dim=1).unsqueeze(1)
+                    history_zone_embeds = model.zone_embedder(y_history)
+                    static_embeds = torch.cat([person_embeds, home_zone_embeds], dim=1)
+                    expanded_static_embeds = static_embeds.unsqueeze(1).expand(-1, config.history_length, -1)
+                    history_path = torch.cat([history_zone_embeds, expanded_static_embeds], dim=2)
+                    
+                    cde_zone_embeds = model.zone_embedder(y_cde_actual)
+                    cde_times = full_times[history_end_idx - 1 : cde_end_idx]
+                    cde_time_feats = time_features[history_end_idx - 1 : cde_end_idx]
+                    cde_time_path = cde_time_feats.unsqueeze(0)
+                    
+                    cde_path_values = torch.cat([cde_time_path, cde_zone_embeds], dim=2)
+                    cde_coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(cde_path_values)
+                    
+                    # --- STOCHASTIC PREDICTION ---
+                    pred_logits = model(history_path, cde_coeffs, cde_times)
+                    probabilities = torch.nn.functional.softmax(pred_logits, dim=-1)
+                    pred_class = torch.multinomial(probabilities, num_samples=1)
 
-            # Append the prediction to our generated sequence
-            generated_y = torch.cat([generated_y, pred_class], dim=1)
+                    generated_y_person = torch.cat([generated_y_person, pred_class], dim=1)
 
-            # Check for physics violations
-            for person_idx in range(num_people):
-                prev_zone = generated_y[person_idx, -2].item()
-                new_zone = generated_y[person_idx, -1].item()
-                if (prev_zone, new_zone) not in valid_transitions:
-                    physics_violations += 1
+                    # Check for physics violations for this step
+                    prev_zone = generated_y_person[0, -2].item()
+                    new_zone = generated_y_person[0, -1].item()
+                    if (prev_zone, new_zone) not in valid_transitions:
+                        current_violations += 1
+            
+            # After generating a full trajectory, check for acceptance
+            if current_violations == 0:
+                min_violations_for_person = 0
+                best_trajectory_for_person = generated_y_person.squeeze(0)
+                break
+            
+            if current_violations < min_violations_for_person:
+                min_violations_for_person = current_violations
+                best_trajectory_for_person = generated_y_person.squeeze(0)
+
+        if min_violations_for_person > 0:
+            print(f"   ⚠️  Warning: Could not find a 0-violation trajectory for person {person_idx + 1}. Best had {min_violations_for_person} violations.")
+        
+        accepted_trajectories.append(best_trajectory_for_person)
+        total_physics_violations += min_violations_for_person
+
+    # Combine accepted trajectories into a single tensor for evaluation
+    generated_y = torch.stack(accepted_trajectories)
 
     # --- Calculate Metrics ---
     # Compare the generated trajectory to the actual one, ignoring the warm-up period
@@ -173,7 +202,7 @@ def evaluate_model():
     
     accuracy = np.mean(eval_slice_actual == eval_slice_generated)
     print(f"\n🎯 Autoregressive Accuracy: {accuracy:.2%}")
-    print(f"⚖️ Physics Violations: {physics_violations}")
+    print(f"⚖️ Total Physics Violations: {total_physics_violations}")
 
     # --- Plot Confusion Matrix ---
     print("📊 Plotting confusion matrix...")
