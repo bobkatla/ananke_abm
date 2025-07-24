@@ -101,6 +101,7 @@ def evaluate_model():
     time_features = data['time_features'].to(device) # Get new features
     full_y = data['trajectories_y'].to(device)
     person_features_raw = data['person_features_raw'].to(device)
+    people_edge_index = data['people_edge_index'].to(device) # Get social graph
     num_people, full_seq_len = full_y.shape
     
     # Start with the ground truth history
@@ -109,6 +110,10 @@ def evaluate_model():
 
     with torch.no_grad():
         person_embeds = model.person_feature_embedder(person_features_raw)
+        # Apply social GNN to get context-aware person embeddings
+        social_context = model.social_gnn(person_embeds, people_edge_index)
+        person_embeds = person_embeds + social_context
+        
         home_zone_ids = full_y[:, 0].to(device)
         home_zone_embeds = model.zone_embedder(home_zone_ids)
 

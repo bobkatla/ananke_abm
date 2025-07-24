@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import warnings
 import os
 import torchcde
+from torch_geometric.nn import GATConv
 
 warnings.filterwarnings('ignore')
 
@@ -82,6 +83,9 @@ class EncoderDecoderCDE(nn.Module):
         # --- Embedders ---
         self.zone_embedder = nn.Embedding(num_zones + 1, config.zone_embed_dim, padding_idx=padding_idx)
         self.person_feature_embedder = nn.Linear(person_feat_dim, config.person_embed_dim)
+
+        # --- Social GNN for household interaction ---
+        self.social_gnn = GATConv(config.person_embed_dim, config.person_embed_dim, heads=2, concat=False, dropout=0.2)
 
         # --- Encoder (LSTM) ---
         # It takes a sequence of zone, person, and home embeddings
@@ -175,6 +179,9 @@ class SimpleDataProcessor:
         times_cos = torch.cos(2 * np.pi * time_of_day / 24.0)
         time_features = torch.stack([times_sin, times_cos], dim=1)
 
+        # Create the people graph for household interactions
+        people_edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
+
         return {
             'person_features_raw': person_features_raw,
             'trajectories_y': padded_trajs,
@@ -184,7 +191,8 @@ class SimpleDataProcessor:
             'num_zones': num_zones,
             'padding_value': padding_value,
             'person_names': person_names,
-            'edge_index': sarah_data['edge_index']
+            'edge_index': sarah_data['edge_index'],
+            'people_edge_index': people_edge_index # Add social graph
         }
 
 
@@ -219,7 +227,7 @@ def train_model():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5)
     
     print(f"\n🚀 Training for {config.num_epochs} epochs...")
-    save_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '..', '..', 'saved_models', 'encoder_decoder_cde')
+    save_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '..', '..', 'saved_models', 'encoder_decoder_cde22')
     os.makedirs(save_dir, exist_ok=True)
     
     # Store losses for plotting and saving
@@ -232,6 +240,7 @@ def train_model():
     time_features = data['time_features'].to(device) # Get new features
     full_y = data['trajectories_y'].to(device)
     person_features_raw = data['person_features_raw'].to(device)
+    people_edge_index = data['people_edge_index'].to(device) # Get social graph
     num_people, full_seq_len = full_y.shape
     
     # --- Train/Validation Split ---
@@ -253,6 +262,11 @@ def train_model():
         
         # 1. Get Person & Home Embeddings
         person_embeds = model.person_feature_embedder(person_features_raw)
+        
+        # Apply GNN for social context before passing to LSTM
+        social_context = model.social_gnn(person_embeds, people_edge_index)
+        person_embeds = person_embeds + social_context # Use residual connection
+
         home_zone_embeds = model.zone_embedder(home_zone_ids)
         
         # 2. Sample a window from the TRAINING set
@@ -323,6 +337,7 @@ def train_model():
                     vmask = (vtarget != data['padding_value'])
                     
                     if vmask.any():
+                        # Note: Social GNN is already applied to person_embeds
                         vhistory_zone_embeds = model.zone_embedder(vy_history)
                         vstatic_embeds = torch.cat([person_embeds, home_zone_embeds], dim=1)
                         vexpanded_static_embeds = vstatic_embeds.unsqueeze(1).expand(-1, config.history_length, -1)
