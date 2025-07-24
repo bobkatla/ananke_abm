@@ -5,7 +5,6 @@ to generate predictions, calculate accuracy, and plot visualizations.
 """
 
 import torch
-import torch.nn as nn
 import torchcde
 import numpy as np
 import matplotlib.pyplot as plt
@@ -17,7 +16,6 @@ import pandas as pd
 # To make the script runnable, we need to import the model and config classes
 from ananke_abm.models.run.simple_cde.household_simple_cde import (
     HouseholdEncoderDecoderConfig,
-    CDEFunc,
     EncoderDecoderCDE,
     SimpleDataProcessor,
     get_device
@@ -66,12 +64,17 @@ def evaluate_model():
     device = get_device()
     processor = SimpleDataProcessor()
     
+    # First, get the training-time graph structure to ensure model compatibility
+    print("📊 Re-creating training-time graph structure...")
+    train_data_for_graph = processor.process_data(repeat_pattern=True)
+    edge_index_sem_train = train_data_for_graph['edge_index_sem']
+
     print("📊 Processing data for evaluation (single day)...")
     data = processor.process_data(repeat_pattern=False)
     num_zones = data['num_zones']
     
     # --- Setup for Physics Violation Check ---
-    edge_index = data['edge_index'].cpu().numpy()
+    edge_index = data['edge_index_phys'].cpu().numpy()
     valid_transitions = set(tuple(edge) for edge in edge_index.T)
     # Add self-loops (it's always valid to stay in the same zone)
     for i in range(num_zones):
@@ -81,10 +84,13 @@ def evaluate_model():
         config,
         num_zones=num_zones,
         person_feat_dim=data['person_features_raw'].shape[1],
+        zone_feat_dim=data['zone_features'].shape[1],
+        edge_index_phys=data['edge_index_phys'].to(device),
+        edge_index_sem=edge_index_sem_train.to(device), # Use the training-time graph
         padding_idx=data['padding_value']
     ).to(device)
 
-    save_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '..', '..', 'saved_models', 'encoder_decoder_cde22')
+    save_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '..', '..', 'saved_models', 'encoder_decoder_cde33')
     model_path = os.path.join(save_dir, 'enc_dec_cde_best.pth')
     
     if not os.path.exists(model_path):
@@ -113,8 +119,13 @@ def evaluate_model():
         person_embeds_all = model.person_feature_embedder(person_features_raw)
         social_context = model.social_gnn(person_embeds_all, people_edge_index)
         person_embeds_all = person_embeds_all + social_context
+        
+        # Compute spatial GNN embeddings
+        zone_features = data['zone_features'].to(device)
+        zone_gnn_embeds = model.get_zone_gnn_embeds(zone_features)
+        
         home_zone_ids_all = full_y[:, 0].to(device)
-        home_zone_embeds_all = model.zone_embedder(home_zone_ids_all)
+        home_zone_embeds_all = zone_gnn_embeds[home_zone_ids_all]
 
     # Store results
     accepted_trajectories = []
@@ -148,7 +159,7 @@ def evaluate_model():
                     # --- Create a self-driven CDE path without looking at ground truth ---
                     last_generated_zone = generated_y_person[:, -1:]
                     y_cde_path_plausible = last_generated_zone.repeat(1, config.prediction_length)
-                    cde_zone_embeds = model.zone_embedder(y_cde_path_plausible)
+                    cde_zone_embeds = zone_gnn_embeds[y_cde_path_plausible.squeeze(0)].unsqueeze(0)
 
                     # Handle time features for the final step to prevent index error
                     if i < full_seq_len - 1:
@@ -158,7 +169,7 @@ def evaluate_model():
 
                     cde_times = torch.linspace(0, 1, config.prediction_length).to(device)
 
-                    history_zone_embeds = model.zone_embedder(y_history)
+                    history_zone_embeds = zone_gnn_embeds[y_history.squeeze(0)].unsqueeze(0)
                     static_embeds = torch.cat([person_embeds, home_zone_embeds], dim=1)
                     expanded_static_embeds = static_embeds.unsqueeze(1).expand(-1, config.history_length, -1)
                     history_path = torch.cat([history_zone_embeds, expanded_static_embeds], dim=2)

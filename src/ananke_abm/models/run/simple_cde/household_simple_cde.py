@@ -16,7 +16,8 @@ from dataclasses import dataclass
 import warnings
 import os
 import torchcde
-from torch_geometric.nn import GATConv
+from torch_geometric.nn import GATConv, GCNConv
+from fastdtw import fastdtw
 
 warnings.filterwarnings('ignore')
 
@@ -75,21 +76,28 @@ class CDEFunc(nn.Module):
 class EncoderDecoderCDE(nn.Module):
     """
     An LSTM-CDE model that first encodes a history and then decodes the next step.
+    This version includes GNNs for both social and spatial context.
     """
-    def __init__(self, config: HouseholdEncoderDecoderConfig, num_zones: int, person_feat_dim: int, padding_idx: int):
+    def __init__(self, config: HouseholdEncoderDecoderConfig, num_zones: int, person_feat_dim: int, zone_feat_dim: int, edge_index_phys: torch.Tensor, edge_index_sem: torch.Tensor, padding_idx: int):
         super().__init__()
         self.config = config
         
+        # --- Spatial GNNs for Zone Embeddings ---
+        self.zone_gnn_phys = GCNConv(zone_feat_dim, config.zone_embed_dim)
+        self.zone_gnn_sem = GCNConv(zone_feat_dim, config.zone_embed_dim)
+        self.register_buffer('edge_index_phys', edge_index_phys)
+        self.register_buffer('edge_index_sem', edge_index_sem)
+
         # --- Embedders ---
-        self.zone_embedder = nn.Embedding(num_zones + 1, config.zone_embed_dim, padding_idx=padding_idx)
         self.person_feature_embedder = nn.Linear(person_feat_dim, config.person_embed_dim)
 
         # --- Social GNN for household interaction ---
         self.social_gnn = GATConv(config.person_embed_dim, config.person_embed_dim, heads=2, concat=False, dropout=0.2)
 
         # --- Encoder (LSTM) ---
-        # It takes a sequence of zone, person, and home embeddings
-        encoder_input_dim = config.zone_embed_dim + config.person_embed_dim + config.zone_embed_dim # Added home embed
+        # The input dimension now includes the concatenated embeddings from the two zone GNNs
+        gnn_embed_dim = config.zone_embed_dim * 2
+        encoder_input_dim = gnn_embed_dim + config.person_embed_dim + gnn_embed_dim # Zone, Person, Home
         self.encoder_rnn = nn.LSTM(
             input_size=encoder_input_dim,
             hidden_size=config.encoder_hidden_dim,
@@ -99,15 +107,20 @@ class EncoderDecoderCDE(nn.Module):
         )
 
         # --- Decoder (CDE) ---
-        # The CDE's initial state is determined by the encoder's context
         self.initial_state_mapper = nn.Linear(config.encoder_hidden_dim, config.cde_hidden_dim)
         
-        # The CDE's control path is simpler: just time + the current zone's embedding
-        control_path_dim = 2 + config.zone_embed_dim # sin/cos time features
+        # The CDE's control path includes time and the concatenated GNN embeddings
+        control_path_dim = 2 + gnn_embed_dim # sin/cos time + phys/sem gnn
         self.cde_func = CDEFunc(control_path_dim, config.cde_hidden_dim)
         
         # The final predictor maps the CDE's state to a zone prediction
         self.predictor = nn.Linear(config.cde_hidden_dim, num_zones)
+
+    def get_zone_gnn_embeds(self, zone_features):
+        """Helper to compute zone embeddings from the spatial GNNs."""
+        phys_embeds = torch.relu(self.zone_gnn_phys(zone_features, self.edge_index_phys))
+        sem_embeds = torch.relu(self.zone_gnn_sem(zone_features, self.edge_index_sem))
+        return torch.cat([phys_embeds, sem_embeds], dim=1)
 
     def forward(self, history_path, cde_coeffs, cde_times):
         """
@@ -149,14 +162,38 @@ def get_device():
 
 
 class SimpleDataProcessor:
-    """Process mock data for the simplified CDE model."""
+    """Process mock data for the CDE model, now including spatial graphs."""
+    def _create_semantic_adjacency_matrix(self, trajectories, num_zones, threshold_percentile=25):
+        """
+        Creates a semantic adjacency matrix based on the similarity of zone usage patterns.
+        """
+        num_people, max_len = trajectories.shape
+        zone_activity = torch.zeros((num_zones, max_len))
+        for t in range(max_len):
+            for p in range(num_people):
+                zone_id = trajectories[p, t]
+                if zone_id < num_zones:
+                    zone_activity[zone_id, t] = 1
+
+        distances, zone_pairs = [], []
+        for i in range(num_zones):
+            for j in range(i + 1, num_zones):
+                dist, _ = fastdtw(zone_activity[i].numpy(), zone_activity[j].numpy(), dist=lambda a, b: abs(a - b))
+                distances.append(dist)
+                zone_pairs.append((i, j))
+        
+        if not distances: return torch.empty((2, 0), dtype=torch.long)
+        
+        distance_threshold = np.percentile(distances, threshold_percentile)
+        adj = torch.zeros((num_zones, num_zones))
+        for (i, j), dist in zip(zone_pairs, distances):
+            if dist <= distance_threshold:
+                adj[i, j] = adj[j, i] = 1
+        return adj.to_sparse().indices()
+
     def process_data(self, repeat_pattern=True):
         """
         Process mock data to return raw tensors for the simple CDE model.
-        
-        Args:
-            repeat_pattern (bool): Whether to generate a long, noisy sequence 
-                                   or a single daily pattern.
         """
         print("   Loading and processing data from mock_2p...")
         sarah_data, marcus_data = create_two_person_training_data(repeat_pattern=repeat_pattern)
@@ -165,13 +202,18 @@ class SimpleDataProcessor:
         trajectories_data = [torch.tensor(d['zone_observations'], dtype=torch.long) for d in [sarah_data, marcus_data]]
         person_names = [d['person_name'] for d in [sarah_data, marcus_data]]
         num_zones = sarah_data['num_zones']
+        zone_features = sarah_data['zone_features']
         
-        # IMPORTANT: Use a padding value that is NOT a valid zone_id. Here, num_zones is a safe choice.
+        # Physical graph from data generator
+        edge_index_phys = sarah_data['edge_index']
+
         padding_value = num_zones 
-        
         max_len = max(len(t) for t in trajectories_data)
         times = torch.linspace(0, max_len - 1, max_len)
         padded_trajs = pad_sequences(trajectories_data, padding_value=padding_value)
+
+        # Create semantic graph from trajectories
+        edge_index_sem = self._create_semantic_adjacency_matrix(padded_trajs, num_zones)
 
         # Create cyclical time features
         time_of_day = times % 24.0
@@ -186,13 +228,15 @@ class SimpleDataProcessor:
             'person_features_raw': person_features_raw,
             'trajectories_y': padded_trajs,
             'times': times,
-            'time_features': time_features, # Add cyclical features
+            'time_features': time_features,
             'num_people': len(person_names),
             'num_zones': num_zones,
             'padding_value': padding_value,
             'person_names': person_names,
-            'edge_index': sarah_data['edge_index'],
-            'people_edge_index': people_edge_index # Add social graph
+            'zone_features': zone_features,
+            'edge_index_phys': edge_index_phys,
+            'edge_index_sem': edge_index_sem,
+            'people_edge_index': people_edge_index
         }
 
 
@@ -214,10 +258,18 @@ def train_model():
     data = processor.process_data(repeat_pattern=True)
     num_zones = data['num_zones']
     
+    # Move graph data to device
+    zone_features = data['zone_features'].to(device)
+    edge_index_phys = data['edge_index_phys'].to(device)
+    edge_index_sem = data['edge_index_sem'].to(device)
+
     model = EncoderDecoderCDE(
         config,
         num_zones=num_zones,
         person_feat_dim=data['person_features_raw'].shape[1],
+        zone_feat_dim=zone_features.shape[1],
+        edge_index_phys=edge_index_phys,
+        edge_index_sem=edge_index_sem,
         padding_idx=data['padding_value']
     ).to(device)
 
@@ -227,7 +279,7 @@ def train_model():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5)
     
     print(f"\n🚀 Training for {config.num_epochs} epochs...")
-    save_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '..', '..', 'saved_models', 'encoder_decoder_cde22')
+    save_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '..', '..', 'saved_models', 'encoder_decoder_cde33')
     os.makedirs(save_dir, exist_ok=True)
     
     # Store losses for plotting and saving
@@ -260,14 +312,20 @@ def train_model():
         # --- Training Step ---
         optimizer.zero_grad()
         
-        # 1. Get Person & Home Embeddings
+        # 1. Compute all embeddings for this step
+        # Social embeddings
         person_embeds = model.person_feature_embedder(person_features_raw)
-        
-        # Apply GNN for social context before passing to LSTM
         social_context = model.social_gnn(person_embeds, people_edge_index)
-        person_embeds = person_embeds + social_context # Use residual connection
+        person_embeds = person_embeds + social_context
 
-        home_zone_embeds = model.zone_embedder(home_zone_ids)
+        # Spatial zone embeddings
+        zone_gnn_embeds_real = model.get_zone_gnn_embeds(zone_features)
+        
+        # Add a zero-vector for the padding index to avoid out-of-bounds error
+        padding_embed = torch.zeros(1, zone_gnn_embeds_real.shape[1], device=device)
+        zone_gnn_embeds = torch.cat([zone_gnn_embeds_real, padding_embed], dim=0)
+
+        home_zone_embeds = zone_gnn_embeds[home_zone_ids]
         
         # 2. Sample a window from the TRAINING set
         total_window_size = config.history_length + config.prediction_length
@@ -280,13 +338,13 @@ def train_model():
         y_cde = train_y[:, history_end_idx - 1 : cde_end_idx]
         
         # 4. Construct LSTM history path (with home embedding)
-        history_zone_embeds = model.zone_embedder(y_history)
+        history_zone_embeds = zone_gnn_embeds[y_history] # Use GNN embeds
         static_embeds = torch.cat([person_embeds, home_zone_embeds], dim=1)
         expanded_static_embeds = static_embeds.unsqueeze(1).expand(-1, config.history_length, -1)
         history_path = torch.cat([history_zone_embeds, expanded_static_embeds], dim=2)
         
         # 5. Construct CDE control path and get coefficients
-        cde_zone_embeds = model.zone_embedder(y_cde)
+        cde_zone_embeds = zone_gnn_embeds[y_cde] # Use GNN embeds
         cde_times = train_times[history_end_idx - 1 : cde_end_idx]
         
         # Use new cyclical time features for the CDE path
@@ -337,13 +395,13 @@ def train_model():
                     vmask = (vtarget != data['padding_value'])
                     
                     if vmask.any():
-                        # Note: Social GNN is already applied to person_embeds
-                        vhistory_zone_embeds = model.zone_embedder(vy_history)
+                        # Embeddings are pre-computed for the validation step
+                        vhistory_zone_embeds = zone_gnn_embeds[vy_history]
                         vstatic_embeds = torch.cat([person_embeds, home_zone_embeds], dim=1)
                         vexpanded_static_embeds = vstatic_embeds.unsqueeze(1).expand(-1, config.history_length, -1)
                         vhistory_path = torch.cat([vhistory_zone_embeds, vexpanded_static_embeds], dim=2)
                         
-                        vcde_zone_embeds = model.zone_embedder(vy_cde)
+                        vcde_zone_embeds = zone_gnn_embeds[vy_cde]
                         vcde_times = val_times[v_history_end - 1 : v_cde_end]
 
                         # Use new cyclical time features for validation CDE path
