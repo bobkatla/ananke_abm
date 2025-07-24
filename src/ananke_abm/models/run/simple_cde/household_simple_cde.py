@@ -11,12 +11,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
 import warnings
 import os
-import time
 import torchcde
 
 warnings.filterwarnings('ignore')
@@ -41,7 +39,7 @@ class HouseholdEncoderDecoderConfig:
     
     # Training
     learning_rate: float = 0.001
-    num_epochs: int = 20000
+    num_epochs: int = 2000
     weight_decay: float = 1e-5
     
     # CDE specific
@@ -101,7 +99,7 @@ class EncoderDecoderCDE(nn.Module):
         self.initial_state_mapper = nn.Linear(config.encoder_hidden_dim, config.cde_hidden_dim)
         
         # The CDE's control path is simpler: just time + the current zone's embedding
-        control_path_dim = 1 + config.zone_embed_dim
+        control_path_dim = 2 + config.zone_embed_dim # sin/cos time features
         self.cde_func = CDEFunc(control_path_dim, config.cde_hidden_dim)
         
         # The final predictor maps the CDE's state to a zone prediction
@@ -171,10 +169,17 @@ class SimpleDataProcessor:
         times = torch.linspace(0, max_len - 1, max_len)
         padded_trajs = pad_sequences(trajectories_data, padding_value=padding_value)
 
+        # Create cyclical time features
+        time_of_day = times % 24.0
+        times_sin = torch.sin(2 * np.pi * time_of_day / 24.0)
+        times_cos = torch.cos(2 * np.pi * time_of_day / 24.0)
+        time_features = torch.stack([times_sin, times_cos], dim=1)
+
         return {
             'person_features_raw': person_features_raw,
             'trajectories_y': padded_trajs,
             'times': times,
+            'time_features': time_features, # Add cyclical features
             'num_people': len(person_names),
             'num_zones': num_zones,
             'padding_value': padding_value,
@@ -224,6 +229,7 @@ def train_model():
     best_val_loss = float('inf')
 
     full_times = data['times'].to(device)
+    time_features = data['time_features'].to(device) # Get new features
     full_y = data['trajectories_y'].to(device)
     person_features_raw = data['person_features_raw'].to(device)
     num_people, full_seq_len = full_y.shape
@@ -234,6 +240,8 @@ def train_model():
     val_y = full_y[:, split_idx:]
     train_times = full_times[:split_idx]
     val_times = full_times[split_idx:]
+    train_time_features = time_features[:split_idx] # Split new features
+    val_time_features = time_features[split_idx:]   # Split new features
     
     home_zone_ids = full_y[:, 0] # Assume first observation is home
 
@@ -266,7 +274,11 @@ def train_model():
         # 5. Construct CDE control path and get coefficients
         cde_zone_embeds = model.zone_embedder(y_cde)
         cde_times = train_times[history_end_idx - 1 : cde_end_idx]
-        cde_time_path = cde_times.view(1, -1, 1).expand(num_people, -1, -1)
+        
+        # Use new cyclical time features for the CDE path
+        cde_time_feats = train_time_features[history_end_idx - 1 : cde_end_idx]
+        cde_time_path = cde_time_feats.unsqueeze(0).expand(num_people, -1, -1)
+        
         cde_path_values = torch.cat([cde_time_path, cde_zone_embeds], dim=2)
         cde_coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(cde_path_values)
         
@@ -318,7 +330,11 @@ def train_model():
                         
                         vcde_zone_embeds = model.zone_embedder(vy_cde)
                         vcde_times = val_times[v_history_end - 1 : v_cde_end]
-                        vcde_time_path = vcde_times.view(1, -1, 1).expand(num_people, -1, -1)
+
+                        # Use new cyclical time features for validation CDE path
+                        vcde_time_feats = val_time_features[v_history_end - 1 : v_cde_end]
+                        vcde_time_path = vcde_time_feats.unsqueeze(0).expand(num_people, -1, -1)
+                        
                         vcde_path_values = torch.cat([vcde_time_path, vcde_zone_embeds], dim=2)
                         vcde_coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(vcde_path_values)
                         

@@ -98,6 +98,7 @@ def evaluate_model():
     print("🤖 Generating full trajectory via autoregressive rollout...")
     
     full_times = data['times'].to(device)
+    time_features = data['time_features'].to(device) # Get new features
     full_y = data['trajectories_y'].to(device)
     person_features_raw = data['person_features_raw'].to(device)
     num_people, full_seq_len = full_y.shape
@@ -135,7 +136,11 @@ def evaluate_model():
             
             cde_zone_embeds = model.zone_embedder(y_cde_actual)
             cde_times = full_times[history_end_idx - 1 : cde_end_idx]
-            cde_time_path = cde_times.view(1, -1, 1).expand(num_people, -1, -1)
+            
+            # Use new cyclical time features for the CDE path
+            cde_time_feats = time_features[history_end_idx - 1 : cde_end_idx]
+            cde_time_path = cde_time_feats.unsqueeze(0).expand(num_people, -1, -1)
+            
             cde_path_values = torch.cat([cde_time_path, cde_zone_embeds], dim=2)
             cde_coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(cde_path_values)
             
