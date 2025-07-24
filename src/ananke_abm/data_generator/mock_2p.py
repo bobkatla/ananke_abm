@@ -184,12 +184,48 @@ def create_marcus_daily_pattern():
     
     return daily_schedule
 
-def create_training_data_single_person(person, schedule, zone_graph):
-    """Convert single person schedule to training format"""
+def create_training_data_single_person(
+    person, 
+    schedule, 
+    zone_graph, 
+    repeat_pattern=True, 
+    num_days=14, 
+    time_noise_std=0.1
+):
+    """
+    Convert single person schedule to training format.
+    If repeat_pattern is True, repeats the daily pattern with added noise 
+    to create a more realistic long sequence.
+    """
     
+    all_times = []
+    all_zones = []
+    
+    if repeat_pattern:
+        # Repeat the schedule for num_days to create a long sequence
+        for day in range(num_days):
+            day_offset = day * 24.0  # Add 24 hours for each new day
+            
+            for event in schedule:
+                # Add random noise to the event time for more realistic data
+                time_noise = np.random.normal(0, time_noise_std) if event['time'] > 0 else 0
+                
+                # Ensure time is always increasing
+                new_time = event["time"] + day_offset + time_noise
+                if len(all_times) > 0 and new_time <= all_times[-1]:
+                    new_time = all_times[-1] + 0.01 # Add small delta
+
+                all_times.append(new_time)
+                all_zones.append(event["zone"] - 1) # 0-indexed
+    else:
+        # Original behavior: process the schedule once without repetition or noise
+        for event in schedule:
+            all_times.append(event["time"])
+            all_zones.append(event["zone"] - 1)
+
     # Extract zone observations and times
-    times = torch.tensor([event["time"] for event in schedule], dtype=torch.float32)
-    zones = torch.tensor([event["zone"] - 1 for event in schedule], dtype=torch.long)  # Convert to 0-indexed
+    times = torch.tensor(all_times, dtype=torch.float32)
+    zones = torch.tensor(all_zones, dtype=torch.long)
     
     # Person attributes as feature vector
     person_attrs = torch.tensor([
@@ -235,38 +271,25 @@ def create_training_data_single_person(person, schedule, zone_graph):
         "person_id": person.person_id
     }
 
-def create_two_person_training_data():
-    """Create training data with both people for learning person-specific patterns
+def create_two_person_training_data(repeat_pattern=True):
+    """Create training data with both people for learning person-specific patterns.
     
-    This creates training data where models can learn to associate:
-    - Person attributes → Behavioral patterns
-    
-    Models will be trained on both Sarah and Marcus, then tested on their ability
-    to predict the correct behavioral pattern when given each person's attributes.
+    Args:
+        repeat_pattern (bool): If True, generates a longer, noisy sequence. 
+                               If False, generates a single, clean daily pattern.
     """
     
     # Create the shared zone graph
     zone_graph, zone_data = create_mock_zone_graph()
     
-    # Create both people
+    # --- Sarah ---
     sarah = create_sarah()
-    marcus = create_marcus()
-    
-    # Create their schedules
     sarah_schedule = create_sarah_daily_pattern()
+    sarah_data = create_training_data_single_person(sarah, sarah_schedule, zone_graph, repeat_pattern=repeat_pattern)
+    
+    # --- Marcus ---
+    marcus = create_marcus()
     marcus_schedule = create_marcus_daily_pattern()
-    
-    # Convert to training format
-    sarah_data = create_training_data_single_person(sarah, sarah_schedule, zone_graph)
-    marcus_data = create_training_data_single_person(marcus, marcus_schedule, zone_graph)
-    
-    # Create a "batch" format where we have multiple training examples
-    # This allows models to learn the mapping: person_attrs → trajectory_pattern
-    
-    # We'll create the training data as separate examples that can be used in batch training
-    # Format compatible with existing training loops
-    
-    # Option 1: Use Sarah's data as the primary training format (with all person metadata)
-    # This maintains compatibility while providing both people's data for evaluation
+    marcus_data = create_training_data_single_person(marcus, marcus_schedule, zone_graph, repeat_pattern=repeat_pattern)
     
     return sarah_data, marcus_data

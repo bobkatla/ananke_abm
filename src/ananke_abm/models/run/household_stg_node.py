@@ -163,12 +163,12 @@ def train_model():
         data['edge_index_sem']
     ).to(device)
 
-    # Add torch.compile for potential speedup
-    try:
-        model = torch.compile(model, mode="reduce-overhead")
-        print("✅ Model compiled successfully with torch.compile!")
-    except Exception as e:
-        print(f"⚠️ Could not compile model with torch.compile: {e}. Continuing without it.")
+    # Add torch.compile for potential speedup - NOTE: Disabled due to incompatibility with torchcde library.
+    # try:
+    #     model = torch.compile(model, mode="reduce-overhead")
+    #     print("✅ Model compiled successfully with torch.compile!")
+    # except Exception as e:
+    #     print(f"⚠️ Could not compile model with torch.compile: {e}. Continuing without it.")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     
@@ -265,7 +265,60 @@ class HouseholdDataProcessor:
         self.zone_to_id = {}
         self.id_to_zone = {}
         self.person_names = []
+        self.zone_names = []
         
+    def _create_semantic_adjacency_matrix(self, trajectories, num_zones, threshold_percentile=25):
+        """
+        Creates a semantic adjacency matrix based on the similarity of zone usage
+        patterns using Dynamic Time Warping (DTW).
+        
+        An edge is created between two zones if the DTW distance between their
+        activity time series is in the bottom `threshold_percentile` of all
+        pairwise distances.
+        """
+        print("   Calculating semantic adjacency matrix using DTW...")
+        num_people, max_len = trajectories.shape
+
+        # 1. Create a time series for each zone representing its activity (is someone present?)
+        zone_activity = torch.zeros((num_zones, max_len))
+        for t in range(max_len):
+            for p in range(num_people):
+                zone_id = trajectories[p, t]
+                # Assuming padding value is a non-valid zone_id and won't be accessed.
+                # If padding is a valid zone_id, this logic needs adjustment.
+                if zone_id < num_zones:
+                    zone_activity[zone_id, t] = 1 # Mark as active (presence)
+
+        # 2. Compute the DTW distance for every pair of zones
+        distances = []
+        zone_pairs = []
+        for i in range(num_zones):
+            for j in range(i + 1, num_zones):
+                ts_i = zone_activity[i].numpy()
+                ts_j = zone_activity[j].numpy()
+                # Use absolute difference for scalar points in the time series, as euclidean expects vectors.
+                distance, _ = fastdtw(ts_i, ts_j, dist=lambda a, b: abs(a - b))
+                distances.append(distance)
+                zone_pairs.append((i, j))
+
+        if not distances:
+            # Handle case with no pairs or single zone
+            return torch.empty((2, 0), dtype=torch.long)
+
+        # 3. Determine the threshold and build the adjacency matrix
+        distance_threshold = np.percentile(distances, threshold_percentile)
+        
+        adj = torch.zeros((num_zones, num_zones))
+        for (i, j), dist in zip(zone_pairs, distances):
+            if dist <= distance_threshold:
+                adj[i, j] = 1
+                adj[j, i] = 1 # Symmetric relationship
+                
+        # 4. Convert adjacency matrix to edge index format
+        edge_index = adj.to_sparse().indices()
+        print(f"   Semantic graph created with {edge_index.shape[1]} edges (DTW distance < {distance_threshold:.2f})")
+        return edge_index
+
     def process_data(self):
         """
         Process mock data to return raw tensors.
@@ -280,25 +333,33 @@ class HouseholdDataProcessor:
         
         # GNN graph structure
         zone_features = sarah_data['zone_features']
-        zone_graph, _ = create_mock_zone_graph()
+        zone_graph, self.zone_names = create_mock_zone_graph()
         edge_index_phys = from_networkx(zone_graph).edge_index
         
         # Padded trajectories and time grid
+        # IMPORTANT: Use a padding value that is NOT a valid zone_id. Here, num_zones is a safe choice.
+        num_zones = sarah_data['num_zones']
+        padding_value = num_zones
         max_len = max(len(t) for t in trajectories_data)
         times = torch.linspace(0, max_len - 1, max_len)
-        padded_trajs = pad_sequences(trajectories_data, padding_value=0)
+        padded_trajs = pad_sequences(trajectories_data, padding_value=padding_value)
+
+        # Create the semantic graph based on movement patterns
+        edge_index_sem = self._create_semantic_adjacency_matrix(padded_trajs, num_zones)
 
         return {
             'person_features_raw': person_features_raw,
             'trajectories_y': padded_trajs,
             'times': times,
             'num_people': len(self.person_names),
-            'num_zones': sarah_data['num_zones'],
+            'num_zones': num_zones,
             'zone_features': zone_features,
             'edge_index_phys': edge_index_phys,
-            'edge_index_sem': edge_index_phys, # Placeholder for now
+            'edge_index_sem': edge_index_sem,
             'adjacency_matrix': torch.tensor(nx.to_numpy_array(zone_graph), dtype=torch.float32),
-            'person_names': self.person_names
+            'person_names': self.person_names,
+            'zone_names': self.zone_names,
+            'padding_value': padding_value,
         }
 
 def main():
