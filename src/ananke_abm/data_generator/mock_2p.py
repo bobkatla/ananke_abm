@@ -128,6 +128,7 @@ def create_sarah_daily_pattern():
         {"time": 19.5, "zone": 1, "activity": "dinner", "description": "Dinner at home"},
         {"time": 21.0, "zone": 1, "activity": "evening", "description": "Relaxing at home"},
         {"time": 23.0, "zone": 1, "activity": "sleep", "description": "Going to sleep"},
+        {"time": 24.0, "zone": 1, "activity": "sleep", "description": "End of day at home"},
     ]
     
     return daily_schedule
