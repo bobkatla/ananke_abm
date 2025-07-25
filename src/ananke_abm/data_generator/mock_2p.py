@@ -201,6 +201,7 @@ def create_training_data_single_person(
     
     all_times = []
     all_zones = []
+    all_activities = []
     
     if repeat_pattern:
         # Repeat the schedule for num_days to create a long sequence
@@ -218,11 +219,13 @@ def create_training_data_single_person(
 
                 all_times.append(new_time)
                 all_zones.append(event["zone"] - 1) # 0-indexed
+                all_activities.append(event["activity"])
     else:
         # Original behavior: process the schedule once without repetition or noise
         for event in schedule:
             all_times.append(event["time"])
             all_zones.append(event["zone"] - 1)
+            all_activities.append(event["activity"])
 
     # Extract zone observations and times
     times = torch.tensor(all_times, dtype=torch.float32)
@@ -265,6 +268,7 @@ def create_training_data_single_person(
         "person_attrs": person_attrs,
         "times": times,
         "zone_observations": zones,  # Now 0-indexed
+        "activities": all_activities,
         "zone_features": zone_features,
         "edge_index": edge_index,
         "num_zones": len(zone_graph.nodes()),

@@ -11,297 +11,231 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-from dataclasses import dataclass
-import os
-import warnings
 from torchdiffeq import odeint
 import networkx as nx
+import numpy as np
 
 # Local imports
 from ananke_abm.data_generator.mock_2p import create_two_person_training_data
 from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
 
-warnings.filterwarnings('ignore')
+# --- 1. Training Configuration ---
 
-# --- 1. Configuration ---
-@dataclass
 class GenerativeODEConfig:
-    """Configuration for the Generative ODE model"""
-    zone_embed_dim: int = 32
-    person_embed_dim: int = 32
-    latent_dim: int = 64  # The dimension of the "plan" vector z
-    
+    latent_dim: int = 32
+    zone_embed_dim: int = 16
+    encoder_hidden_dim: int = 128
     ode_hidden_dim: int = 128
     
-    # Training
-    learning_rate: float = 0.001
-    num_epochs: int = 5000
-    weight_decay: float = 1e-5
+    # Training parameters
+    learning_rate: float = 1e-3
+    num_iterations: int = 10000
+    kl_weight: float = 0.01  # Weight for the KL divergence term
     
-    # ODE specific
+    # ODE solver settings
     ode_method: str = 'dopri5'
-    ode_rtol: float = 1e-4
-    ode_atol: float = 1e-4
-
-    # Loss weights for composite loss
-    trait_loss_weight: float = 1.0
-    physical_loss_weight: float = 1.5 # Give less weight to the direct distance initially
+    
+    # Purpose configuration
+    purpose_groups: list = ["Home", "Work/Education", "Subsistence", "Leisure & Recreation", "Social", "Travel/Transit"]
 
 # --- 2. Data Processor ---
+
 class DataProcessor:
-    """Processes mock data, providing the raw, irregular event data."""
-    
-    def process_data(self):
-        """Provides the original, irregularly-spaced trajectory data."""
-        print("   Loading and processing data...")
-        # Note: We only need Sarah's data for this single-agent model
-        sarah_data, _ = create_two_person_training_data(repeat_pattern=False)
-        
-        # Also load the graph to get the adjacency matrix and distance matrix
-        zone_graph, _ = create_mock_zone_graph()
-        sorted_nodes = sorted(zone_graph.nodes())
-        
-        # Adjacency Matrix for hard constraints
-        adjacency_matrix = torch.tensor(nx.to_numpy_array(zone_graph, nodelist=sorted_nodes), dtype=torch.float32)
+    """Processes mock data, preparing it for the Generative ODE model."""
 
-        # Distance Matrix for soft loss constraint
-        num_zones = len(sorted_nodes)
-        distance_matrix = torch.zeros((num_zones, num_zones))
-        for i in range(num_zones):
-            for j in range(num_zones):
-                node_i = sorted_nodes[i]
-                node_j = sorted_nodes[j]
-                # Using shortest path distance on the graph as the metric
-                distance_matrix[i, j] = nx.shortest_path_length(zone_graph, source=node_i, target=node_j, weight='distance')
-        
-        # Normalize the distance matrix
-        distance_matrix = distance_matrix / distance_matrix.max()
+    def __init__(self, device, config):
+        self.device = device
+        self.config = config
+        self.sarah_data, self.marcus_data = create_two_person_training_data(repeat_pattern=False)
+        self.zone_graph, _ = create_mock_zone_graph()
 
+        # Define the mapping from detailed activities to broader categories
+        self.activity_to_group = {
+            # Home activities
+            "sleep": "Home", "morning_routine": "Home", "evening": "Home", 
+            "dinner": "Home", "arrive_home": "Home",
+            # Work/Education
+            "work": "Work/Education", "arrive_work": "Work/Education", "end_work": "Work/Education",
+            # Subsistence
+            "lunch": "Subsistence", "lunch_start": "Subsistence", "lunch_end": "Subsistence",
+            # Leisure & Recreation
+            "gym": "Leisure & Recreation", "gym_end": "Leisure & Recreation", 
+            "exercise": "Leisure & Recreation", "leaving_park": "Leisure & Recreation",
+            # Social
+            "social": "Social", "leaving_social": "Social", "dinner_social": "Social",
+            # Travel/Transit
+            "prepare_commute": "Travel/Transit", "start_commute": "Travel/Transit",
+            "transit": "Travel/Transit", "leaving_home": "Travel/Transit",
+            "break": "Travel/Transit",
+        }
+        self.purpose_map = {name: i for i, name in enumerate(self.config.purpose_groups)}
+
+    def get_data(self, person_id: int):
+        data = self.sarah_data if person_id == 1 else self.marcus_data
+
+        # --- Process Purpose Features ---
+        activities = data["activities"]
+        purpose_counts = torch.zeros(len(self.config.purpose_groups))
+        for activity in activities:
+            group = self.activity_to_group.get(activity, "Travel/Transit")
+            group_idx = self.purpose_map[group]
+            purpose_counts[group_idx] += 1
+        purpose_features = F.normalize(purpose_counts, p=1, dim=0)
 
         return {
-            'person_features': sarah_data['person_attrs'],
-            'trajectory_y': sarah_data['zone_observations'],
-            'times': sarah_data['times'],
-            'num_zones': sarah_data['num_zones'],
-            'zone_features': sarah_data['zone_features'],
-            'person_name': sarah_data['person_name'],
-            'home_zone_id': sarah_data['home_zone_id'],
-            'work_zone_id': sarah_data['work_zone_id'],
-            'adjacency_matrix': adjacency_matrix,
-            'distance_matrix': distance_matrix
+            "person_features": data["person_attrs"].to(self.device),
+            "trajectory_y": data["zone_observations"].to(self.device),
+            "times": data["times"].to(self.device),
+            "num_zones": data["num_zones"],
+            "home_zone_id": data["home_zone_id"],
+            "work_zone_id": data["work_zone_id"],
+            "person_name": data.get("person_name", f"Person {person_id}"),
+            "purpose_features": purpose_features.to(self.device),
         }
 
 # --- 3. Model Architecture ---
 
+class ResidualBlock(nn.Module):
+    """A residual block with two linear layers and a skip connection."""
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(dim, dim), nn.Tanh(), nn.Linear(dim, dim))
+        self.activation = nn.Tanh()
+
+    def forward(self, x):
+        return self.activation(x + self.net(x))
+
 class ODEFunc(nn.Module):
-    """The dynamics function f(z, t, home_embedding) for the Neural ODE."""
+    """The dynamics function f(z, t, ...) using a ResNet-like architecture."""
     def __init__(self, latent_dim, hidden_dim, static_dim, home_embed_dim):
         super().__init__()
-        # The ODE is now conditioned on the home embedding as well
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim + static_dim + home_embed_dim + 1, hidden_dim), # z, static, home, t
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, latent_dim),
-        )
+        self.input_layer = nn.Sequential(nn.Linear(latent_dim + static_dim + home_embed_dim + 1, hidden_dim), nn.Tanh())
+        self.residual_blocks = nn.Sequential(ResidualBlock(hidden_dim), ResidualBlock(hidden_dim))
+        self.output_layer = nn.Linear(hidden_dim, latent_dim)
 
     def forward(self, t, z):
-        # The ODE solver passes t and z. We manually append static and home features.
         t_vec = torch.ones(z.shape[0], 1).to(z.device) * t
-        # Note: self.static_features and self.home_zone_embedding must be set before calling odeint
         z_t_static_home = torch.cat([z, t_vec, self.static_features, self.home_zone_embedding], dim=-1)
-        return self.net(z_t_static_home)
+        h = self.input_layer(z_t_static_home)
+        h = self.residual_blocks(h)
+        return self.output_layer(h)
 
 class GenerativeODE(nn.Module):
-    """
-    A generative model that decodes a latent vector z into a full trajectory
-    using a Neural ODE. This version is conditioned on the final home location.
-    """
-    def __init__(self, config: GenerativeODEConfig, person_feat_dim: int, num_zones: int):
+    """A generative VAE model that decodes a latent vector z into a full trajectory."""
+    def __init__(self, person_feat_dim, num_zones, config):
         super().__init__()
         self.config = config
-        
-        # Zone Look-up Table
         self.zone_embedder = nn.Embedding(num_zones, config.zone_embed_dim)
         
-        # Encoder: Maps enriched static features to the initial latent state z(0)
-        # Input: person_features + work_zone_embedding (Home is now for the ODE dynamics)
-        encoder_input_dim = person_feat_dim + config.zone_embed_dim
+        encoder_input_dim = person_feat_dim + config.zone_embed_dim * 2 + len(config.purpose_groups)
         self.encoder = nn.Sequential(
-            nn.Linear(encoder_input_dim, 128),
+            nn.Linear(encoder_input_dim, config.encoder_hidden_dim),
             nn.ReLU(),
-            nn.Linear(128, config.latent_dim)
+            nn.Linear(config.encoder_hidden_dim, config.latent_dim * 2),
         )
         
-        # ODE Dynamics - conditioned on static features AND the home embedding
+        self.decoder = nn.Linear(config.latent_dim, num_zones)
         self.ode_func = ODEFunc(
             latent_dim=config.latent_dim, 
-            hidden_dim=config.ode_hidden_dim, 
-            static_dim=encoder_input_dim, # The static context passed to the ODE
+            hidden_dim=config.ode_hidden_dim,
+            static_dim=person_feat_dim + config.zone_embed_dim, # person_features + work_embed
             home_embed_dim=config.zone_embed_dim
         )
-        
-        # Decoder: Maps the latent trajectory z(t) to the TRAIT embedding space
-        self.decoder = nn.Linear(config.latent_dim, config.zone_embed_dim)
 
-    def forward(self, person_features, home_zone_id, work_zone_id, times):
-        """
-        Generates a full trajectory from static person features, conditioned on the home location.
-        """
-        # 1. Get embeddings for home and work zones
-        home_zone_embed = self.zone_embedder(home_zone_id)
-        work_zone_embed = self.zone_embedder(work_zone_id)
+    def forward(self, person_features, home_zone_id, work_zone_id, purpose_features, times):
+        home_embed = self.zone_embedder(home_zone_id)
+        work_embed = self.zone_embedder(work_zone_id)
         
-        # 2. Create the static feature set for the ENCODER (to generate z0)
-        # We exclude the home embedding here, as it's a dynamic constraint, not an initial condition.
-        encoder_static_features = torch.cat([person_features, work_zone_embed], dim=-1)
+        encoder_input = torch.cat([person_features, home_embed, work_embed, purpose_features], dim=-1)
+        
+        latent_params = self.encoder(encoder_input)
+        mu, log_var = latent_params.chunk(2, dim=-1)
+        
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        z0 = mu + eps * std
 
-        # 3. Encode to get the initial state z(0)
-        z0 = self.encoder(encoder_static_features)
+        self.ode_func.static_features = torch.cat([person_features, work_embed], dim=-1).expand(z0.shape[0], -1)
+        self.ode_func.home_zone_embedding = home_embed.expand(z0.shape[0], -1)
         
-        # 4. Set the conditioning variables for the ODE function
-        # The ODE needs the static context (what we used for the encoder) AND the home embedding.
-        self.ode_func.static_features = encoder_static_features.expand(z0.shape[0], -1)
-        self.ode_func.home_zone_embedding = home_zone_embed.expand(z0.shape[0], -1)
+        pred_z = odeint(self.ode_func, z0, times, method=self.config.ode_method).permute(1, 0, 2)
+        pred_y_logits = self.decoder(pred_z)
+        
+        return pred_y_logits, mu, log_var
 
-        # 5. Solve the ODE for the entire time interval
-        z_t = odeint(
-            self.ode_func,
-            z0,
-            times,
-            method=self.config.ode_method,
-            rtol=self.config.ode_rtol,
-            atol=self.config.ode_atol
-        )
-        
-        # 6. Decode the latent trajectory to get zone predictions
-        # z_t has shape (time, batch, features), need to swap for decoder
-        z_t = z_t.permute(1, 0, 2)
-        pred_y_embeds = self.decoder(z_t)
-        
-        return pred_y_embeds
+# --- 4. Main Execution ---
 
-# --- 4. Training Loop ---
-def train():
-    """Trains the Generative ODE model."""
-    print("🏠 Training Generative ODE Model for a Single Agent")
-    print("=" * 60)
-    
+if __name__ == "__main__":
     config = GenerativeODEConfig()
-    processor = DataProcessor()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    processor = DataProcessor(device, config)
     print(f"🔬 Using device: {device}")
 
-    print("📊 Processing data...")
-    data = processor.process_data()
+    print("📊 Processing data for Person 1 (Sarah)...")
+    data = processor.get_data(person_id=1)
+    
+    person_features = data["person_features"].unsqueeze(0)
+    trajectory_y = data["trajectory_y"]
+    times = data["times"]
+    home_zone_id = torch.tensor([data["home_zone_id"]], device=device)
+    work_zone_id = torch.tensor([data["work_zone_id"]], device=device)
+    purpose_features = data["purpose_features"].unsqueeze(0)
     
     model = GenerativeODE(
-        config,
-        person_feat_dim=data['person_features'].shape[0],
-        num_zones=data['num_zones']
+        person_feat_dim=person_features.shape[-1],
+        num_zones=data["num_zones"],
+        config=config,
     ).to(device)
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     
-    # Move data to device
-    person_features = data['person_features'].unsqueeze(0).to(device) # Add batch dim
-    home_zone_id = torch.tensor([data['home_zone_id']], device=device)
-    work_zone_id = torch.tensor([data['work_zone_id']], device=device)
-    trajectory_y = data['trajectory_y'].to(device)
-    times = data['times'].to(device)
-    distance_matrix = data['distance_matrix'].to(device)
-    
-    print(f"\n🚀 Training for {config.num_epochs} epochs...")
-    save_dir = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'saved_models', 'generative_ode')
-    os.makedirs(save_dir, exist_ok=True)
-    
-    losses = []
+    print("🚀 Starting training...")
     best_loss = float('inf')
-    model_path = os.path.join(save_dir, 'generative_ode_best.pth')
-    
-    for epoch in range(config.num_epochs):
-        model.train()
+    model_path = "generative_ode_best_model.pth"
+
+    for i in range(config.num_iterations):
         optimizer.zero_grad()
         
-        # Forward pass to get predicted embeddings in the trait space
-        pred_y_embeds = model(person_features, home_zone_id, work_zone_id, times).squeeze(0)
-        
-        # --- Loss Calculation ---
-        
-        # 1. Trait Loss (MSE in the learned semantic/trait space)
-        true_y_embeds = model.zone_embedder(trajectory_y)
-        trait_loss = F.mse_loss(pred_y_embeds, true_y_embeds)
-        
-        # 2. Physical Loss (Direct distance look-up)
-        # First, find the 'hard' prediction by finding the nearest neighbor in trait space
-        all_zone_embeds = model.zone_embedder.weight.detach() # Detach to not train via this path
-        dist_matrix_embed = torch.cdist(pred_y_embeds, all_zone_embeds)
-        pred_y_indices = torch.argmin(dist_matrix_embed, dim=1)
-        
-        # Now, look up the real physical distance between predicted and true zones
-        physical_loss = distance_matrix[pred_y_indices, trajectory_y].mean()
+        pred_y_logits, mu, log_var = model(person_features, home_zone_id, work_zone_id, purpose_features, times)
+        pred_y_logits = pred_y_logits.squeeze(0)
 
-        # 3. Composite Loss
-        loss = (
-            config.trait_loss_weight * trait_loss + 
-            config.physical_loss_weight * physical_loss
-        )
-        
+        recon_loss = F.cross_entropy(pred_y_logits, trajectory_y)
+        kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+        loss = recon_loss + config.kl_weight * kl_loss
+
         loss.backward()
         optimizer.step()
-        
-        losses.append(loss.item())
-        
-        # Save the best model based on training loss
+
+        if (i + 1) % 500 == 0:
+            print(f"   Iter {i+1}, Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}")
+
         if loss.item() < best_loss:
             best_loss = loss.item()
             torch.save(model.state_dict(), model_path)
-        
-        if (epoch + 1) % 100 == 0:
-            print(f"   Epoch {epoch+1:5d}/{config.num_epochs} | Loss: {loss.item():.4f} | Best Loss: {best_loss:.4f}")
             
-    print("\n✅ Training complete!")
+    print("✅ Training complete.")
 
-    # --- 5. Evaluation and Visualization ---
-    print("📈 Evaluating model and plotting results...")
-    
-    # Load the best model for evaluation
-    print(f"   -> Loading best model from {model_path}")
+    print("📈 Evaluating best model...")
     model.load_state_dict(torch.load(model_path))
     model.eval()
-    
-    with torch.no_grad():
-        # To generate a smooth plot, we now query the ODE on a uniform grid
-        plot_times = torch.linspace(0, 24, 100).to(device)
-        pred_y_embeds_plot = model(person_features, home_zone_id, work_zone_id, plot_times).squeeze(0)
-        
-        # Find nearest zones for plotting by comparing distances in the embedding space
-        all_zone_embeds = model.zone_embedder.weight
-        dist_matrix = torch.cdist(pred_y_embeds_plot, all_zone_embeds)
-        pred_y_plot = torch.argmin(dist_matrix, dim=1)
 
-    plt.figure(figsize=(15, 5))
-    # Plot the original, sparse ground truth points
-    plt.plot(data['times'].cpu(), data['trajectory_y'].cpu(), label='Ground Truth Events', color='blue', marker='o', linestyle='None', markersize=6)
-    # Plot the dense, generated trajectory from the ODE
-    plt.plot(plot_times.cpu(), pred_y_plot.cpu(), label='Generated Trajectory (ODE)', color='red', linestyle='-', markersize=2)
-    plt.title(f"Generated vs. Ground Truth Trajectory for {data['person_name']}")
-    plt.ylabel('Zone ID')
-    plt.xlabel('Time (Hours)')
-    plt.grid(True)
+    with torch.no_grad():
+        plot_times = torch.linspace(0, 24, 100).to(device)
+        pred_y_logits, _, _ = model(person_features, home_zone_id, work_zone_id, purpose_features, plot_times)
+        pred_y_logits = pred_y_logits.squeeze(0)
+        pred_y = torch.argmax(pred_y_logits, dim=1)
+
+    plt.figure(figsize=(15, 6))
+    plt.plot(data["times"].cpu().numpy(), data["trajectory_y"].cpu().numpy(), 'o', label='Ground Truth Snaps', markersize=8)
+    plt.plot(plot_times.cpu().numpy(), pred_y.cpu().numpy(), '-', label='Generated Trajectory')
+    
+    plt.xlabel("Time (hours)")
+    plt.ylabel("Zone ID")
+    plt.title(f"Generated vs. Ground Truth Trajectory for {data['person_name']} (with Purpose)")
+    plt.yticks(np.arange(data["num_zones"]))
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
     plt.legend()
     plt.tight_layout()
-    plot_path = os.path.join(save_dir, 'trajectory_comparison.png')
-    plt.savefig(plot_path)
-    plt.close()
-    print(f"   -> Plot saved to {plot_path}")
-
-# --- Main Execution ---
-if __name__ == "__main__":
-    try:
-        train()
-    except Exception as e:
-        print(f"❌ Error occurred: {e}")
-        import traceback
-        traceback.print_exc() 
+    plt.savefig("generative_ode_with_purpose_trajectory.png")
+    print("📄 Plot saved to 'generative_ode_with_purpose_trajectory.png'")
+    plt.show() 
