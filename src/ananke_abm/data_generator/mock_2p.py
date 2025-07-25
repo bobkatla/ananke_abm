@@ -269,7 +269,9 @@ def create_training_data_single_person(
         "edge_index": edge_index,
         "num_zones": len(zone_graph.nodes()),
         "person_name": person.name,
-        "person_id": person.person_id
+        "person_id": person.person_id,
+        "home_zone_id": person.home_zone - 1, # 0-indexed
+        "work_zone_id": person.work_zone - 1  # 0-indexed
     }
 
 def create_two_person_training_data(repeat_pattern=True):
