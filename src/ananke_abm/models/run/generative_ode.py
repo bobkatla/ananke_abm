@@ -171,71 +171,98 @@ if __name__ == "__main__":
     processor = DataProcessor(device, config)
     print(f"🔬 Using device: {device}")
 
-    print("📊 Processing data for Person 1 (Sarah)...")
-    data = processor.get_data(person_id=1)
-    
-    person_features = data["person_features"].unsqueeze(0)
-    trajectory_y = data["trajectory_y"]
-    times = data["times"]
-    home_zone_id = torch.tensor([data["home_zone_id"]], device=device)
-    work_zone_id = torch.tensor([data["work_zone_id"]], device=device)
-    purpose_features = data["purpose_features"].unsqueeze(0)
-    
+    # --- Model Initialization ---
+    # We initialize the model once. We can get the feature dimensions from one person.
+    init_data = processor.get_data(person_id=1)
     model = GenerativeODE(
-        person_feat_dim=person_features.shape[-1],
-        num_zones=data["num_zones"],
+        person_feat_dim=init_data["person_features"].shape[-1],
+        num_zones=init_data["num_zones"],
         config=config,
     ).to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     
-    print("🚀 Starting training...")
+    # --- Training Loop for Multiple People ---
+    print("🚀 Starting training for all people...")
     best_loss = float('inf')
     model_path = "generative_ode_best_model.pth"
+    person_ids = [1, 2]  # Sarah and Marcus
 
     for i in range(config.num_iterations):
-        optimizer.zero_grad()
         
-        pred_y_logits, mu, log_var = model(person_features, home_zone_id, work_zone_id, purpose_features, times)
-        pred_y_logits = pred_y_logits.squeeze(0)
+        total_iter_loss = 0
+        # In each iteration, train on each person's data
+        for person_id in person_ids:
+            optimizer.zero_grad()
+            
+            data = processor.get_data(person_id=person_id)
+            
+            person_features = data["person_features"].unsqueeze(0)
+            trajectory_y = data["trajectory_y"]
+            times = data["times"]
+            home_zone_id = torch.tensor([data["home_zone_id"]], device=device)
+            work_zone_id = torch.tensor([data["work_zone_id"]], device=device)
+            purpose_features = data["purpose_features"].unsqueeze(0)
 
-        recon_loss = F.cross_entropy(pred_y_logits, trajectory_y)
-        kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
-        loss = recon_loss + config.kl_weight * kl_loss
+            pred_y_logits, mu, log_var = model(person_features, home_zone_id, work_zone_id, purpose_features, times)
+            pred_y_logits = pred_y_logits.squeeze(0)
 
-        loss.backward()
-        optimizer.step()
+            recon_loss = F.cross_entropy(pred_y_logits, trajectory_y)
+            kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+            loss = recon_loss + config.kl_weight * kl_loss
+
+            loss.backward()
+            optimizer.step()
+            total_iter_loss += loss.item()
 
         if (i + 1) % 500 == 0:
-            print(f"   Iter {i+1}, Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}")
+            avg_loss = total_iter_loss / len(person_ids)
+            print(f"   Iter {i+1}, Avg Loss: {avg_loss:.4f}")
 
-        if loss.item() < best_loss:
-            best_loss = loss.item()
+        # Save the best model based on average loss for the iteration
+        if total_iter_loss < best_loss:
+            best_loss = total_iter_loss
             torch.save(model.state_dict(), model_path)
             
     print("✅ Training complete.")
 
-    print("📈 Evaluating best model...")
+    # --- Evaluation for Multiple People ---
+    print("📈 Evaluating best model for each person...")
     model.load_state_dict(torch.load(model_path))
     model.eval()
 
-    with torch.no_grad():
-        plot_times = torch.linspace(0, 24, 100).to(device)
-        pred_y_logits, _, _ = model(person_features, home_zone_id, work_zone_id, purpose_features, plot_times)
-        pred_y_logits = pred_y_logits.squeeze(0)
-        pred_y = torch.argmax(pred_y_logits, dim=1)
+    for person_id in person_ids:
+        with torch.no_grad():
+            data = processor.get_data(person_id=person_id)
+            person_name = data['person_name']
+            print(f"   -> Generating trajectory for {person_name}...")
 
-    plt.figure(figsize=(15, 6))
-    plt.plot(data["times"].cpu().numpy(), data["trajectory_y"].cpu().numpy(), 'o', label='Ground Truth Snaps', markersize=8)
-    plt.plot(plot_times.cpu().numpy(), pred_y.cpu().numpy(), '-', label='Generated Trajectory')
-    
-    plt.xlabel("Time (hours)")
-    plt.ylabel("Zone ID")
-    plt.title(f"Generated vs. Ground Truth Trajectory for {data['person_name']} (with Purpose)")
-    plt.yticks(np.arange(data["num_zones"]))
-    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("generative_ode_with_purpose_trajectory.png")
-    print("📄 Plot saved to 'generative_ode_with_purpose_trajectory.png'")
-    plt.show() 
+            person_features = data["person_features"].unsqueeze(0)
+            home_zone_id = torch.tensor([data["home_zone_id"]], device=device)
+            work_zone_id = torch.tensor([data["work_zone_id"]], device=device)
+            purpose_features = data["purpose_features"].unsqueeze(0)
+
+            plot_times = torch.linspace(0, 24, 100).to(device)
+            pred_y_logits, _, _ = model(person_features, home_zone_id, work_zone_id, purpose_features, plot_times)
+            pred_y_logits = pred_y_logits.squeeze(0)
+            pred_y = torch.argmax(pred_y_logits, dim=1)
+
+        # --- Visualization ---
+        plt.figure(figsize=(15, 6))
+        plt.plot(data["times"].cpu().numpy(), data["trajectory_y"].cpu().numpy(), 'o', label='Ground Truth Snaps', markersize=8)
+        plt.plot(plot_times.cpu().numpy(), pred_y.cpu().numpy(), '-', label='Generated Trajectory')
+        
+        plt.xlabel("Time (hours)")
+        plt.ylabel("Zone ID")
+        plt.title(f"Generated vs. Ground Truth Trajectory for {person_name}")
+        plt.yticks(np.arange(data["num_zones"]))
+        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+        plt.legend()
+        plt.tight_layout()
+        
+        save_path = f"generative_ode_trajectory_{person_name.replace(' ', '_')}.png"
+        plt.savefig(save_path)
+        print(f"   📄 Plot saved to '{save_path}'")
+        plt.close()
+
+    print("✅ Evaluation complete.") 
