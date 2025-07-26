@@ -4,10 +4,10 @@ Main script for training the Generative Latent ODE model.
 import torch
 import numpy as np
 
-from .config import GenerativeODEConfig
-from .data import DataProcessor
-from .model import GenerativeODE
-from .loss import calculate_loss
+from ananke_abm.models.run.latent_ode.config import GenerativeODEConfig
+from ananke_abm.models.run.latent_ode.data import DataProcessor
+from ananke_abm.models.run.latent_ode.model import GenerativeODE
+from ananke_abm.models.run.latent_ode.loss import calculate_loss
 
 def train():
     """Orchestrates the training of the Generative ODE model."""

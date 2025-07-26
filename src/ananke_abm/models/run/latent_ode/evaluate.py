@@ -5,9 +5,9 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 
-from .config import GenerativeODEConfig
-from .data import DataProcessor
-from .model import GenerativeODE
+from ananke_abm.models.run.latent_ode.config import GenerativeODEConfig
+from ananke_abm.models.run.latent_ode.data import DataProcessor
+from ananke_abm.models.run.latent_ode.model import GenerativeODE
 
 def evaluate():
     """Loads a trained model and generates evaluation plots."""
