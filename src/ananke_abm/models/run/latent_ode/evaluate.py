@@ -36,6 +36,42 @@ def evaluate():
         print(f"ERROR: Model file not found at {model_path}. Please run train.py first.")
         return
         
+    # --- Plot Training Loss ---
+    training_stats_path = folder_path / "latent_ode_training_stats_composite_loss_anchor.npz"
+    try:
+        stats = np.load(training_stats_path)
+        
+        plt.figure(figsize=(14, 8))
+        
+        # Plot each loss component if it exists in the stats file
+        loss_keys = {
+            'iteration_losses': 'Total Loss',
+            'classification_losses': 'Location Classification',
+            'embedding_losses': 'Location Embedding',
+            'distance_losses': 'Physical Distance',
+            'purpose_losses': 'Purpose Classification',
+            'kl_losses': 'KL Divergence'
+        }
+        
+        for key, label in loss_keys.items():
+            if key in stats:
+                plt.plot(stats[key], label=label, alpha=0.9)
+
+        plt.title("All Training Loss Components (Unweighted)")
+        plt.xlabel("Iteration")
+        plt.ylabel("Average Loss")
+        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+        plt.legend()
+        plt.yscale('log')
+        plt.tight_layout()
+        loss_plot_path = folder_path / "all_training_loss_curves_anchor.png"
+        plt.savefig(loss_plot_path)
+        print(f"   📉 All training loss plots saved to '{loss_plot_path}'")
+        plt.close()
+            
+    except FileNotFoundError:
+        print(f"WARNING: Training stats file not found at {training_stats_path}. Skipping loss plot.")
+
     model.eval()
 
     person_ids = [1, 2]  # Sarah and Marcus

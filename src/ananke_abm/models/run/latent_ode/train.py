@@ -36,10 +36,17 @@ def train():
     training_stats_path = folder_path / "latent_ode_training_stats_composite_loss_anchor.npz"
     person_ids = [1, 2]
 
+    # Lists to store all loss components
     iteration_losses = []
+    classification_losses = []
+    embedding_losses = []
+    distance_losses = []
+    purpose_losses = []
+    kl_losses = []
     
     for i in range(config.num_iterations):
-        total_iter_loss = 0
+        # Accumulators for the current iteration's losses
+        total_iter_loss, total_c, total_e, total_d, total_p, total_kl = 0, 0, 0, 0, 0, 0
         model.train()
         
         for person_id in person_ids:
@@ -74,26 +81,47 @@ def train():
 
             loss.backward()
             optimizer.step()
-            total_iter_loss += loss.item()
             
-        avg_loss = total_iter_loss / len(person_ids)
-        iteration_losses.append(avg_loss)
+            # Accumulate all loss components
+            total_iter_loss += loss.item()
+            total_c += loss_c.item()
+            total_e += loss_e.item()
+            total_d += loss_d.item()
+            total_p += loss_p.item()
+            total_kl += loss_kl.item()
+            
+        # Calculate and record the average of each loss component for the iteration
+        num_people = len(person_ids)
+        iteration_losses.append(total_iter_loss / num_people)
+        classification_losses.append(total_c / num_people)
+        embedding_losses.append(total_e / num_people)
+        distance_losses.append(total_d / num_people)
+        purpose_losses.append(total_p / num_people)
+        kl_losses.append(total_kl / num_people)
 
         if (i + 1) % 500 == 0:
-            print(f"Iter {i+1}, Avg Loss: {avg_loss:.4f} | "
-                  f"Classif: {loss_c.item():.4f}, "
-                  f"Embed: {loss_e.item():.4f}, "
-                  f"Dist: {loss_d.item():.4f}, "
-                  f"Purp: {loss_p.item():.4f}, "
-                  f"KL: {loss_kl.item():.4f}")
+            print(f"Iter {i+1}, Avg Loss: {iteration_losses[-1]:.4f} | "
+                  f"Classif: {classification_losses[-1]:.4f}, "
+                  f"Embed: {embedding_losses[-1]:.4f}, "
+                  f"Dist: {distance_losses[-1]:.4f}, "
+                  f"Purp: {purpose_losses[-1]:.4f}, "
+                  f"KL: {kl_losses[-1]:.4f}")
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        if iteration_losses[-1] < best_loss:
+            best_loss = iteration_losses[-1]
             torch.save(model.state_dict(), model_path)
             
     print("✅ Training complete.")
 
-    np.savez(training_stats_path, iteration_losses=np.array(iteration_losses))
+    np.savez(
+        training_stats_path, 
+        iteration_losses=np.array(iteration_losses),
+        classification_losses=np.array(classification_losses),
+        embedding_losses=np.array(embedding_losses),
+        distance_losses=np.array(distance_losses),
+        purpose_losses=np.array(purpose_losses),
+        kl_losses=np.array(kl_losses)
+    )
     print(f"   💾 Training stats saved to '{training_stats_path}'")
 
 if __name__ == "__main__":
