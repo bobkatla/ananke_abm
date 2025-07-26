@@ -1,21 +1,58 @@
 """
-Loss function for the Generative Latent ODE model.
+Composite loss function for the Generative Latent ODE model.
 """
 import torch
 import torch.nn.functional as F
 
-def calculate_loss(pred_y_logits, trajectory_y, mu, log_var, kl_weight):
+def calculate_composite_loss(
+    pred_y_logits,
+    pred_y_embeds,
+    pred_purpose_logits,
+    target_y_ids,
+    target_purpose_ids,
+    model,
+    mu,
+    log_var,
+    distance_matrix,
+    config
+):
     """
-    Calculates the VAE loss, which is a combination of reconstruction loss
-    and KL divergence loss.
+    Calculates a weighted, composite loss with four main components:
+    1.  Location Classification Loss (Cross-Entropy on zone logits).
+    2.  Location Embedding Loss (MSE on predicted vs. target zone embeddings).
+    3.  Physical Distance Loss (Physical distance between predicted and target zones).
+    4.  Purpose Classification Loss (Cross-Entropy on purpose logits).
     """
-    # Reconstruction loss (how well the model reproduces the data)
-    recon_loss = F.cross_entropy(pred_y_logits, trajectory_y)
+    # Squeeze to remove the batch dimension of 1 for single-person training
+    pred_y_logits = pred_y_logits.squeeze(0)
+    pred_y_embeds = pred_y_embeds.squeeze(0)
+    pred_purpose_logits = pred_purpose_logits.squeeze(0)
+
+    # --- 1. Location Classification Loss (Cross-Entropy) ---
+    loss_classification = F.cross_entropy(pred_y_logits, target_y_ids)
+
+    # --- 2. Location Embedding Loss (MSE) ---
+    target_y_embeds = model.zone_embedder(target_y_ids)
+    loss_embedding = F.mse_loss(pred_y_embeds, target_y_embeds)
     
-    # KL divergence loss (a regularizer on the latent space)
+    # --- 3. Physical Distance Loss ---
+    pred_y_ids = torch.argmax(pred_y_logits, dim=1)
+    physical_distances = distance_matrix[pred_y_ids, target_y_ids]
+    loss_distance = physical_distances.mean()
+    
+    # --- 4. Purpose Classification Loss ---
+    loss_purpose = F.cross_entropy(pred_purpose_logits, target_purpose_ids)
+
+    # --- 5. KL Divergence ---
     kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
     
-    # Combine the two losses
-    loss = recon_loss + kl_weight * kl_loss
+    # --- 6. Combine all losses with their weights ---
+    total_loss = (
+        config.loss_weight_classification * loss_classification +
+        config.loss_weight_embedding * loss_embedding +
+        config.loss_weight_distance * loss_distance +
+        config.loss_weight_purpose * loss_purpose +
+        config.kl_weight * kl_loss
+    )
     
-    return loss, recon_loss, kl_loss 
+    return total_loss, loss_classification, loss_embedding, loss_distance, loss_purpose, kl_loss 

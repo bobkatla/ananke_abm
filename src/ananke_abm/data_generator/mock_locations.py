@@ -1,4 +1,28 @@
 import networkx as nx
+import torch
+import numpy as np
+
+def create_distance_matrix(zones_data):
+    """
+    Computes a pairwise distance matrix between all zones based on their coordinates.
+    
+    Args:
+        zones_data (dict): Dictionary with zone information, including coordinates.
+        
+    Returns:
+        torch.Tensor: A square matrix where element (i, j) is the Euclidean
+                      distance between zone i+1 and zone j+1.
+    """
+    num_zones = len(zones_data)
+    # Note: zone_ids are 1-based, so we create a 0-indexed array
+    coords = np.array([zones_data[i+1]['coordinates'] for i in range(num_zones)])
+    
+    # Calculate pairwise squared Euclidean distances
+    # (x1-x2)^2 + (y1-y2)^2
+    diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
+    dist_sq = np.sum(diff**2, axis=-1)
+    
+    return torch.from_numpy(np.sqrt(dist_sq)).float()
 
 def create_mock_zone_graph():
     """Create realistic zone graph with 8 zones"""
@@ -118,4 +142,6 @@ def create_mock_zone_graph():
     
     G.add_edges_from(edges)
     
-    return G, zones_data
+    distance_matrix = create_distance_matrix(zones_data)
+    
+    return G, zones_data, distance_matrix

@@ -4,8 +4,14 @@ Data processing for the Generative Latent ODE model.
 import torch
 import torch.nn.functional as F
 
-from ananke_abm.data_generator.mock_2p import create_two_person_training_data
-from .config import GenerativeODEConfig
+from ananke_abm.data_generator.mock_2p import (
+    create_training_data_single_person,
+    create_sarah_daily_pattern,
+    create_marcus_daily_pattern,
+    create_sarah, create_marcus
+)
+from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
+from ananke_abm.models.run.latent_ode.config import GenerativeODEConfig
 
 class DataProcessor:
     """Processes mock data, preparing it for the Generative ODE model."""
@@ -13,8 +19,12 @@ class DataProcessor:
     def __init__(self, device, config: GenerativeODEConfig):
         self.device = device
         self.config = config
-        self.sarah_data, self.marcus_data = create_two_person_training_data(repeat_pattern=False)
+        
+        # Load the static graph and distance matrix once
+        self.zone_graph, self.zones_raw, self.distance_matrix = create_mock_zone_graph()
+        self.distance_matrix = self.distance_matrix.to(device)
 
+        # --- Activity/Purpose Processing ---
         # Define the mapping from detailed activities to broader categories
         self.activity_to_group = {
             # Home activities
@@ -36,25 +46,50 @@ class DataProcessor:
         }
         self.purpose_map = {name: i for i, name in enumerate(self.config.purpose_groups)}
 
-    def get_data(self, person_id: int):
-        data = self.sarah_data if person_id == 1 else self.marcus_data
+    def get_data(self, person_id):
+        """
+        Processes mock data for a single person, resampling it to a uniform time grid.
+        Now includes a sequence of purpose IDs for loss calculation.
+        """
+        if person_id == 1:
+            schedule = create_sarah_daily_pattern()
+            person_obj = create_sarah()
+        else:
+            schedule = create_marcus_daily_pattern()
+            person_obj = create_marcus()
+            
+        data = create_training_data_single_person(
+            person=person_obj,
+            schedule=schedule,
+            zone_graph=self.zone_graph,
+            repeat_pattern=False
+        )
 
-        # --- Process Purpose Features ---
         activities = data["activities"]
+        
+        # --- Create the purpose summary vector for the encoder ---
         purpose_counts = torch.zeros(len(self.config.purpose_groups))
         for activity in activities:
             group = self.activity_to_group.get(activity, "Travel/Transit")
             group_idx = self.purpose_map[group]
             purpose_counts[group_idx] += 1
-        purpose_features = F.normalize(purpose_counts, p=1, dim=0)
+        purpose_summary_features = F.normalize(purpose_counts, p=1, dim=0)
+        
+        # --- Create the target sequence of purpose IDs ---
+        # The `activities` list directly corresponds to the `zone_observations`
+        target_purpose_ids = torch.tensor(
+            [self.purpose_map[self.activity_to_group.get(act, "Travel/Transit")] for act in activities],
+            dtype=torch.long
+        ).to(self.device)
 
         return {
             "person_features": data["person_attrs"].to(self.device),
-            "trajectory_y": data["zone_observations"].to(self.device),
             "times": data["times"].to(self.device),
-            "num_zones": data["num_zones"],
+            "trajectory_y": data["zone_observations"].to(self.device),
+            "purpose_summary_features": purpose_summary_features.to(self.device),
+            "target_purpose_ids": target_purpose_ids,
+            "num_zones": len(self.zones_raw),
+            "person_name": data['person_name'],
             "home_zone_id": data["home_zone_id"],
             "work_zone_id": data["work_zone_id"],
-            "person_name": data.get("person_name", f"Person {person_id}"),
-            "purpose_features": purpose_features.to(self.device),
         } 

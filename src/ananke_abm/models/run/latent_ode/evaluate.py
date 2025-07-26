@@ -25,9 +25,14 @@ def evaluate():
     ).to(device)
     
     # --- Load Trained Model ---
-    model_path = "latent_ode_best_model.pth"
+    model_path = "latent_ode_best_model_composite_loss_with_purpose.pth"
     print(f"📈 Evaluating best model from '{model_path}'...")
-    model.load_state_dict(torch.load(model_path))
+    try:
+        model.load_state_dict(torch.load(model_path, map_location=device))
+    except FileNotFoundError:
+        print(f"ERROR: Model file not found at {model_path}. Please run train.py first.")
+        return
+        
     model.eval()
 
     person_ids = [1, 2]  # Sarah and Marcus
@@ -41,27 +46,43 @@ def evaluate():
             person_features = data["person_features"].unsqueeze(0)
             home_zone_id = torch.tensor([data["home_zone_id"]], device=device)
             work_zone_id = torch.tensor([data["work_zone_id"]], device=device)
-            purpose_features = data["purpose_features"].unsqueeze(0)
+            purpose_summary_features = data["purpose_summary_features"].unsqueeze(0)
 
             plot_times = torch.linspace(0, 24, 100).to(device)
-            pred_y_logits, _, _ = model(person_features, home_zone_id, work_zone_id, purpose_features, plot_times)
-            pred_y_logits = pred_y_logits.squeeze(0)
-            pred_y = torch.argmax(pred_y_logits, dim=1)
+            
+            # Model returns purpose logits now as well
+            pred_y_logits, _, pred_purpose_logits, _, _ = model(
+                person_features, home_zone_id, work_zone_id, purpose_summary_features, plot_times
+            )
+            
+            pred_y = torch.argmax(pred_y_logits.squeeze(0), dim=1)
+            pred_purpose = torch.argmax(pred_purpose_logits.squeeze(0), dim=1)
 
         # --- Visualization ---
-        plt.figure(figsize=(15, 6))
-        plt.plot(data["times"].cpu().numpy(), data["trajectory_y"].cpu().numpy(), 'o', label='Ground Truth Snaps', markersize=8)
-        plt.plot(plot_times.cpu().numpy(), pred_y.cpu().numpy(), '-', label='Generated Trajectory')
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), sharex=True)
         
-        plt.xlabel("Time (hours)")
-        plt.ylabel("Zone ID")
-        plt.title(f"Generated vs. Ground Truth Trajectory for {person_name}")
-        plt.yticks(np.arange(data["num_zones"]))
-        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
-        plt.legend()
+        # Plot Location Trajectory
+        ax1.plot(data["times"].cpu().numpy(), data["trajectory_y"].cpu().numpy(), 'o', label='Ground Truth Location', markersize=8)
+        ax1.plot(plot_times.cpu().numpy(), pred_y.cpu().numpy(), '-', label='Generated Location')
+        ax1.set_ylabel("Zone ID")
+        ax1.set_title(f"Generated vs. Ground Truth for {person_name} (Composite Loss w/ Purpose)")
+        ax1.set_yticks(np.arange(data["num_zones"]))
+        ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
+        ax1.legend()
+        
+        # Plot Purpose Trajectory
+        ax2.plot(data["times"].cpu().numpy(), data["target_purpose_ids"].cpu().numpy(), 'o', label='Ground Truth Purpose', markersize=8)
+        ax2.plot(plot_times.cpu().numpy(), pred_purpose.cpu().numpy(), '-', label='Generated Purpose')
+        ax2.set_xlabel("Time (hours)")
+        ax2.set_ylabel("Purpose ID")
+        ax2.set_yticks(np.arange(len(config.purpose_groups)))
+        ax2.set_yticklabels(config.purpose_groups, rotation=30, ha='right')
+        ax2.grid(True, which='both', linestyle='--', linewidth=0.5)
+        ax2.legend()
+        
         plt.tight_layout()
         
-        save_path = f"generative_ode_trajectory_{person_name.replace(' ', '_')}.png"
+        save_path = f"generative_ode_trajectory_{person_name.replace(' ', '_')}_composite_loss_with_purpose.png"
         plt.savefig(save_path)
         print(f"   📄 Plot saved to '{save_path}'")
         plt.close()

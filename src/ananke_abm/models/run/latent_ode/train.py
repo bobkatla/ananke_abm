@@ -3,14 +3,15 @@ Main script for training the Generative Latent ODE model.
 """
 import torch
 import numpy as np
+import torch.nn.functional as F
 
 from ananke_abm.models.run.latent_ode.config import GenerativeODEConfig
 from ananke_abm.models.run.latent_ode.data import DataProcessor
 from ananke_abm.models.run.latent_ode.model import GenerativeODE
-from ananke_abm.models.run.latent_ode.loss import calculate_loss
+from ananke_abm.models.run.latent_ode.loss import calculate_composite_loss
 
 def train():
-    """Orchestrates the training of the Generative ODE model."""
+    """Orchestrates the training of the Generative ODE model, one person at a time."""
     config = GenerativeODEConfig()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     processor = DataProcessor(device, config)
@@ -26,61 +27,71 @@ def train():
     
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     
-    # --- Training Loop for Multiple People ---
-    print("🚀 Starting training for all people...")
+    # --- Training Loop (Sequential) ---
+    print("🚀 Starting training (sequential, embedding space)...")
     best_loss = float('inf')
-    model_path = "latent_ode_best_model.pth"
-    training_stats_path = "latent_ode_training_stats.npz"
-    person_ids = [1, 2]  # Sarah and Marcus
-    
-    # Lists to store training statistics
+    model_path = "latent_ode_best_model_composite_loss_with_purpose.pth"
+    training_stats_path = "latent_ode_training_stats_composite_loss_with_purpose.npz"
+    person_ids = [1, 2]
+
     iteration_losses = []
     
     for i in range(config.num_iterations):
-        
         total_iter_loss = 0
-        # In each iteration, train on each person's data
+        model.train()
+        
         for person_id in person_ids:
             optimizer.zero_grad()
             
             data = processor.get_data(person_id=person_id)
             
             person_features = data["person_features"].unsqueeze(0)
-            trajectory_y = data["trajectory_y"]
             times = data["times"]
             home_zone_id = torch.tensor([data["home_zone_id"]], device=device)
             work_zone_id = torch.tensor([data["work_zone_id"]], device=device)
-            purpose_features = data["purpose_features"].unsqueeze(0)
+            purpose_summary_features = data["purpose_summary_features"].unsqueeze(0)
 
-            pred_y_logits, mu, log_var = model(person_features, home_zone_id, work_zone_id, purpose_features, times)
-            pred_y_logits = pred_y_logits.squeeze(0)
-
-            loss, recon_loss, kl_loss = calculate_loss(
-                pred_y_logits, trajectory_y, mu, log_var, config.kl_weight
+            # Forward pass now returns purpose predictions as well
+            pred_y_logits, pred_y_embeds, pred_purpose_logits, mu, log_var = model(
+                person_features, home_zone_id, work_zone_id, purpose_summary_features, times
+            )
+            
+            # Calculate the new composite loss
+            loss, loss_c, loss_e, loss_d, loss_p, loss_kl = calculate_composite_loss(
+                pred_y_logits,
+                pred_y_embeds,
+                pred_purpose_logits,
+                data["trajectory_y"],
+                data["target_purpose_ids"],
+                model,
+                mu,
+                log_var,
+                processor.distance_matrix,
+                config
             )
 
             loss.backward()
             optimizer.step()
             total_iter_loss += loss.item()
-
+            
         avg_loss = total_iter_loss / len(person_ids)
         iteration_losses.append(avg_loss)
-        
-        if (i + 1) % 500 == 0:
-            print(f"   Iter {i+1}, Avg Loss: {avg_loss:.4f}")
 
-        # Save the best model based on average loss for the iteration
-        if total_iter_loss < best_loss:
-            best_loss = total_iter_loss
+        if (i + 1) % 500 == 0:
+            print(f"Iter {i+1}, Avg Loss: {avg_loss:.4f} | "
+                  f"Classif: {loss_c.item():.4f}, "
+                  f"Embed: {loss_e.item():.4f}, "
+                  f"Dist: {loss_d.item():.4f}, "
+                  f"Purp: {loss_p.item():.4f}, "
+                  f"KL: {loss_kl.item():.4f}")
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
             torch.save(model.state_dict(), model_path)
             
     print("✅ Training complete.")
 
-    # --- Save Training Statistics ---
-    np.savez(
-        training_stats_path,
-        iteration_losses=np.array(iteration_losses),
-    )
+    np.savez(training_stats_path, iteration_losses=np.array(iteration_losses))
     print(f"   💾 Training stats saved to '{training_stats_path}'")
 
 if __name__ == "__main__":

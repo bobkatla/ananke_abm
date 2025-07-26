@@ -10,11 +10,17 @@ class GenerativeODEConfig:
     
     # Training parameters
     learning_rate: float = 1e-3
-    num_iterations: int = 10000
-    kl_weight: float = 0.01  # Weight for the KL divergence term
+    kl_weight: float = 0.5
+    num_iterations: int = 6000
     
+    # --- New Composite Loss Weights ---
+    loss_weight_classification: float = 1.0
+    loss_weight_embedding: float = 0.5
+    loss_weight_distance: float = 2.0
+    loss_weight_purpose: float = 0.75
+
     # ODE solver settings
     ode_method: str = 'dopri5'
     
     # Purpose configuration
-    purpose_groups: list = ["Home", "Work/Education", "Subsistence", "Leisure & Recreation", "Social", "Travel/Transit"] 
+    purpose_groups: tuple = ("Home", "Work/Education", "Subsistence", "Leisure & Recreation", "Social", "Travel/Transit") 

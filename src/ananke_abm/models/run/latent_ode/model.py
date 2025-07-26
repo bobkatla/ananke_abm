@@ -46,7 +46,14 @@ class GenerativeODE(nn.Module):
             nn.Linear(config.encoder_hidden_dim, config.latent_dim * 2),
         )
         
-        self.decoder = nn.Linear(config.latent_dim, num_zones)
+        # --- Decoder with two output heads ---
+        # Head 1: Predicts zone logits for classification
+        self.decoder_logits = nn.Linear(config.latent_dim, num_zones)
+        # Head 2: Predicts zone embedding for MSE loss
+        self.decoder_embed = nn.Linear(config.latent_dim, config.zone_embed_dim)
+        # Head 3: Predicts purpose logits for classification
+        self.decoder_purpose = nn.Linear(config.latent_dim, len(config.purpose_groups))
+
         self.ode_func = ODEFunc(
             latent_dim=config.latent_dim, 
             hidden_dim=config.ode_hidden_dim,
@@ -71,6 +78,10 @@ class GenerativeODE(nn.Module):
         self.ode_func.home_zone_embedding = home_embed.expand(z0.shape[0], -1)
         
         pred_z = odeint(self.ode_func, z0, times, method=self.config.ode_method).permute(1, 0, 2)
-        pred_y_logits = self.decoder(pred_z)
         
-        return pred_y_logits, mu, log_var 
+        # Get predictions from both decoder heads
+        pred_y_logits = self.decoder_logits(pred_z)
+        pred_y_embeds = self.decoder_embed(pred_z)
+        pred_purpose_logits = self.decoder_purpose(pred_z)
+        
+        return pred_y_logits, pred_y_embeds, pred_purpose_logits, mu, log_var 
