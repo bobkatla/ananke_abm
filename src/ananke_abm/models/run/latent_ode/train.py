@@ -28,10 +28,10 @@ def train():
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     
     # --- Training Loop (Sequential) ---
-    print("🚀 Starting training (sequential, embedding space)...")
+    print("🚀 Starting training (sequential, composite loss)...")
     best_loss = float('inf')
-    model_path = "latent_ode_best_model_composite_loss_with_purpose.pth"
-    training_stats_path = "latent_ode_training_stats_composite_loss_with_purpose.npz"
+    model_path = "latent_ode_best_model_composite_loss_anchor.pth"
+    training_stats_path = "latent_ode_training_stats_composite_loss_anchor.npz"
     person_ids = [1, 2]
 
     iteration_losses = []

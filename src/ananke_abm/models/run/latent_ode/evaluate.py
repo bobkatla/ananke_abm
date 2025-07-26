@@ -25,7 +25,7 @@ def evaluate():
     ).to(device)
     
     # --- Load Trained Model ---
-    model_path = "latent_ode_best_model_composite_loss_with_purpose.pth"
+    model_path = "latent_ode_best_model_composite_loss_anchor.pth"
     print(f"📈 Evaluating best model from '{model_path}'...")
     try:
         model.load_state_dict(torch.load(model_path, map_location=device))
@@ -65,7 +65,7 @@ def evaluate():
         ax1.plot(data["times"].cpu().numpy(), data["trajectory_y"].cpu().numpy(), 'o', label='Ground Truth Location', markersize=8)
         ax1.plot(plot_times.cpu().numpy(), pred_y.cpu().numpy(), '-', label='Generated Location')
         ax1.set_ylabel("Zone ID")
-        ax1.set_title(f"Generated vs. Ground Truth for {person_name} (Composite Loss w/ Purpose)")
+        ax1.set_title(f"Generated vs. Ground Truth for {person_name} (Composite Loss w/ Anchor)")
         ax1.set_yticks(np.arange(data["num_zones"]))
         ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
         ax1.legend()
@@ -82,7 +82,7 @@ def evaluate():
         
         plt.tight_layout()
         
-        save_path = f"generative_ode_trajectory_{person_name.replace(' ', '_')}_composite_loss_with_purpose.png"
+        save_path = f"generative_ode_trajectory_{person_name.replace(' ', '_')}_composite_loss_anchor.png"
         plt.savefig(save_path)
         print(f"   📄 Plot saved to '{save_path}'")
         plt.close()
