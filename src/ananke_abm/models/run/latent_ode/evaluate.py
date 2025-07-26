@@ -9,6 +9,8 @@ from ananke_abm.models.run.latent_ode.config import GenerativeODEConfig
 from ananke_abm.models.run.latent_ode.data import DataProcessor
 from ananke_abm.models.run.latent_ode.model import GenerativeODE
 
+from pathlib import Path
+
 def evaluate():
     """Loads a trained model and generates evaluation plots."""
     config = GenerativeODEConfig()
@@ -25,7 +27,8 @@ def evaluate():
     ).to(device)
     
     # --- Load Trained Model ---
-    model_path = "latent_ode_best_model_composite_loss_anchor.pth"
+    folder_path = Path("saved_models/generative_ode")
+    model_path = folder_path / "latent_ode_best_model_composite_loss_anchor.pth"
     print(f"📈 Evaluating best model from '{model_path}'...")
     try:
         model.load_state_dict(torch.load(model_path, map_location=device))
@@ -82,7 +85,7 @@ def evaluate():
         
         plt.tight_layout()
         
-        save_path = f"generative_ode_trajectory_{person_name.replace(' ', '_')}_composite_loss_anchor.png"
+        save_path = folder_path / f"generative_ode_trajectory_{person_name.replace(' ', '_')}_composite_loss_anchor.png"
         plt.savefig(save_path)
         print(f"   📄 Plot saved to '{save_path}'")
         plt.close()

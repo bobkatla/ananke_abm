@@ -4,6 +4,7 @@ Main script for training the Generative Latent ODE model.
 import torch
 import numpy as np
 import torch.nn.functional as F
+from pathlib import Path
 
 from ananke_abm.models.run.latent_ode.config import GenerativeODEConfig
 from ananke_abm.models.run.latent_ode.data import DataProcessor
@@ -30,8 +31,9 @@ def train():
     # --- Training Loop (Sequential) ---
     print("🚀 Starting training (sequential, composite loss)...")
     best_loss = float('inf')
-    model_path = "latent_ode_best_model_composite_loss_anchor.pth"
-    training_stats_path = "latent_ode_training_stats_composite_loss_anchor.npz"
+    folder_path = Path("saved_models/generative_ode")
+    model_path = folder_path / "latent_ode_best_model_composite_loss_anchor.pth"
+    training_stats_path = folder_path / "latent_ode_training_stats_composite_loss_anchor.npz"
     person_ids = [1, 2]
 
     iteration_losses = []
