@@ -39,7 +39,8 @@ class GenerativeODE(nn.Module):
         self.config = config
         self.zone_embedder = nn.Embedding(num_zones, config.zone_embed_dim)
         
-        encoder_input_dim = person_feat_dim + config.zone_embed_dim * 2 + len(config.purpose_groups)
+        # The encoder now only takes person traits and home/work locations
+        encoder_input_dim = person_feat_dim + config.zone_embed_dim * 2
         self.encoder = nn.Sequential(
             nn.Linear(encoder_input_dim, config.encoder_hidden_dim),
             nn.ReLU(),
@@ -61,13 +62,15 @@ class GenerativeODE(nn.Module):
             home_embed_dim=config.zone_embed_dim
         )
 
-    def forward(self, person_features, home_zone_id, work_zone_id, purpose_features, times):
+    def forward(self, person_features, home_zone_id, work_zone_id, times):
+        
         home_embed = self.zone_embedder(home_zone_id)
         work_embed = self.zone_embedder(work_zone_id)
         
-        encoder_input = torch.cat([person_features, home_embed, work_embed, purpose_features], dim=-1)
-        
+        # Encoder input no longer includes purpose summary
+        encoder_input = torch.cat([person_features, home_embed, work_embed], dim=-1)
         latent_params = self.encoder(encoder_input)
+        
         mu, log_var = latent_params.chunk(2, dim=-1)
         
         std = torch.exp(0.5 * log_var)

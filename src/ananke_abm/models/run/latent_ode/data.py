@@ -83,14 +83,6 @@ class DataProcessor:
 
         activities = data["activities"]
         
-        # --- Create the purpose summary vector for the encoder ---
-        purpose_counts = torch.zeros(len(self.config.purpose_groups))
-        for activity in activities:
-            group = self.activity_to_group.get(activity, "Travel/Transit")
-            group_idx = self.purpose_map[group]
-            purpose_counts[group_idx] += 1
-        purpose_summary_features = F.normalize(purpose_counts, p=1, dim=0)
-        
         # --- Create the target sequence of purpose IDs ---
         # The `activities` list directly corresponds to the `zone_observations`
         target_purpose_ids = torch.tensor(
@@ -102,7 +94,6 @@ class DataProcessor:
             "person_features": data["person_attrs"].to(self.device),
             "times": data["times"].to(self.device),
             "trajectory_y": data["zone_observations"].to(self.device),
-            "purpose_summary_features": purpose_summary_features.to(self.device),
             "target_purpose_ids": target_purpose_ids,
             "num_zones": len(self.zones_raw),
             "person_name": data['person_name'],

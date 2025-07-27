@@ -55,7 +55,6 @@ def train():
                 batch['person_features'], 
                 batch['home_zone_id'], 
                 batch['work_zone_id'], 
-                batch['purpose_summary_features'], 
                 batch['t_unified']
             )
             

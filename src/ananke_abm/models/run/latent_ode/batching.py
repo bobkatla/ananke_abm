@@ -31,12 +31,15 @@ def unify_and_interpolate_batch(batch):
     config = batch[0]['config']
     if config.train_on_interpolated_points:
         loss_mask.fill_(1.0)
-
+    
+    # Get the ID for "Travel/Transit" for intelligent filling
+    # This assumes "Travel/Transit" is the last purpose group in the config.
+    travel_purpose_id = len(config.purpose_groups) - 1
+    
     # --- 3. Pre-compute anchor indices and fill dense tensors ---
     prev_real_indices = torch.zeros((batch_size, unified_len), dtype=torch.long, device=device)
     next_real_indices = torch.zeros((batch_size, unified_len), dtype=torch.long, device=device)
     
-    travel_purpose_id = len(batch[0]['purpose_summary_features']) - 1
     t_to_idx = {t.item(): i for i, t in enumerate(t_unified)}
 
     for i in range(batch_size):
@@ -96,7 +99,6 @@ def unify_and_interpolate_batch(batch):
         'person_features': torch.stack([s['person_features'] for s in batch]),
         'home_zone_id': torch.tensor([s['home_zone_id'] for s in batch], dtype=torch.long, device=device),
         'work_zone_id': torch.tensor([s['work_zone_id'] for s in batch], dtype=torch.long, device=device),
-        'purpose_summary_features': torch.stack([s['purpose_summary_features'] for s in batch]),
         'num_zones': batch[0]['num_zones'],
         'purpose_groups': config.purpose_groups,
         'person_names': [s['person_name'] for s in batch]

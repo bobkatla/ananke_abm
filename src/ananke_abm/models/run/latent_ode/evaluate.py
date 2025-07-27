@@ -83,12 +83,11 @@ def evaluate():
             person_features = data["person_features"].unsqueeze(0)
             home_zone_id = torch.tensor([data["home_zone_id"]], device=device)
             work_zone_id = torch.tensor([data["work_zone_id"]], device=device)
-            purpose_summary_features = data["purpose_summary_features"].unsqueeze(0)
 
             plot_times = torch.linspace(0, 24, 100).to(device)
             
             pred_y_logits, _, pred_purpose_logits, _, _ = model(
-                person_features, home_zone_id, work_zone_id, purpose_summary_features, plot_times
+                person_features, home_zone_id, work_zone_id, plot_times
             )
             
             pred_y = torch.argmax(pred_y_logits.squeeze(0), dim=1)
