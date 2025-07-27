@@ -95,6 +95,7 @@ class DataProcessor:
             "times": data["times"].to(self.device),
             "trajectory_y": data["zone_observations"].to(self.device),
             "target_purpose_ids": target_purpose_ids,
+            "start_purpose_id": target_purpose_ids[0].item(), # Known starting purpose
             "num_zones": len(self.zones_raw),
             "person_name": data['person_name'],
             "home_zone_id": data["home_zone_id"],

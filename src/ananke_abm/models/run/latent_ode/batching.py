@@ -99,6 +99,7 @@ def unify_and_interpolate_batch(batch):
         'person_features': torch.stack([s['person_features'] for s in batch]),
         'home_zone_id': torch.tensor([s['home_zone_id'] for s in batch], dtype=torch.long, device=device),
         'work_zone_id': torch.tensor([s['work_zone_id'] for s in batch], dtype=torch.long, device=device),
+        'start_purpose_id': torch.tensor([s['start_purpose_id'] for s in batch], dtype=torch.long, device=device),
         'num_zones': batch[0]['num_zones'],
         'purpose_groups': config.purpose_groups,
         'person_names': [s['person_name'] for s in batch]

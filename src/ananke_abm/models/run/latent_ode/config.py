@@ -1,12 +1,17 @@
 """
 Configuration for the Generative Latent ODE model.
 """
+from dataclasses import dataclass
 
+@dataclass
 class GenerativeODEConfig:
-    latent_dim: int = 32
-    zone_embed_dim: int = 16
-    encoder_hidden_dim: int = 128
+    """Configuration for the Generative ODE model."""
+    hidden_dim: int = 32
+    encoder_hidden_dim: int = 64
     ode_hidden_dim: int = 128
+    zone_embed_dim: int = 8
+    purpose_embed_dim: int = 4
+    num_residual_blocks: int = 2
     
     # Training parameters
     learning_rate: float = 1e-3

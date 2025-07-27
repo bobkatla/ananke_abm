@@ -54,7 +54,8 @@ def train():
             model_outputs = model(
                 batch['person_features'], 
                 batch['home_zone_id'], 
-                batch['work_zone_id'], 
+                batch['work_zone_id'],
+                batch['start_purpose_id'],
                 batch['t_unified']
             )
             
