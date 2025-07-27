@@ -4,56 +4,60 @@ Composite loss function for the Generative Latent ODE model.
 import torch
 import torch.nn.functional as F
 
-def calculate_composite_loss(
-    pred_y_logits,
-    pred_y_embeds,
-    pred_purpose_logits,
-    target_y_ids,
-    target_purpose_ids,
-    model,
-    mu,
-    log_var,
-    distance_matrix,
-    config
-):
+def calculate_composite_loss(batch, model_outputs, model, distance_matrix, config):
     """
-    Calculates a weighted, composite loss with four main components:
-    1.  Location Classification Loss (Cross-Entropy on zone logits).
-    2.  Location Embedding Loss (MSE on predicted vs. target zone embeddings).
-    3.  Physical Distance Loss (Physical distance between predicted and target zones).
-    4.  Purpose Classification Loss (Cross-Entropy on purpose logits).
+    Calculates a weighted, composite loss for a BATCH of data.
+    - Uses a loss_mask to only compute loss on real (non-interpolated) data points.
+    - Performs time-weighted interpolation for the location embedding loss.
     """
-    # Squeeze to remove the batch dimension of 1 for single-person training
-    pred_y_logits = pred_y_logits.squeeze(0)
-    pred_y_embeds = pred_y_embeds.squeeze(0)
-    pred_purpose_logits = pred_purpose_logits.squeeze(0)
-
-    # --- Create Anchor Mask for the first time step ---
-    # This gives extra weight to getting the first point right.
-    anchor_mask = torch.ones(target_y_ids.shape[0], device=target_y_ids.device)
-    anchor_mask[0] = config.initial_step_loss_weight
-
+    pred_y_logits, pred_y_embeds, pred_purpose_logits, mu, log_var = model_outputs
+    
+    t_unified = batch['t_unified']
+    target_y_loc_dense = batch['y_loc_dense']
+    target_y_purp_dense = batch['y_purp_dense']
+    loss_mask = batch['loss_mask']
+    
+    batch_size = pred_y_logits.shape[0]
+    
     # --- 1. Location Classification Loss (Cross-Entropy) ---
-    loss_classification = F.cross_entropy(pred_y_logits, target_y_ids, reduction='none')
-    loss_classification = (loss_classification * anchor_mask).mean()
+    pred_y_logits_flat = pred_y_logits.view(-1, pred_y_logits.shape[-1])
+    target_y_loc_flat = target_y_loc_dense.view(-1)
+    loss_classification_unmasked = F.cross_entropy(pred_y_logits_flat, target_y_loc_flat, ignore_index=-1, reduction='none')
+    loss_classification = (loss_classification_unmasked * loss_mask.view(-1)).sum() / loss_mask.sum()
 
-    # --- 2. Location Embedding Loss (MSE) ---
-    target_y_embeds = model.zone_embedder(target_y_ids)
-    # Calculate MSE per element, then apply mask
-    loss_embedding_per_element = F.mse_loss(pred_y_embeds, target_y_embeds, reduction='none').mean(dim=1)
-    loss_embedding = (loss_embedding_per_element * anchor_mask).mean()
+    # --- 2. Location Embedding Loss (Time-Weighted MSE) ---
+    # Get embeddings for previous and next real anchor points
+    prev_embeds = torch.gather(model.zone_embedder(target_y_loc_dense.clamp(min=0)), 1, batch['prev_real_indices'].unsqueeze(-1).expand(-1, -1, config.zone_embed_dim))
+    next_embeds = torch.gather(model.zone_embedder(target_y_loc_dense.clamp(min=0)), 1, batch['next_real_indices'].unsqueeze(-1).expand(-1, -1, config.zone_embed_dim))
+    
+    # Get timestamps for the anchor points
+    t_prev = t_unified[batch['prev_real_indices']]
+    t_next = t_unified[batch['next_real_indices']]
+    
+    # Calculate interpolation weights
+    w_next = (t_unified.unsqueeze(0) - t_prev) / (t_next - t_prev + 1e-8)
+    w_next = torch.clamp(w_next, 0, 1).unsqueeze(-1)
+    
+    # Create the dense target trajectory via interpolation
+    target_y_embeds = (1 - w_next) * prev_embeds + w_next * next_embeds
+    
+    # Calculate masked MSE loss against the interpolated target
+    loss_embedding_unmasked = F.mse_loss(pred_y_embeds, target_y_embeds, reduction='none').mean(dim=-1)
+    loss_embedding = (loss_embedding_unmasked * loss_mask).sum() / loss_mask.sum()
     
     # --- 3. Physical Distance Loss ---
-    pred_y_ids = torch.argmax(pred_y_logits, dim=1)
-    physical_distances = distance_matrix[pred_y_ids, target_y_ids]
-    loss_distance = (physical_distances * anchor_mask).mean()
+    pred_y_ids = torch.argmax(pred_y_logits, dim=2)
+    physical_distances = distance_matrix[pred_y_ids, target_y_loc_dense.clamp(min=0)]
+    loss_distance = (physical_distances * loss_mask).sum() / loss_mask.sum()
     
     # --- 4. Purpose Classification Loss ---
-    loss_purpose = F.cross_entropy(pred_purpose_logits, target_purpose_ids, reduction='none')
-    loss_purpose = (loss_purpose * anchor_mask).mean()
+    pred_purpose_logits_flat = pred_purpose_logits.view(-1, pred_purpose_logits.shape[-1])
+    target_y_purp_flat = target_y_purp_dense.view(-1)
+    loss_purpose_unmasked = F.cross_entropy(pred_purpose_logits_flat, target_y_purp_flat, ignore_index=-1, reduction='none')
+    loss_purpose = (loss_purpose_unmasked * loss_mask.view(-1)).sum() / loss_mask.sum()
 
-    # --- 5. KL Divergence (not affected by the anchor) ---
-    kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+    # --- 5. KL Divergence (Averaged over batch) ---
+    kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp()) / batch_size
     
     # --- 6. Combine all losses with their weights ---
     total_loss = (

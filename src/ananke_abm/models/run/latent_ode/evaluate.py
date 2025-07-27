@@ -4,12 +4,11 @@ Script for evaluating a trained Generative Latent ODE model.
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 from ananke_abm.models.run.latent_ode.config import GenerativeODEConfig
 from ananke_abm.models.run.latent_ode.data import DataProcessor
 from ananke_abm.models.run.latent_ode.model import GenerativeODE
-
-from pathlib import Path
 
 def evaluate():
     """Loads a trained model and generates evaluation plots."""
@@ -27,8 +26,8 @@ def evaluate():
     ).to(device)
     
     # --- Load Trained Model ---
-    folder_path = Path("saved_models/generative_ode")
-    model_path = folder_path / "latent_ode_best_model_composite_loss_anchor.pth"
+    folder_path = Path("saved_models/generative_ode_batched")
+    model_path = folder_path / "latent_ode_best_model_batched.pth"
     print(f"📈 Evaluating best model from '{model_path}'...")
     try:
         model.load_state_dict(torch.load(model_path, map_location=device))
@@ -37,34 +36,33 @@ def evaluate():
         return
         
     # --- Plot Training Loss ---
-    training_stats_path = folder_path / "latent_ode_training_stats_composite_loss_anchor.npz"
+    training_stats_path = folder_path / "latent_ode_training_stats_batched.npz"
     try:
         stats = np.load(training_stats_path)
         
         plt.figure(figsize=(14, 8))
         
-        # Plot each loss component if it exists in the stats file
         loss_keys = {
-            'iteration_losses': 'Total Loss',
-            'classification_losses': 'Location Classification',
-            'embedding_losses': 'Location Embedding',
-            'distance_losses': 'Physical Distance',
-            'purpose_losses': 'Purpose Classification',
-            'kl_losses': 'KL Divergence'
+            'total_loss': 'Total Loss',
+            'classification_loss': 'Location Classification',
+            'embedding_loss': 'Location Embedding',
+            'distance_loss': 'Physical Distance',
+            'purpose_loss': 'Purpose Classification',
+            'kl_loss': 'KL Divergence'
         }
         
         for key, label in loss_keys.items():
             if key in stats:
                 plt.plot(stats[key], label=label, alpha=0.9)
 
-        plt.title("All Training Loss Components (Unweighted)")
+        plt.title("All Training Loss Components (Unweighted, Batched Training)")
         plt.xlabel("Iteration")
-        plt.ylabel("Average Loss")
+        plt.ylabel("Average Loss (Log Scale)")
         plt.grid(True, which='both', linestyle='--', linewidth=0.5)
         plt.legend()
         plt.yscale('log')
         plt.tight_layout()
-        loss_plot_path = folder_path / "all_training_loss_curves_anchor.png"
+        loss_plot_path = folder_path / "all_training_loss_curves_batched.png"
         plt.savefig(loss_plot_path)
         print(f"   📉 All training loss plots saved to '{loss_plot_path}'")
         plt.close()
@@ -74,7 +72,7 @@ def evaluate():
 
     model.eval()
 
-    person_ids = [1, 2]  # Sarah and Marcus
+    person_ids = [1, 2]
 
     for person_id in person_ids:
         with torch.no_grad():
@@ -89,7 +87,6 @@ def evaluate():
 
             plot_times = torch.linspace(0, 24, 100).to(device)
             
-            # Model returns purpose logits now as well
             pred_y_logits, _, pred_purpose_logits, _, _ = model(
                 person_features, home_zone_id, work_zone_id, purpose_summary_features, plot_times
             )
@@ -100,16 +97,14 @@ def evaluate():
         # --- Visualization ---
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), sharex=True)
         
-        # Plot Location Trajectory
         ax1.plot(data["times"].cpu().numpy(), data["trajectory_y"].cpu().numpy(), 'o', label='Ground Truth Location', markersize=8)
         ax1.plot(plot_times.cpu().numpy(), pred_y.cpu().numpy(), '-', label='Generated Location')
         ax1.set_ylabel("Zone ID")
-        ax1.set_title(f"Generated vs. Ground Truth for {person_name} (Composite Loss w/ Anchor)")
+        ax1.set_title(f"Generated vs. Ground Truth for {person_name} (Batched Training)")
         ax1.set_yticks(np.arange(data["num_zones"]))
         ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
         ax1.legend()
         
-        # Plot Purpose Trajectory
         ax2.plot(data["times"].cpu().numpy(), data["target_purpose_ids"].cpu().numpy(), 'o', label='Ground Truth Purpose', markersize=8)
         ax2.plot(plot_times.cpu().numpy(), pred_purpose.cpu().numpy(), '-', label='Generated Purpose')
         ax2.set_xlabel("Time (hours)")
@@ -121,7 +116,7 @@ def evaluate():
         
         plt.tight_layout()
         
-        save_path = folder_path / f"generative_ode_trajectory_{person_name.replace(' ', '_')}_composite_loss_anchor.png"
+        save_path = folder_path / f"generative_ode_trajectory_{person_name.replace(' ', '_')}_batched.png"
         plt.savefig(save_path)
         print(f"   📄 Plot saved to '{save_path}'")
         plt.close()

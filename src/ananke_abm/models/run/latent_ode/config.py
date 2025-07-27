@@ -22,6 +22,9 @@ class GenerativeODEConfig:
     # --- New Anchor Loss Weight ---
     initial_step_loss_weight: float = 10.0
 
+    # --- New Training Mode ---
+    train_on_interpolated_points: bool = False
+
     # ODE solver settings
     ode_method: str = 'dopri5'
     

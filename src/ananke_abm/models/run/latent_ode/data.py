@@ -12,6 +12,22 @@ from ananke_abm.data_generator.mock_2p import (
 )
 from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
 from ananke_abm.models.run.latent_ode.config import GenerativeODEConfig
+from torch.utils.data import Dataset
+
+class LatentODEDataset(Dataset):
+    """PyTorch Dataset to provide individual samples for the DataLoader."""
+    def __init__(self, person_ids, processor):
+        self.person_ids = person_ids
+        self.processor = processor
+
+    def __len__(self):
+        return len(self.person_ids)
+
+    def __getitem__(self, idx):
+        person_id = self.person_ids[idx]
+        data = self.processor.get_data(person_id)
+        data['config'] = self.processor.config
+        return data
 
 class DataProcessor:
     """Processes mock data, preparing it for the Generative ODE model."""

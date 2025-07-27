@@ -3,124 +3,92 @@ Main script for training the Generative Latent ODE model.
 """
 import torch
 import numpy as np
-import torch.nn.functional as F
 from pathlib import Path
+from torch.utils.data import DataLoader
 
 from ananke_abm.models.run.latent_ode.config import GenerativeODEConfig
-from ananke_abm.models.run.latent_ode.data import DataProcessor
+from ananke_abm.models.run.latent_ode.data import DataProcessor, LatentODEDataset
 from ananke_abm.models.run.latent_ode.model import GenerativeODE
 from ananke_abm.models.run.latent_ode.loss import calculate_composite_loss
+from ananke_abm.models.run.latent_ode.batching import unify_and_interpolate_batch
 
 def train():
-    """Orchestrates the training of the Generative ODE model, one person at a time."""
+    """Orchestrates the training of the Generative ODE model using batched data."""
     config = GenerativeODEConfig()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     processor = DataProcessor(device, config)
     print(f"🔬 Using device: {device}")
 
+    # --- Setup DataLoader ---
+    person_ids = [1, 2] # Sarah and Marcus
+    dataset = LatentODEDataset(person_ids, processor)
+    data_loader = DataLoader(dataset, batch_size=len(person_ids), shuffle=True, collate_fn=unify_and_interpolate_batch)
+
     # --- Model Initialization ---
-    init_data = processor.get_data(person_id=1)
+    # Use a sample from the dataset to get dimensions for model init
+    init_batch = next(iter(data_loader))
     model = GenerativeODE(
-        person_feat_dim=init_data["person_features"].shape[-1],
-        num_zones=init_data["num_zones"],
+        person_feat_dim=init_batch["person_features"].shape[-1],
+        num_zones=init_batch["num_zones"],
         config=config,
     ).to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     
-    # --- Training Loop (Sequential) ---
-    print("🚀 Starting training (sequential, composite loss)...")
-    best_loss = float('inf')
-    folder_path = Path("saved_models/generative_ode")
-    model_path = folder_path / "latent_ode_best_model_composite_loss_anchor.pth"
-    training_stats_path = folder_path / "latent_ode_training_stats_composite_loss_anchor.npz"
-    person_ids = [1, 2]
+    # --- Training Loop (Batched) ---
+    print("🚀 Starting training with batched data...")
+    folder_path = Path("saved_models/generative_ode_batched")
+    folder_path.mkdir(exist_ok=True, parents=True)
+    model_path = folder_path / "latent_ode_best_model_batched.pth"
+    training_stats_path = folder_path / "latent_ode_training_stats_batched.npz"
 
-    # Lists to store all loss components
-    iteration_losses = []
-    classification_losses = []
-    embedding_losses = []
-    distance_losses = []
-    purpose_losses = []
-    kl_losses = []
-    
+    best_loss = float('inf')
+    all_losses = []
+
     for i in range(config.num_iterations):
-        # Accumulators for the current iteration's losses
-        total_iter_loss, total_c, total_e, total_d, total_p, total_kl = 0, 0, 0, 0, 0, 0
-        model.train()
-        
-        for person_id in person_ids:
+        for batch in data_loader:
+            model.train()
             optimizer.zero_grad()
             
-            data = processor.get_data(person_id=person_id)
-            
-            person_features = data["person_features"].unsqueeze(0)
-            times = data["times"]
-            home_zone_id = torch.tensor([data["home_zone_id"]], device=device)
-            work_zone_id = torch.tensor([data["work_zone_id"]], device=device)
-            purpose_summary_features = data["purpose_summary_features"].unsqueeze(0)
-
-            # Forward pass now returns purpose predictions as well
-            pred_y_logits, pred_y_embeds, pred_purpose_logits, mu, log_var = model(
-                person_features, home_zone_id, work_zone_id, purpose_summary_features, times
+            # Forward pass using the unified timeline
+            model_outputs = model(
+                batch['person_features'], 
+                batch['home_zone_id'], 
+                batch['work_zone_id'], 
+                batch['purpose_summary_features'], 
+                batch['t_unified']
             )
             
-            # Calculate the new composite loss
+            # Calculate the composite loss on the batch
             loss, loss_c, loss_e, loss_d, loss_p, loss_kl = calculate_composite_loss(
-                pred_y_logits,
-                pred_y_embeds,
-                pred_purpose_logits,
-                data["trajectory_y"],
-                data["target_purpose_ids"],
-                model,
-                mu,
-                log_var,
-                processor.distance_matrix,
-                config
+                batch, model_outputs, model, processor.distance_matrix, config
             )
 
             loss.backward()
             optimizer.step()
-            
-            # Accumulate all loss components
-            total_iter_loss += loss.item()
-            total_c += loss_c.item()
-            total_e += loss_e.item()
-            total_d += loss_d.item()
-            total_p += loss_p.item()
-            total_kl += loss_kl.item()
-            
-        # Calculate and record the average of each loss component for the iteration
-        num_people = len(person_ids)
-        iteration_losses.append(total_iter_loss / num_people)
-        classification_losses.append(total_c / num_people)
-        embedding_losses.append(total_e / num_people)
-        distance_losses.append(total_d / num_people)
-        purpose_losses.append(total_p / num_people)
-        kl_losses.append(total_kl / num_people)
+        
+        # Store all loss components for the iteration
+        all_losses.append([loss.item(), loss_c.item(), loss_e.item(), loss_d.item(), loss_p.item(), loss_kl.item()])
 
         if (i + 1) % 500 == 0:
-            print(f"Iter {i+1}, Avg Loss: {iteration_losses[-1]:.4f} | "
-                  f"Classif: {classification_losses[-1]:.4f}, "
-                  f"Embed: {embedding_losses[-1]:.4f}, "
-                  f"Dist: {distance_losses[-1]:.4f}, "
-                  f"Purp: {purpose_losses[-1]:.4f}, "
-                  f"KL: {kl_losses[-1]:.4f}")
+            print(f"Iter {i+1}, Loss: {loss.item():.4f} | Classif: {loss_c.item():.4f}, Embed: {loss_e.item():.4f}, Dist: {loss_d.item():.4f}, Purp: {loss_p.item():.4f}, KL: {loss_kl.item():.4f}")
 
-        if iteration_losses[-1] < best_loss:
-            best_loss = iteration_losses[-1]
+        if loss.item() < best_loss:
+            best_loss = loss.item()
             torch.save(model.state_dict(), model_path)
             
     print("✅ Training complete.")
 
+    # --- Save Training Statistics ---
+    all_losses = np.array(all_losses)
     np.savez(
         training_stats_path, 
-        iteration_losses=np.array(iteration_losses),
-        classification_losses=np.array(classification_losses),
-        embedding_losses=np.array(embedding_losses),
-        distance_losses=np.array(distance_losses),
-        purpose_losses=np.array(purpose_losses),
-        kl_losses=np.array(kl_losses)
+        total_loss=all_losses[:, 0],
+        classification_loss=all_losses[:, 1],
+        embedding_loss=all_losses[:, 2],
+        distance_loss=all_losses[:, 3],
+        purpose_loss=all_losses[:, 4],
+        kl_loss=all_losses[:, 5]
     )
     print(f"   💾 Training stats saved to '{training_stats_path}'")
 
