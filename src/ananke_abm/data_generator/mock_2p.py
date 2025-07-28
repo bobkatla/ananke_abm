@@ -94,7 +94,7 @@ def create_sarah_daily_pattern():
     
     # Time format: hours from midnight (0-24)
     daily_schedule = [
-        {"time": 0.0, "zone": 1, "activity": "sleep", "description": "At home sleeping"},
+        {"time": 0.0, "zone": 1, "activity": "sleep", "description": "At home sleeping", "importance": "anchor"},
         {"time": 7.0, "zone": 1, "activity": "morning_routine", "description": "Wake up, breakfast"},
         {"time": 7.5, "zone": 1, "activity": "prepare_commute", "description": "Getting ready to leave"},
         
@@ -128,7 +128,7 @@ def create_sarah_daily_pattern():
         {"time": 19.5, "zone": 1, "activity": "dinner", "description": "Dinner at home"},
         {"time": 21.0, "zone": 1, "activity": "evening", "description": "Relaxing at home"},
         {"time": 23.0, "zone": 1, "activity": "sleep", "description": "Going to sleep"},
-        {"time": 24.0, "zone": 1, "activity": "sleep", "description": "End of day at home"},
+        {"time": 24.0, "zone": 1, "activity": "sleep", "description": "End of day at home", "importance": "anchor"},
     ]
     
     return daily_schedule
@@ -140,7 +140,7 @@ def create_marcus_daily_pattern():
     # Lives in downtown, works at mall, much more flexible and social
     
     daily_schedule = [
-        {"time": 0.0, "zone": 3, "activity": "sleep", "description": "At home sleeping"},
+        {"time": 0.0, "zone": 3, "activity": "sleep", "description": "At home sleeping", "importance": "anchor"},
         {"time": 9.0, "zone": 3, "activity": "wake_up", "description": "Late wake up"},
         {"time": 9.5, "zone": 3, "activity": "morning_routine", "description": "Breakfast, getting ready"},
         
@@ -180,7 +180,7 @@ def create_marcus_daily_pattern():
         
         # Late night at home
         {"time": 22.5, "zone": 3, "activity": "evening", "description": "Relaxing at home"},
-        {"time": 24.0, "zone": 3, "activity": "sleep", "description": "Going to sleep (late)"},
+        {"time": 24.0, "zone": 3, "activity": "sleep", "description": "Going to sleep (late)", "importance": "anchor"},
     ]
     
     return daily_schedule
@@ -202,6 +202,7 @@ def create_training_data_single_person(
     all_times = []
     all_zones = []
     all_activities = []
+    all_importances = []
     
     if repeat_pattern:
         # Repeat the schedule for num_days to create a long sequence
@@ -220,12 +221,14 @@ def create_training_data_single_person(
                 all_times.append(new_time)
                 all_zones.append(event["zone"] - 1) # 0-indexed
                 all_activities.append(event["activity"])
+                all_importances.append(event.get("importance", "normal"))
     else:
         # Original behavior: process the schedule once without repetition or noise
         for event in schedule:
             all_times.append(event["time"])
             all_zones.append(event["zone"] - 1)
             all_activities.append(event["activity"])
+            all_importances.append(event.get("importance", "normal"))
 
     # Extract zone observations and times
     times = torch.tensor(all_times, dtype=torch.float32)
@@ -269,6 +272,7 @@ def create_training_data_single_person(
         "times": times,
         "zone_observations": zones,  # Now 0-indexed
         "activities": all_activities,
+        "importances": all_importances,
         "zone_features": zone_features,
         "edge_index": edge_index,
         "num_zones": len(zone_graph.nodes()),

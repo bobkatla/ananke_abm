@@ -16,7 +16,7 @@ class GenerativeODEConfig:
     # Training parameters
     learning_rate: float = 1e-3
     kl_weight: float = 0.5
-    num_iterations: int = 8000
+    num_iterations: int = 6000
     
     # --- New Composite Loss Weights ---
     loss_weight_classification: float = 1.0
@@ -25,7 +25,7 @@ class GenerativeODEConfig:
     loss_weight_purpose: float = 0.75
 
     # --- New Anchor Loss Weight ---
-    initial_step_loss_weight: float = 10.0
+    anchor_loss_weight: float = 10.0
 
     # --- New Training Mode ---
     train_on_interpolated_points: bool = False

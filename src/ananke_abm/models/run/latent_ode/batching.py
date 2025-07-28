@@ -17,6 +17,7 @@ def unify_and_interpolate_batch(batch):
     all_times = [s['times'] for s in batch]
     all_y_loc = [s['trajectory_y'] for s in batch]
     all_y_purp = [s['target_purpose_ids'] for s in batch]
+    all_imp_weights = [s['importance_weights'] for s in batch]
     
     t_unified = torch.cat(all_times).unique(sorted=True)
     unified_len = len(t_unified)
@@ -27,6 +28,7 @@ def unify_and_interpolate_batch(batch):
     y_loc_dense = torch.full((batch_size, unified_len), -1, dtype=torch.long, device=device)
     y_purp_dense = torch.full((batch_size, unified_len), -1, dtype=torch.long, device=device)
     loss_mask = torch.zeros((batch_size, unified_len), device=device)
+    importance_mask = torch.ones((batch_size, unified_len), device=device)
     
     config = batch[0]['config']
     if config.train_on_interpolated_points:
@@ -48,6 +50,7 @@ def unify_and_interpolate_batch(batch):
         
         y_loc_dense[i, indices_in_unified] = all_y_loc[i]
         y_purp_dense[i, indices_in_unified] = all_y_purp[i]
+        importance_mask[i, indices_in_unified] = all_imp_weights[i]
         
         # Only overwrite with 1s if we are not training on all points
         if not config.train_on_interpolated_points:
@@ -88,12 +91,15 @@ def unify_and_interpolate_batch(batch):
                     fill_value = travel_purpose_id if start_purp != end_purp else start_purp.item()
                     y_purp_dense[i, start_idx + 1 : end_idx] = fill_value
 
+    # Combine the masks here to create the final weight mask
+    final_loss_mask = loss_mask * importance_mask
+
     # --- 4. Stack all other features ---
     return {
         't_unified': t_unified,
         'y_loc_dense': y_loc_dense,
         'y_purp_dense': y_purp_dense,
-        'loss_mask': loss_mask,
+        'loss_mask': final_loss_mask,
         'prev_real_indices': prev_real_indices,
         'next_real_indices': next_real_indices,
         'person_features': torch.stack([s['person_features'] for s in batch]),

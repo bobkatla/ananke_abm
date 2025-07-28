@@ -90,11 +90,18 @@ class DataProcessor:
             dtype=torch.long
         ).to(self.device)
 
+        # Convert importance strings to numerical weights
+        importance_weights = [
+            self.config.anchor_loss_weight if imp == 'anchor' else 1.0
+            for imp in data['importances']
+        ]
+
         return {
             "person_features": data["person_attrs"].to(self.device),
             "times": data["times"].to(self.device),
             "trajectory_y": data["zone_observations"].to(self.device),
             "target_purpose_ids": target_purpose_ids,
+            "importance_weights": torch.tensor(importance_weights, dtype=torch.float32, device=self.device),
             "start_purpose_id": target_purpose_ids[0].item(), # Known starting purpose
             "num_zones": len(self.zones_raw),
             "person_name": data['person_name'],
