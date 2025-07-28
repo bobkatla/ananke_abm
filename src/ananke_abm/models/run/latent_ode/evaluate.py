@@ -21,7 +21,7 @@ def evaluate():
     init_data = processor.get_data(person_id=1)
     model = GenerativeODE(
         person_feat_dim=init_data["person_features"].shape[-1],
-        num_zones=init_data["num_zones"],
+        num_zone_features=init_data["all_zone_features"].shape[-1],
         config=config,
     ).to(device)
     
@@ -81,14 +81,17 @@ def evaluate():
             print(f"   -> Generating trajectory for {person_name}...")
 
             person_features = data["person_features"].unsqueeze(0)
-            home_zone_id = torch.tensor([data["home_zone_id"]], device=device)
-            work_zone_id = torch.tensor([data["work_zone_id"]], device=device)
+            home_zone_features = data["home_zone_features"].unsqueeze(0)
+            work_zone_features = data["work_zone_features"].unsqueeze(0)
             start_purpose_id = torch.tensor([data["start_purpose_id"]], device=device)
+            all_zone_features = data["all_zone_features"] # No batch dim needed
+            adjacency_matrix = data["adjacency_matrix"] # No batch dim needed
 
             plot_times = torch.linspace(0, 24, 100).to(device)
             
             pred_y_logits, _, pred_purpose_logits, _, _ = model(
-                person_features, home_zone_id, work_zone_id, start_purpose_id, plot_times
+                person_features, home_zone_features, work_zone_features, 
+                start_purpose_id, plot_times, all_zone_features, adjacency_matrix
             )
             
             pred_y = torch.argmax(pred_y_logits.squeeze(0), dim=1)

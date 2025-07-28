@@ -29,7 +29,7 @@ def train():
     init_batch = next(iter(data_loader))
     model = GenerativeODE(
         person_feat_dim=init_batch["person_features"].shape[-1],
-        num_zones=init_batch["num_zones"],
+        num_zone_features=init_batch["all_zone_features"].shape[-1],
         config=config,
     ).to(device)
     
@@ -53,10 +53,12 @@ def train():
             # Forward pass using the unified timeline
             model_outputs = model(
                 batch['person_features'], 
-                batch['home_zone_id'], 
-                batch['work_zone_id'],
+                batch['home_zone_features'], 
+                batch['work_zone_features'],
                 batch['start_purpose_id'],
-                batch['t_unified']
+                batch['t_unified'],
+                batch['all_zone_features'],
+                batch['adjacency_matrix']
             )
             
             # Calculate the composite loss on the batch

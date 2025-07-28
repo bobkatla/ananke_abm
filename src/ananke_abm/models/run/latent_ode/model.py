@@ -48,14 +48,15 @@ class GenerativeODE(nn.Module):
     A conditional, autoregressive Latent ODE model.
     The ODE state itself contains the evolving location and purpose embeddings.
     """
-    def __init__(self, person_feat_dim, num_zones, config):
+    def __init__(self, person_feat_dim, num_zone_features, config):
         super().__init__()
         self.config = config
         
-        self.zone_embedder = nn.Embedding(num_zones, config.zone_embed_dim)
+        self.zone_feature_encoder = nn.Linear(num_zone_features, config.zone_embed_dim)
         self.purpose_embedder = nn.Embedding(len(config.purpose_groups), config.purpose_embed_dim)
 
         # The encoder produces the initial hidden state h(0)
+        # It now takes zone *characteristics* instead of embeddings
         encoder_input_dim = person_feat_dim + config.zone_embed_dim * 2
         self.encoder = nn.Sequential(
             nn.Linear(encoder_input_dim, config.encoder_hidden_dim),
@@ -73,13 +74,19 @@ class GenerativeODE(nn.Module):
         )
         
         # Decoders now operate on the hidden state component h(t)
-        self.decoder_loc_logits = nn.Linear(config.hidden_dim, num_zones)
+        # The location decoder predicts a "target embedding", not logits over all zones
+        self.decoder_loc = nn.Linear(config.hidden_dim, config.zone_embed_dim)
         self.decoder_purp_logits = nn.Linear(config.hidden_dim, len(config.purpose_groups))
 
-    def forward(self, person_features, home_zone_id, work_zone_id, start_purp_id, times):
+    def forward(self, person_features, home_zone_features, work_zone_features, 
+                start_purp_id, times, all_zone_features, adjacency_matrix):
         
-        home_embed = self.zone_embedder(home_zone_id)
-        work_embed = self.zone_embedder(work_zone_id)
+        # Create candidate embeddings for all zones in the geography
+        candidate_zone_embeds = self.zone_feature_encoder(all_zone_features)
+
+        # Encode home and work zones from their features
+        home_embed = self.zone_feature_encoder(home_zone_features)
+        work_embed = self.zone_feature_encoder(work_zone_features)
         
         # 1. ENCODER: Get initial hidden state h(0) from static features
         encoder_input = torch.cat([person_features, home_embed, work_embed], dim=-1)
@@ -88,7 +95,7 @@ class GenerativeODE(nn.Module):
         h0 = mu + torch.exp(0.5 * log_var) * torch.randn_like(mu)
 
         # 2. INITIAL STATE: Construct the full initial state s(0)
-        s0_loc = self.zone_embedder(home_zone_id) # Start at home location
+        s0_loc = home_embed # Start at home location
         s0_purp = self.purpose_embedder(start_purp_id) # Start with home purpose
         s0 = torch.cat([h0, s0_loc, s0_purp], dim=-1)
 
@@ -97,11 +104,16 @@ class GenerativeODE(nn.Module):
         
         # 4. DECODE: Split the solved state back into its components
         pred_h = pred_s[..., :self.config.hidden_dim]
-        pred_y_loc_embed = pred_s[..., self.config.hidden_dim : self.config.hidden_dim + self.config.zone_embed_dim]
+        pred_y_loc_embed_path = pred_s[..., self.config.hidden_dim : self.config.hidden_dim + self.config.zone_embed_dim]
         # pred_y_purp_embed is also available if we want to use it in the future
         
-        # Use the hidden state trajectory to predict logits
-        pred_y_loc_logits = self.decoder_loc_logits(pred_h)
+        # 5. PREDICT: Use the hidden state to predict a "target embedding"
+        target_loc_embeds = self.decoder_loc(pred_h)
+
+        # 6. MATCH: Find the most similar candidate zone for each predicted target embedding
+        # This computes the dot product similarity and gives us our new logits
+        pred_y_loc_logits = torch.einsum('bsd,zd->bsz', target_loc_embeds, candidate_zone_embeds)
+
         pred_y_purp_logits = self.decoder_purp_logits(pred_h)
         
-        return pred_y_loc_logits, pred_y_loc_embed, pred_y_purp_logits, mu, log_var 
+        return pred_y_loc_logits, pred_y_loc_embed_path, pred_y_purp_logits, mu, log_var 

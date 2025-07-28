@@ -26,9 +26,16 @@ def calculate_composite_loss(batch, model_outputs, model, distance_matrix, confi
     loss_classification = (loss_classification_unmasked * loss_mask.view(-1)).sum() / loss_mask.sum()
 
     # --- 2. Location Embedding Loss (Time-Weighted MSE) ---
-    # Get embeddings for previous and next real anchor points
-    prev_embeds = torch.gather(model.zone_embedder(target_y_loc_dense.clamp(min=0)), 1, batch['prev_real_indices'].unsqueeze(-1).expand(-1, -1, config.zone_embed_dim))
-    next_embeds = torch.gather(model.zone_embedder(target_y_loc_dense.clamp(min=0)), 1, batch['next_real_indices'].unsqueeze(-1).expand(-1, -1, config.zone_embed_dim))
+    # To get the target embeddings, we now use the zone_feature_encoder
+    all_candidate_embeds = model.zone_feature_encoder(batch['all_zone_features'])
+
+    # Get the ground-truth zone IDs for the previous and next real anchor points
+    prev_real_zone_ids = torch.gather(target_y_loc_dense, 1, batch['prev_real_indices'])
+    next_real_zone_ids = torch.gather(target_y_loc_dense, 1, batch['next_real_indices'])
+
+    # Get embeddings for the anchor points by indexing into the full candidate matrix
+    prev_embeds = all_candidate_embeds[prev_real_zone_ids.clamp(min=0)]
+    next_embeds = all_candidate_embeds[next_real_zone_ids.clamp(min=0)]
     
     # Get timestamps for the anchor points
     t_prev = t_unified[batch['prev_real_indices']]

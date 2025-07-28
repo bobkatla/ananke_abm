@@ -3,6 +3,7 @@ Data processing for the Generative Latent ODE model.
 """
 import torch
 import torch.nn.functional as F
+import networkx as nx
 
 from ananke_abm.data_generator.mock_2p import (
     create_training_data_single_person,
@@ -95,6 +96,15 @@ class DataProcessor:
             self.config.anchor_loss_weight if imp == 'anchor' else 1.0
             for imp in data['importances']
         ]
+        
+        zone_features = data['zone_features'].to(self.device)
+        home_zone_features = zone_features[data['home_zone_id']]
+        work_zone_features = zone_features[data['work_zone_id']]
+        
+        # Create adjacency matrix for the physics mask
+        adjacency_matrix = torch.tensor(nx.to_numpy_array(self.zone_graph), dtype=torch.float32, device=self.device)
+        # Add self-loops to allow staying in the same zone
+        adjacency_matrix.fill_diagonal_(1)
 
         return {
             "person_features": data["person_attrs"].to(self.device),
@@ -105,6 +115,8 @@ class DataProcessor:
             "start_purpose_id": target_purpose_ids[0].item(), # Known starting purpose
             "num_zones": len(self.zones_raw),
             "person_name": data['person_name'],
-            "home_zone_id": data["home_zone_id"],
-            "work_zone_id": data["work_zone_id"],
+            "home_zone_features": home_zone_features,
+            "work_zone_features": work_zone_features,
+            "all_zone_features": zone_features,
+            "adjacency_matrix": adjacency_matrix
         } 

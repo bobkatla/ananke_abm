@@ -103,9 +103,11 @@ def unify_and_interpolate_batch(batch):
         'prev_real_indices': prev_real_indices,
         'next_real_indices': next_real_indices,
         'person_features': torch.stack([s['person_features'] for s in batch]),
-        'home_zone_id': torch.tensor([s['home_zone_id'] for s in batch], dtype=torch.long, device=device),
-        'work_zone_id': torch.tensor([s['work_zone_id'] for s in batch], dtype=torch.long, device=device),
+        'home_zone_features': torch.stack([s['home_zone_features'] for s in batch]),
+        'work_zone_features': torch.stack([s['work_zone_features'] for s in batch]),
         'start_purpose_id': torch.tensor([s['start_purpose_id'] for s in batch], dtype=torch.long, device=device),
+        'all_zone_features': batch[0]['all_zone_features'], # Same for all samples
+        'adjacency_matrix': batch[0]['adjacency_matrix'], # Same for all samples
         'num_zones': batch[0]['num_zones'],
         'purpose_groups': config.purpose_groups,
         'person_names': [s['person_name'] for s in batch]
