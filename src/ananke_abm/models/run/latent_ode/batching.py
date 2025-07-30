@@ -17,6 +17,7 @@ def unify_and_interpolate_batch(batch):
     all_times = [s['times'] for s in batch]
     all_y_loc = [s['trajectory_y'] for s in batch]
     all_y_purp = [s['target_purpose_ids'] for s in batch]
+    all_y_mode = [s['target_mode_ids'] for s in batch]  # NEW: Mode sequences
     all_imp_weights = [s['importance_weights'] for s in batch]
     
     t_unified = torch.cat(all_times).unique(sorted=True)
@@ -27,6 +28,7 @@ def unify_and_interpolate_batch(batch):
     # --- 2. Create dense tensors and masks ---
     y_loc_dense = torch.full((batch_size, unified_len), -1, dtype=torch.long, device=device)
     y_purp_dense = torch.full((batch_size, unified_len), -1, dtype=torch.long, device=device)
+    y_mode_dense = torch.full((batch_size, unified_len), -1, dtype=torch.long, device=device)  # NEW: Mode tensor
     loss_mask = torch.zeros((batch_size, unified_len), device=device)
     importance_mask = torch.ones((batch_size, unified_len), device=device)
     
@@ -37,6 +39,9 @@ def unify_and_interpolate_batch(batch):
     # Get the ID for "Travel/Transit" for intelligent filling
     # This assumes "Travel/Transit" is the last purpose group in the config.
     travel_purpose_id = len(config.purpose_groups) - 1
+    
+    # Get the ID for "Stay" mode for intelligent filling (mode 0)
+    stay_mode_id = 0
     
     # --- 3. Pre-compute anchor indices and fill dense tensors ---
     prev_real_indices = torch.zeros((batch_size, unified_len), dtype=torch.long, device=device)
@@ -50,6 +55,7 @@ def unify_and_interpolate_batch(batch):
         
         y_loc_dense[i, indices_in_unified] = all_y_loc[i]
         y_purp_dense[i, indices_in_unified] = all_y_purp[i]
+        y_mode_dense[i, indices_in_unified] = all_y_mode[i]  # NEW: Fill mode tensor
         importance_mask[i, indices_in_unified] = all_imp_weights[i]
         
         # Only overwrite with 1s if we are not training on all points
@@ -90,6 +96,18 @@ def unify_and_interpolate_batch(batch):
                     start_purp, end_purp = y_purp_dense[i, start_idx], y_purp_dense[i, end_idx]
                     fill_value = travel_purpose_id if start_purp != end_purp else start_purp.item()
                     y_purp_dense[i, start_idx + 1 : end_idx] = fill_value
+                    
+                    # Intelligently fill mode IDs
+                    start_mode, end_mode = y_mode_dense[i, start_idx], y_mode_dense[i, end_idx]
+                    # If we're transitioning between different purposes, use the transition mode
+                    # Otherwise, stay in the current mode
+                    if start_purp != end_purp:
+                        # Find the actual mode used in this transition from the real data points
+                        transition_mode = start_mode.item() if start_mode != stay_mode_id else end_mode.item()
+                        y_mode_dense[i, start_idx + 1 : end_idx] = transition_mode
+                    else:
+                        # Same purpose, so stay in same mode
+                        y_mode_dense[i, start_idx + 1 : end_idx] = start_mode.item()
 
     # Combine the masks here to create the final weight mask
     final_loss_mask = loss_mask * importance_mask
@@ -99,6 +117,7 @@ def unify_and_interpolate_batch(batch):
         't_unified': t_unified,
         'y_loc_dense': y_loc_dense,
         'y_purp_dense': y_purp_dense,
+        'y_mode_dense': y_mode_dense,  # NEW: Mode sequence
         'loss_mask': final_loss_mask,
         'prev_real_indices': prev_real_indices,
         'next_real_indices': next_real_indices,

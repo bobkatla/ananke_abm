@@ -62,11 +62,20 @@ class DataProcessor:
             "break": "Travel/Transit",
         }
         self.purpose_map = {name: i for i, name in enumerate(self.config.purpose_groups)}
+        
+        # --- Mode Processing ---
+        # Define the mapping from travel modes to mode IDs
+        self.mode_map = {
+            "Stay": 0,
+            "Walk": 1, 
+            "Car": 2,
+            "Public_Transit": 3
+        }
 
     def get_data(self, person_id):
         """
         Processes mock data for a single person, resampling it to a uniform time grid.
-        Now includes a sequence of purpose IDs for loss calculation.
+        Now includes sequences of purpose IDs and mode IDs for loss calculation.
         """
         if person_id == 1:
             schedule = create_sarah_daily_pattern()
@@ -83,11 +92,19 @@ class DataProcessor:
         )
 
         activities = data["activities"]
+        travel_modes = data["travel_modes"]
         
         # --- Create the target sequence of purpose IDs ---
         # The `activities` list directly corresponds to the `zone_observations`
         target_purpose_ids = torch.tensor(
             [self.purpose_map[self.activity_to_group.get(act, "Travel/Transit")] for act in activities],
+            dtype=torch.long
+        ).to(self.device)
+        
+        # --- Create the target sequence of mode IDs ---
+        # The `travel_modes` list directly corresponds to the `zone_observations`
+        target_mode_ids = torch.tensor(
+            [self.mode_map.get(mode, 0) for mode in travel_modes],
             dtype=torch.long
         ).to(self.device)
 
@@ -111,6 +128,7 @@ class DataProcessor:
             "times": data["times"].to(self.device),
             "trajectory_y": data["zone_observations"].to(self.device),
             "target_purpose_ids": target_purpose_ids,
+            "target_mode_ids": target_mode_ids,  # NEW: Mode sequence
             "importance_weights": torch.tensor(importance_weights, dtype=torch.float32, device=self.device),
             "start_purpose_id": target_purpose_ids[0].item(), # Known starting purpose
             "num_zones": len(self.zones_raw),

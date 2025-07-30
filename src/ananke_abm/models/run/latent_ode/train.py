@@ -18,6 +18,8 @@ def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     processor = DataProcessor(device, config)
     print(f"🔬 Using device: {device}")
+    print(f"🧠 Attention enabled: {config.enable_attention} (strength: {config.attention_strength})")
+    print(f"🚀 Mode choice enabled: {config.num_modes} modes with weight {config.loss_weight_mode}")
 
     # --- Setup DataLoader ---
     person_ids = [1, 2] # Sarah and Marcus
@@ -36,8 +38,8 @@ def train():
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     
     # --- Training Loop (Batched) ---
-    print("🚀 Starting training with batched data...")
-    folder_path = Path("saved_models/generative_ode_batched")
+    print("🚀 Starting training with batched data and mode choice...")
+    folder_path = Path("saved_models/mode_generative_ode_batched")
     folder_path.mkdir(exist_ok=True, parents=True)
     model_path = folder_path / "latent_ode_best_model_batched.pth"
     training_stats_path = folder_path / "latent_ode_training_stats_batched.npz"
@@ -61,8 +63,8 @@ def train():
                 batch['adjacency_matrix']
             )
             
-            # Calculate the composite loss on the batch
-            loss, loss_c, loss_e, loss_d, loss_p, loss_kl = calculate_composite_loss(
+            # Calculate the composite loss on the batch (now includes mode loss)
+            loss, loss_c, loss_e, loss_d, loss_p, loss_mode, loss_kl = calculate_composite_loss(
                 batch, model_outputs, model, processor.distance_matrix, config
             )
 
@@ -70,10 +72,10 @@ def train():
             optimizer.step()
         
         # Store all loss components for the iteration
-        all_losses.append([loss.item(), loss_c.item(), loss_e.item(), loss_d.item(), loss_p.item(), loss_kl.item()])
+        all_losses.append([loss.item(), loss_c.item(), loss_e.item(), loss_d.item(), loss_p.item(), loss_mode.item(), loss_kl.item()])
 
         if (i + 1) % 500 == 0:
-            print(f"Iter {i+1}, Loss: {loss.item():.4f} | Classif: {loss_c.item():.4f}, Embed: {loss_e.item():.4f}, Dist: {loss_d.item():.4f}, Purp: {loss_p.item():.4f}, KL: {loss_kl.item():.4f}")
+            print(f"Iter {i+1}, Loss: {loss.item():.4f} | Classif: {loss_c.item():.4f}, Embed: {loss_e.item():.4f}, Dist: {loss_d.item():.4f}, Purp: {loss_p.item():.4f}, Mode: {loss_mode.item():.4f}, KL: {loss_kl.item():.4f}")
 
         if loss.item() < best_loss:
             best_loss = loss.item()
@@ -90,7 +92,8 @@ def train():
         embedding_loss=all_losses[:, 2],
         distance_loss=all_losses[:, 3],
         purpose_loss=all_losses[:, 4],
-        kl_loss=all_losses[:, 5]
+        mode_loss=all_losses[:, 5],  # NEW: Mode loss statistics
+        kl_loss=all_losses[:, 6]
     )
     print(f"   💾 Training stats saved to '{training_stats_path}'")
 

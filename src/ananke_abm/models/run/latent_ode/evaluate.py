@@ -26,7 +26,7 @@ def evaluate():
     ).to(device)
     
     # --- Load Trained Model ---
-    folder_path = Path("saved_models/generative_ode_batched")
+    folder_path = Path("saved_models/mode_generative_ode_batched")
     model_path = folder_path / "latent_ode_best_model_batched.pth"
     print(f"📈 Evaluating best model from '{model_path}'...")
     try:
@@ -40,7 +40,7 @@ def evaluate():
     try:
         stats = np.load(training_stats_path)
         
-        plt.figure(figsize=(14, 8))
+        plt.figure(figsize=(16, 8))
         
         loss_keys = {
             'total_loss': 'Total Loss',
@@ -48,6 +48,7 @@ def evaluate():
             'embedding_loss': 'Location Embedding',
             'distance_loss': 'Physical Distance',
             'purpose_loss': 'Purpose Classification',
+            'mode_loss': 'Mode Classification',  # NEW: Mode loss component
             'kl_loss': 'KL Divergence'
         }
         
@@ -55,7 +56,7 @@ def evaluate():
             if key in stats:
                 plt.plot(stats[key], label=label, alpha=0.9)
 
-        plt.title("All Training Loss Components (Unweighted, Batched Training)")
+        plt.title("All Training Loss Components (Unweighted, Batched Training with Mode Choice)")
         plt.xlabel("Iteration")
         plt.ylabel("Average Loss (Log Scale)")
         plt.grid(True, which='both', linestyle='--', linewidth=0.5)
@@ -73,6 +74,7 @@ def evaluate():
     model.eval()
 
     person_ids = [1, 2]
+    mode_names = ["Stay", "Walk", "Car", "Public_Transit"]
 
     for person_id in person_ids:
         with torch.no_grad():
@@ -89,42 +91,70 @@ def evaluate():
 
             plot_times = torch.linspace(0, 24, 100).to(device)
             
-            pred_y_logits, _, pred_purpose_logits, _, _ = model(
+            # Enhanced model outputs with mode prediction
+            pred_y_logits, _, pred_purpose_logits, pred_mode_logits, _, _ = model(
                 person_features, home_zone_features, work_zone_features, 
                 start_purpose_id, plot_times, all_zone_features, adjacency_matrix
             )
             
             pred_y = torch.argmax(pred_y_logits.squeeze(0), dim=1)
             pred_purpose = torch.argmax(pred_purpose_logits.squeeze(0), dim=1)
+            pred_mode = torch.argmax(pred_mode_logits.squeeze(0), dim=1)  # NEW: Mode predictions
 
-        # --- Visualization ---
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), sharex=True)
+        # --- Enhanced Visualization with 3 subplots ---
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 14), sharex=True)
         
+        # Location plot
         ax1.plot(data["times"].cpu().numpy(), data["trajectory_y"].cpu().numpy(), 'o', label='Ground Truth Location', markersize=8)
         ax1.plot(plot_times.cpu().numpy(), pred_y.cpu().numpy(), '-', label='Generated Location')
         ax1.set_ylabel("Zone ID")
-        ax1.set_title(f"Generated vs. Ground Truth for {person_name} (Batched Training)")
+        ax1.set_title(f"Generated vs. Ground Truth for {person_name} (Batched Training with Mode Choice)")
         ax1.set_yticks(np.arange(data["num_zones"]))
         ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
         ax1.legend()
         
+        # Purpose plot
         ax2.plot(data["times"].cpu().numpy(), data["target_purpose_ids"].cpu().numpy(), 'o', label='Ground Truth Purpose', markersize=8)
         ax2.plot(plot_times.cpu().numpy(), pred_purpose.cpu().numpy(), '-', label='Generated Purpose')
-        ax2.set_xlabel("Time (hours)")
         ax2.set_ylabel("Purpose ID")
         ax2.set_yticks(np.arange(len(config.purpose_groups)))
         ax2.set_yticklabels(config.purpose_groups, rotation=30, ha='right')
         ax2.grid(True, which='both', linestyle='--', linewidth=0.5)
         ax2.legend()
         
+        # NEW: Mode plot
+        ax3.plot(data["times"].cpu().numpy(), data["target_mode_ids"].cpu().numpy(), 'o', label='Ground Truth Mode', markersize=8)
+        ax3.plot(plot_times.cpu().numpy(), pred_mode.cpu().numpy(), '-', label='Generated Mode')
+        ax3.set_xlabel("Time (hours)")
+        ax3.set_ylabel("Mode ID")
+        ax3.set_yticks(np.arange(len(mode_names)))
+        ax3.set_yticklabels(mode_names, rotation=0, ha='right')
+        ax3.grid(True, which='both', linestyle='--', linewidth=0.5)
+        ax3.legend()
+        
         plt.tight_layout()
         
-        save_path = folder_path / f"generative_ode_trajectory_{person_name.replace(' ', '_')}_batched.png"
+        save_path = folder_path / f"generative_ode_trajectory_{person_name.replace(' ', '_')}_batched_with_modes.png"
         plt.savefig(save_path)
         print(f"   📄 Plot saved to '{save_path}'")
         plt.close()
+        
+        # --- Mode Choice Analysis ---
+        ground_truth_modes = data["target_mode_ids"].cpu().numpy()
+        print(f"   📊 Mode choice analysis for {person_name}:")
+        print(f"      Ground truth mode distribution: {dict(zip(mode_names, [np.sum(ground_truth_modes == i) for i in range(len(mode_names))]))}")
+        
+        # Calculate mode transition statistics
+        mode_transitions = []
+        for i in range(len(ground_truth_modes) - 1):
+            if ground_truth_modes[i] != ground_truth_modes[i+1]:
+                mode_transitions.append((mode_names[ground_truth_modes[i]], mode_names[ground_truth_modes[i+1]]))
+        
+        print(f"      Mode transitions: {len(mode_transitions)} transitions")
+        if mode_transitions:
+            print(f"      Most common transitions: {mode_transitions[:5]}")
 
-    print("✅ Evaluation complete.")
+    print("✅ Evaluation complete with mode choice analysis.")
 
 if __name__ == "__main__":
     evaluate() 

@@ -9,12 +9,14 @@ def calculate_composite_loss(batch, model_outputs, model, distance_matrix, confi
     Calculates a weighted, composite loss for a BATCH of data.
     - Uses a loss_mask to only compute loss on real (non-interpolated) data points.
     - Performs time-weighted interpolation for the location embedding loss.
+    - Now includes mode classification loss.
     """
-    pred_y_logits, pred_y_embeds, pred_purpose_logits, mu, log_var = model_outputs
+    pred_y_logits, pred_y_embeds, pred_purpose_logits, pred_mode_logits, mu, log_var = model_outputs
     
     t_unified = batch['t_unified']
     target_y_loc_dense = batch['y_loc_dense']
     target_y_purp_dense = batch['y_purp_dense']
+    target_y_mode_dense = batch['y_mode_dense']  # NEW: Mode targets
     loss_mask = batch['loss_mask']
     
     batch_size = pred_y_logits.shape[0]
@@ -63,16 +65,23 @@ def calculate_composite_loss(batch, model_outputs, model, distance_matrix, confi
     loss_purpose_unmasked = F.cross_entropy(pred_purpose_logits_flat, target_y_purp_flat, ignore_index=-1, reduction='none')
     loss_purpose = (loss_purpose_unmasked * loss_mask.view(-1)).sum() / loss_mask.sum()
 
-    # --- 5. KL Divergence (Averaged over batch) ---
+    # --- 5. NEW: Mode Classification Loss ---
+    pred_mode_logits_flat = pred_mode_logits.view(-1, pred_mode_logits.shape[-1])
+    target_y_mode_flat = target_y_mode_dense.view(-1)
+    loss_mode_unmasked = F.cross_entropy(pred_mode_logits_flat, target_y_mode_flat, ignore_index=-1, reduction='none')
+    loss_mode = (loss_mode_unmasked * loss_mask.view(-1)).sum() / loss_mask.sum()
+
+    # --- 6. KL Divergence (Averaged over batch) ---
     kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp()) / batch_size
     
-    # --- 6. Combine all losses with their weights ---
+    # --- 7. Combine all losses with their weights ---
     total_loss = (
         config.loss_weight_classification * loss_classification +
         config.loss_weight_embedding * loss_embedding +
         config.loss_weight_distance * loss_distance +
         config.loss_weight_purpose * loss_purpose +
+        config.loss_weight_mode * loss_mode +  # NEW: Mode loss component
         config.kl_weight * kl_loss
     )
     
-    return total_loss, loss_classification, loss_embedding, loss_distance, loss_purpose, kl_loss 
+    return total_loss, loss_classification, loss_embedding, loss_distance, loss_purpose, loss_mode, kl_loss 

@@ -23,6 +23,7 @@ class GenerativeODEConfig:
     loss_weight_embedding: float = 0.5
     loss_weight_distance: float = 2.0
     loss_weight_purpose: float = 0.75
+    loss_weight_mode: float = 1.0  # NEW: Weight for mode classification loss
 
     # --- New Anchor Loss Weight ---
     anchor_loss_weight: float = 10.0
@@ -32,6 +33,14 @@ class GenerativeODEConfig:
 
     # ODE solver settings
     ode_method: str = 'dopri5'
+    
+    # Attention mechanisms
+    enable_attention: bool = True
+    attention_strength: float = 0.1
+    
+    # Mode choice parameters
+    num_modes: int = 4  # Stay, Walk, Car, Public_Transit
+    mode_embed_dim: int = 4  # For backward compatibility if needed
     
     # Purpose configuration
     purpose_groups: tuple = ("Home", "Work/Education", "Subsistence", "Leisure & Recreation", "Social", "Travel/Transit") 
