@@ -20,6 +20,7 @@ def train():
     print(f"🔬 Using device: {device}", flush=True)
     print(f"🧠 Attention enabled: {config.enable_attention} (strength: {config.attention_strength})", flush=True)
     print(f"🚀 Mode choice enabled: {config.num_modes} modes with weight {config.loss_weight_mode}", flush=True)
+    print(f"🎲 SDE enabled: {config.enable_sde} (noise strength: {config.sde_noise_strength})", flush=True)
 
     # --- Setup DataLoader ---
     person_ids = [1, 2] # Sarah and Marcus

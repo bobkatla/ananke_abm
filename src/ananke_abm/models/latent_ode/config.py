@@ -33,6 +33,10 @@ class GenerativeODEConfig:
 
     # ODE solver settings
     ode_method: str = 'dopri5'
+
+    # SDE settings for stochastic dynamics
+    enable_sde: bool = True  # Enable stochastic differential equations
+    sde_noise_strength: float = 0.05  # Base noise level for transitions
     
     # Attention mechanisms
     enable_attention: bool = True

@@ -4,8 +4,7 @@ Model architecture for the Generative Latent ODE.
 import torch
 import torch.nn as nn
 from torchdiffeq import odeint
-
-from ..config import GenerativeODEConfig
+from torchsde import sdeint
 
 class ResidualBlock(nn.Module):
     """A residual block with two linear layers and a skip connection."""
@@ -59,12 +58,13 @@ class MovementAwareDecoder(nn.Module):
 
 class ODEFunc(nn.Module):
     """
-    The dynamics function for the conditional ODE. It computes the derivative of
+    The dynamics function for the conditional ODE/SDE. It computes the derivative of
     the combined state [h, y_loc, movement_intention] at time t.
-    Enhanced with optional attention mechanisms.
+    Enhanced with optional attention mechanisms and stochastic dynamics.
     """
     def __init__(self, state_dim, hidden_dim, num_residual_blocks, 
-                 zone_embed_dim=8, enable_attention=True, attention_strength=0.1):
+                 zone_embed_dim=8, enable_attention=True, attention_strength=0.1,
+                 enable_sde=False, sde_noise_strength=0.05):
         super().__init__()
         # Calculate the actual hidden dim from state structure: state = [h, loc_embed, movement_intention]
         self.actual_hidden_dim = state_dim - zone_embed_dim - 1  # -1 for movement_intention
@@ -72,6 +72,14 @@ class ODEFunc(nn.Module):
         self.zone_embed_dim = zone_embed_dim
         self.enable_attention = enable_attention
         self.attention_strength = attention_strength
+        
+        # SDE parameters
+        self.enable_sde = enable_sde
+        self.sde_noise_strength = sde_noise_strength
+        
+        # Required for torchsde compatibility
+        self.noise_type = "diagonal"  # Independent noise for each state dimension
+        self.sde_type = "ito"  # Ito SDE interpretation
         
         # Core network (adapted for new state structure)
         self.net = nn.Sequential(
@@ -173,6 +181,73 @@ class ODEFunc(nn.Module):
         # Return the delta
         return enhanced_hidden.squeeze(1) - hidden_state
 
+    def f(self, t, state):
+        """Drift function for SDE (same as ODE dynamics)."""
+        return self.forward(t, state)
+    
+    def g(self, t, state):
+        """Diffusion function for SDE (noise term)."""
+        if not self.enable_sde:
+            return torch.zeros_like(state)
+        
+        # For diagonal noise_type, return diffusion tensor of same shape as state
+        diffusion = self._compute_diffusion(t, state)
+        return diffusion
+
+    def f_and_g(self, t, state):
+        """SDE drift and diffusion function for torchsde compatibility."""
+        drift = self.forward(t, state)
+        
+        if not self.enable_sde:
+            # For ODE mode, return zero diffusion
+            diffusion = torch.zeros_like(state)
+        else:
+            diffusion = self._compute_diffusion(t, state)
+            
+        return drift, diffusion
+    
+    def _compute_diffusion(self, t, state):
+        """Compute adaptive noise for SDE transitions."""
+        batch_size = state.shape[0]
+        
+        # Split state into components
+        h = state[:, :self.actual_hidden_dim]
+        loc_embed = state[:, self.actual_hidden_dim:self.actual_hidden_dim + self.zone_embed_dim]
+        movement_intention = state[:, -1:]
+        
+        # Adaptive noise based on movement intention
+        # High noise near decision boundary (movement_intention ≈ 0.5)
+        decision_boundary_distance = torch.abs(movement_intention - 0.5)
+        decision_noise_scale = torch.exp(-4 * decision_boundary_distance)  # Peak at 0.5, decay rapidly
+        
+        # Time-dependent noise (higher during typical transition periods)
+        if t.dim() == 0:
+            t = t.expand(1)
+        # Model higher uncertainty during rush hours (8am, 12pm, 6pm)
+        rush_hour_noise = (
+            torch.exp(-((t - 8) ** 2) / 2) +   # Morning rush
+            torch.exp(-((t - 12) ** 2) / 2) +  # Lunch time  
+            torch.exp(-((t - 18) ** 2) / 2)    # Evening rush
+        ) * 0.3
+        time_noise_scale = (0.5 + rush_hour_noise).expand(batch_size, 1)
+        
+        # Combine noise scales
+        total_noise_scale = self.sde_noise_strength * decision_noise_scale * time_noise_scale
+        
+        # Apply different noise levels to different state components
+        noise_h = total_noise_scale * 0.8  # Moderate noise for hidden state
+        noise_loc = total_noise_scale * 1.2  # Higher noise for location (enables jumps)
+        noise_movement = total_noise_scale * 2.0  # Highest noise for movement intention (sharp switches)
+        
+        # Construct diffusion tensor
+        diffusion = torch.cat([
+            noise_h.expand(-1, self.actual_hidden_dim),
+            noise_loc.expand(-1, self.zone_embed_dim),
+            noise_movement
+        ], dim=-1)
+        
+        return diffusion
+
 class GenerativeODE(nn.Module):
     """
     A conditional, autoregressive Latent ODE model with movement-aware mode choice.
@@ -203,7 +278,9 @@ class GenerativeODE(nn.Module):
             num_residual_blocks=config.num_residual_blocks,
             zone_embed_dim=config.zone_embed_dim,
             enable_attention=config.enable_attention,
-            attention_strength=config.attention_strength
+            attention_strength=config.attention_strength,
+            enable_sde=config.enable_sde,
+            sde_noise_strength=config.sde_noise_strength
         )
         
         # Decoders now operate on the hidden state component h(t)
@@ -238,7 +315,13 @@ class GenerativeODE(nn.Module):
         s0 = torch.cat([h0, s0_loc, s0_movement], dim=-1)
 
         # 3. SOLVER: Evolve the state s(t) over the entire time series
-        pred_s = odeint(self.ode_func, s0, times, method=self.config.ode_method).permute(1, 0, 2)
+        if self.config.enable_sde:
+            # Use SDE solver for stochastic dynamics  
+            pred_s = sdeint(self.ode_func, s0, times, method='euler', dt=0.01)
+            pred_s = pred_s.permute(1, 0, 2)
+        else:
+            # Use deterministic ODE solver
+            pred_s = odeint(self.ode_func, s0, times, method=self.config.ode_method).permute(1, 0, 2)
         
         # 4. DECODE: Split the solved state back into its components
         pred_h = pred_s[..., :self.config.hidden_dim]
