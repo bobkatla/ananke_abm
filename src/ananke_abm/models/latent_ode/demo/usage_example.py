@@ -4,7 +4,7 @@ Shows how to use the Generative Latent ODE model for practical mobility predicti
 """
 
 # Example 1: Quick prediction for a few people
-from ananke_abm.models.run.latent_ode.inference import quick_inference
+from ananke_abm.models.latent_ode.inference.inference import quick_inference
 
 def example_quick_prediction():
     """Simple example of predicting trajectories for multiple people."""
@@ -25,7 +25,7 @@ def example_quick_prediction():
     return predictions
 
 # Example 2: Large-scale city simulation
-from ananke_abm.models.run.latent_ode.inference import BatchedInferenceEngine
+from ananke_abm.models.latent_ode.inference.inference import BatchedInferenceEngine
 
 def example_city_simulation():
     """Example of simulating mobility for a large population."""

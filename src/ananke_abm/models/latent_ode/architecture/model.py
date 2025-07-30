@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torchdiffeq import odeint
 
-from .config import GenerativeODEConfig
+from ..config import GenerativeODEConfig
 
 class ResidualBlock(nn.Module):
     """A residual block with two linear layers and a skip connection."""

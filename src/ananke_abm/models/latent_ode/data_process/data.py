@@ -12,7 +12,7 @@ from ananke_abm.data_generator.mock_2p import (
     create_sarah, create_marcus
 )
 from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
-from ananke_abm.models.run.latent_ode.config import GenerativeODEConfig
+from ananke_abm.models.latent_ode.config import GenerativeODEConfig
 from torch.utils.data import Dataset
 
 class LatentODEDataset(Dataset):

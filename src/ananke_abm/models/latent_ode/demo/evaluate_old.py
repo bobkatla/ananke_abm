@@ -9,8 +9,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from ananke_abm.models.run.latent_ode.config import GenerativeODEConfig
-from ananke_abm.models.run.latent_ode.data import DataProcessor
+from ananke_abm.models.latent_ode.config import GenerativeODEConfig
+from ananke_abm.models.latent_ode.data_process.data import DataProcessor
 
 # Define the OLD model architecture components
 class ResidualBlock(nn.Module):

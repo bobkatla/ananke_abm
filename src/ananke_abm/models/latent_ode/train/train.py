@@ -6,11 +6,11 @@ import numpy as np
 from pathlib import Path
 from torch.utils.data import DataLoader
 
-from ananke_abm.models.run.latent_ode.config import GenerativeODEConfig
-from ananke_abm.models.run.latent_ode.data import DataProcessor, LatentODEDataset
-from ananke_abm.models.run.latent_ode.model import GenerativeODE
-from ananke_abm.models.run.latent_ode.loss import calculate_composite_loss
-from ananke_abm.models.run.latent_ode.batching import unify_and_interpolate_batch
+from ananke_abm.models.latent_ode.config import GenerativeODEConfig
+from ananke_abm.models.latent_ode.data_process.data import DataProcessor, LatentODEDataset
+from ananke_abm.models.latent_ode.architecture.model import GenerativeODE
+from ananke_abm.models.latent_ode.architecture.loss import calculate_composite_loss
+from ananke_abm.models.latent_ode.data_process.batching import unify_and_interpolate_batch
 
 def train():
     """Orchestrates the training of the Generative ODE model using batched data."""

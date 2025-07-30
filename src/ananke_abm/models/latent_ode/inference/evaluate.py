@@ -7,9 +7,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from ananke_abm.models.run.latent_ode.config import GenerativeODEConfig
-from ananke_abm.models.run.latent_ode.data import DataProcessor
-from ananke_abm.models.run.latent_ode.inference import BatchedInferenceEngine
+from ananke_abm.models.latent_ode.config import GenerativeODEConfig
+from ananke_abm.models.latent_ode.data_process.data import DataProcessor
+from ananke_abm.models.latent_ode.inference.inference import BatchedInferenceEngine
 
 def evaluate():
     """Loads a trained model and generates evaluation plots using batched inference."""

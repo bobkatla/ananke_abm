@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 import time
 
-from ananke_abm.models.run.latent_ode.config import GenerativeODEConfig
-from ananke_abm.models.run.latent_ode.data import DataProcessor
-from ananke_abm.models.run.latent_ode.model import GenerativeODE
+from ananke_abm.models.latent_ode.config import GenerativeODEConfig
+from ananke_abm.models.latent_ode.data_process.data import DataProcessor
+from ananke_abm.models.latent_ode.architecture.model import GenerativeODE
 
 class BatchedInferenceEngine:
     """

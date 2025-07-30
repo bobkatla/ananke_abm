@@ -6,7 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from ananke_abm.models.run.latent_ode.inference import BatchedInferenceEngine, quick_inference
+from ananke_abm.models.latent_ode.inference.inference import BatchedInferenceEngine, quick_inference
 
 def demo_quick_inference():
     """Demonstrate the quick inference function for immediate use."""
