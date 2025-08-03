@@ -159,20 +159,24 @@ class BatchedInferenceEngine:
             'person_names': person_names
         }
     
-    def predict_trajectories(self, person_ids: List[int], time_resolution: int = 100, 
-                           batch_size: int = 64) -> Dict[str, np.ndarray]:
+    def predict_trajectories(self, person_ids: List[int], time_resolution: int = 100,
+                           batch_size: int = 64, times_to_predict: Optional[torch.Tensor] = None) -> Dict[str, np.ndarray]:
         """
         Generate predicted trajectories for multiple people.
         
         Args:
             person_ids: List of person IDs to process
-            time_resolution: Number of time points (0-24 hours)
+            time_resolution: Number of time points (0-24 hours). Used if times_to_predict is None.
             batch_size: Batch size for processing
+            times_to_predict: Specific time points to predict at.
             
         Returns:
             Dictionary with trajectory predictions as numpy arrays
         """
-        times = torch.linspace(0, 24, time_resolution).to(self.device)
+        if times_to_predict is not None:
+            times = times_to_predict.to(self.device)
+        else:
+            times = torch.linspace(0, 24, time_resolution).to(self.device)
         
         # Get predictions
         predictions = self.batch_inference(person_ids, times, batch_size)

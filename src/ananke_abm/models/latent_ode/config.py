@@ -26,7 +26,7 @@ class GenerativeODEConfig:
     loss_weight_mode: float = 1.0  # NEW: Weight for mode classification loss
 
     # --- New Anchor Loss Weight ---
-    anchor_loss_weight: float = 10.0
+    anchor_loss_weight: float = 15.0
 
     # --- New Training Mode ---
     train_on_interpolated_points: bool = False
@@ -36,7 +36,7 @@ class GenerativeODEConfig:
 
     # SDE settings for stochastic dynamics
     enable_sde: bool = True  # Enable stochastic differential equations
-    sde_noise_strength: float = 0.05  # Base noise level for transitions
+    sde_noise_strength: float = 0.1  # Base noise level for transitions
     
     # Attention mechanisms
     enable_attention: bool = True
