@@ -160,38 +160,56 @@ class BatchedInferenceEngine:
         }
     
     def predict_trajectories(self, person_ids: List[int], time_resolution: int = 100,
-                           batch_size: int = 64, times_to_predict: Optional[torch.Tensor] = None) -> Dict[str, np.ndarray]:
+                           batch_size: int = 64, times_to_predict: Optional[torch.Tensor] = None,
+                           num_samples: int = 1) -> Dict[str, np.ndarray]:
         """
         Generate predicted trajectories for multiple people.
-        
+
         Args:
             person_ids: List of person IDs to process
             time_resolution: Number of time points (0-24 hours). Used if times_to_predict is None.
             batch_size: Batch size for processing
             times_to_predict: Specific time points to predict at.
-            
+            num_samples: The number of different trajectories to generate for each person.
+
         Returns:
-            Dictionary with trajectory predictions as numpy arrays
+            Dictionary with trajectory predictions as numpy arrays. Output shapes will have a new
+            `num_samples` dimension, e.g., locations will be [num_people, num_samples, num_times].
         """
         if times_to_predict is not None:
             times = times_to_predict.to(self.device)
         else:
             times = torch.linspace(0, 24, time_resolution).to(self.device)
-        
-        # Get predictions
-        predictions = self.batch_inference(person_ids, times, batch_size)
-        
-        # Convert to discrete predictions
-        pred_locations = torch.argmax(predictions['location_logits'], dim=-1).cpu().numpy()
-        pred_purposes = torch.argmax(predictions['purpose_logits'], dim=-1).cpu().numpy()
-        pred_modes = torch.argmax(predictions['mode_logits'], dim=-1).cpu().numpy()
-        
+
+        all_samples_loc = []
+        all_samples_purp = []
+        all_samples_mode = []
+
+        for i in range(num_samples):
+            print(f"   Generating sample {i+1}/{num_samples}...")
+            # Get predictions
+            predictions = self.batch_inference(person_ids, times, batch_size)
+
+            # Convert to discrete predictions
+            pred_locations = torch.argmax(predictions['location_logits'], dim=-1)
+            pred_purposes = torch.argmax(predictions['purpose_logits'], dim=-1)
+            pred_modes = torch.argmax(predictions['mode_logits'], dim=-1)
+
+            all_samples_loc.append(pred_locations)
+            all_samples_purp.append(pred_purposes)
+            all_samples_mode.append(pred_modes)
+
+        # Stack samples to create a new dimension
+        final_locations = torch.stack(all_samples_loc, dim=1).cpu().numpy()
+        final_purposes = torch.stack(all_samples_purp, dim=1).cpu().numpy()
+        final_modes = torch.stack(all_samples_mode, dim=1).cpu().numpy()
+
         return {
             'times': times.cpu().numpy(),
-            'locations': pred_locations,  # [num_people, num_times]
-            'purposes': pred_purposes,    # [num_people, num_times]
-            'modes': pred_modes,         # [num_people, num_times]
-            'person_names': predictions['person_names']
+            'locations': final_locations,  # [num_people, num_samples, num_times]
+            'purposes': final_purposes,    # [num_people, num_samples, num_times]
+            'modes': final_modes,         # [num_people, num_samples, num_times]
+            'person_names': predictions['person_names'] # This will be the same for all samples
         }
     
     def benchmark_performance(self, num_people_list: List[int] = [1, 10, 50, 100], 
