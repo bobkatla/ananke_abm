@@ -16,242 +16,117 @@ class ResidualBlock(nn.Module):
     def forward(self, x):
         return self.activation(x + self.net(x))
 
-class MovementAwareDecoder(nn.Module):
-    """Structured decoder that enforces stay ↔ transit mutual exclusion"""
-    def __init__(self, hidden_dim, num_purposes, num_modes):
-        super().__init__()
-        self.num_purposes = num_purposes
-        self.num_modes = num_modes
-        
-        # Core movement intention (binary choice: staying vs moving)
-        self.movement_net = nn.Linear(hidden_dim, 1)
-        
-        # Purpose selection conditioned on movement
-        self.staying_purpose_net = nn.Linear(hidden_dim, num_purposes - 1)  # Exclude transit
-        
-        # Mode selection conditioned on movement  
-        self.moving_mode_net = nn.Linear(hidden_dim, num_modes - 1)  # Exclude stay
-        
-    def forward(self, hidden_state):
-        # 1. Fundamental movement intention
-        movement_logit = self.movement_net(hidden_state)
-        movement_prob = torch.sigmoid(movement_logit)
-        
-        # 2. Purpose logits with structural constraint
-        staying_purpose_logits = self.staying_purpose_net(hidden_state)
-        # Combine: staying purposes weighted by (1-movement), transit weighted by movement
-        purpose_logits = torch.cat([
-            staying_purpose_logits * (1 - movement_prob),  # Home, Work, Subsistence, Leisure, Social
-            movement_logit  # Transit purpose (high when moving)
-        ], dim=-1)
-        
-        # 3. Mode logits with structural constraint
-        moving_mode_logits = self.moving_mode_net(hidden_state)
-        stay_logit = -movement_logit  # Inverse of movement intention
-        # Combine: stay weighted by (1-movement), moving modes weighted by movement
-        mode_logits = torch.cat([
-            stay_logit,  # Stay mode (high when not moving)
-            moving_mode_logits * movement_prob  # Walk, Car, Public_Transit
-        ], dim=-1)
-        
-        return purpose_logits, mode_logits, movement_prob
-
 class ODEFunc(nn.Module):
     """
-    The dynamics function for the conditional ODE/SDE. It computes the derivative of
-    the combined state [h, y_loc, movement_intention] at time t.
-    Enhanced with optional attention mechanisms and stochastic dynamics.
+    The dynamics function for the conditional SDE, now with dynamic correction.
+    It computes the derivative of the combined state [h, loc, purp_embed, mode_embed].
     """
-    def __init__(self, state_dim, hidden_dim, num_residual_blocks, 
-                 zone_embed_dim=8, enable_attention=True, attention_strength=0.1,
-                 enable_sde=False, sde_noise_strength=0.05):
+    def __init__(self, config, state_dim, hidden_dim, num_residual_blocks):
         super().__init__()
-        # Calculate the actual hidden dim from state structure: state = [h, loc_embed, movement_intention]
-        self.actual_hidden_dim = state_dim - zone_embed_dim - 1  # -1 for movement_intention
-        self.ode_hidden_dim = hidden_dim  # For the network layers
-        self.zone_embed_dim = zone_embed_dim
-        self.enable_attention = enable_attention
-        self.attention_strength = attention_strength
+        self.config = config
+        self.state_dim = state_dim
         
-        # SDE parameters
-        self.enable_sde = enable_sde
-        self.sde_noise_strength = sde_noise_strength
-        
-        # Required for torchsde compatibility
-        self.noise_type = "diagonal"  # Independent noise for each state dimension
-        self.sde_type = "ito"  # Ito SDE interpretation
-        
-        # Core network (adapted for new state structure)
+        # We assume specific dimensions in the embeddings correspond to concepts
+        # This is a simplification; a more advanced model could learn this mapping.
+        self.STAY_MODE_DIM = 0
+        self.TRAVEL_PURPOSE_DIM = 5 # Last purpose in the list
+
+        # Core network to learn the main dynamics
         self.net = nn.Sequential(
-            nn.Linear(state_dim + 2, self.ode_hidden_dim), # +2 for sine/cosine time features
+            nn.Linear(state_dim + 2, hidden_dim), # +2 for sine/cosine time features
             nn.ReLU(),
-            *[ResidualBlock(self.ode_hidden_dim) for _ in range(num_residual_blocks)],
-            nn.Linear(self.ode_hidden_dim, state_dim)
+            *[ResidualBlock(hidden_dim) for _ in range(num_residual_blocks)],
+            nn.Linear(hidden_dim, state_dim)
         )
         
-        # Attention mechanisms (adapted for movement-aware state)
-        if self.enable_attention:
-            # Location-Movement Cross-Attention
-            self.loc_movement_attention = nn.MultiheadAttention(
-                embed_dim=self.zone_embed_dim, num_heads=2, batch_first=True
-            )
-            
-            # Temporal-State Cross-Attention  
-            self.temporal_attention = nn.MultiheadAttention(
-                embed_dim=self.actual_hidden_dim, num_heads=2, batch_first=True
-            )
-        
-        self.static_features = None
-        self.home_zone_embedding = None
+        # Required for torchsde compatibility
+        self.noise_type = "diagonal"
+        self.sde_type = "ito"
 
-    def forward(self, t, state):
-        # state is the combined vector [h, y_loc, movement_intention]
-        batch_size = state.shape[0]
+    def _calculate_potential(self, purpose_embed, mode_embed):
+        """Calculates a penalty potential for a comprehensive set of logical rules."""
+        # Use Tanh to squash activations to a predictable [-1, 1] range
+        activations_purp = torch.tanh(purpose_embed)
+        activations_mode = torch.tanh(mode_embed)
+
+        travel_purp_activation = activations_purp[..., self.TRAVEL_PURPOSE_DIM]
+        stay_mode_activation = activations_mode[..., self.STAY_MODE_DIM]
+
+        # Activation of all non-travel purposes
+        other_purp_dims = [i for i in range(activations_purp.shape[-1]) if i != self.TRAVEL_PURPOSE_DIM]
+        other_purp_activation = activations_purp[..., other_purp_dims].mean(dim=-1)
+
+        # Activation of all non-stay modes (i.e., moving modes)
+        other_mode_dims = [i for i in range(activations_mode.shape[-1]) if i != self.STAY_MODE_DIM]
+        other_mode_activation = activations_mode[..., other_mode_dims].mean(dim=-1)
+
+        # Penalty 1: (Purpose=Travel AND Mode=Stay) should not happen.
+        contradiction_1 = travel_purp_activation + stay_mode_activation - 1.5
+        potential_1 = (torch.relu(contradiction_1))**2
+
+        # Penalty 2: (Purpose is NOT Travel AND Mode is NOT Stay) should not happen.
+        # This enforces that activities must occur in "Stay" mode.
+        contradiction_2 = other_purp_activation + other_mode_activation - 1.5
+        potential_2 = (torch.relu(contradiction_2))**2
         
-        # Ensure t is a tensor and then expand for sine/cosine features
+        # Penalty 3: (Purpose=Travel AND Mode is NOT a moving mode) should not happen.
+        # This is implicitly handled by penalties 1 and 2, but we can add a specific one.
+        # This one encourages a moving mode to be active when purpose is travel.
+        contradiction_3 = travel_purp_activation - other_mode_activation - 1.0 
+        potential_3 = (torch.relu(contradiction_3))**2
+
+        total_potential = potential_1 + potential_2 + potential_3
+        return total_potential
+
+    def forward(self, t, z):
+        """Calculates dz/dt = f(z,t) with dynamic correction."""
+        z.requires_grad_(True) # Essential for calculating the gradient of the potential
+        
+        # --- 1. Calculate Raw Dynamics ---
+        batch_size = z.shape[0]
         if t.dim() == 0:
             t = t.expand(1)
         t_vec = torch.cat([torch.sin(t * 2 * torch.pi / 24), torch.cos(t * 2 * torch.pi / 24)]).expand(batch_size, -1)
         
-        # Core dynamics
-        core_dynamics = self.net(torch.cat([state, t_vec], dim=-1))
-        
-        # Apply attention enhancements if enabled
-        if self.enable_attention:
-            attention_delta = self._compute_attention_delta(state, t_vec)
-            return core_dynamics + self.attention_strength * attention_delta
-        else:
-            return core_dynamics
-    
-    def _compute_attention_delta(self, state, t_vec):
-        """Compute attention-based modifications to the dynamics."""
-        # Split state into components
-        h = state[:, :self.actual_hidden_dim]
-        loc_embed = state[:, self.actual_hidden_dim:self.actual_hidden_dim + self.zone_embed_dim]
-        movement_intention = state[:, -1:]
-        
-        # Initialize delta with zeros
-        delta_h = torch.zeros_like(h)
-        delta_loc = torch.zeros_like(loc_embed)
-        delta_movement = torch.zeros_like(movement_intention)
-        
-        # 1. Location-Movement Cross-Attention
-        loc_movement_delta = self._location_movement_attention(loc_embed, movement_intention)
-        delta_loc += loc_movement_delta
-        
-        # 2. Temporal-State Attention  
-        temporal_delta = self._temporal_state_attention(h, t_vec)
-        delta_h += temporal_delta
-        
-        return torch.cat([delta_h, delta_loc, delta_movement], dim=-1)
-    
-    def _location_movement_attention(self, loc_embed, movement_intention):
-        """Cross-attention between location and movement intention."""
-        # Expand movement intention to match location embedding dimension
-        movement_expanded = movement_intention.expand(-1, self.zone_embed_dim).unsqueeze(1)
-        loc_expanded = loc_embed.unsqueeze(1)
-        
-        # Movement as query, location as key/value
-        enhanced_loc, _ = self.loc_movement_attention(
-            query=movement_expanded, key=loc_expanded, value=loc_expanded
-        )
-        
-        # Calculate delta
-        delta = enhanced_loc.squeeze(1) - loc_embed
-        
-        return delta
-    
-    def _temporal_state_attention(self, hidden_state, time_features):
-        """Temporal attention to modulate hidden state dynamics."""
-        # Expand dimensions for attention
-        hidden_expanded = hidden_state.unsqueeze(1)  # [batch, 1, hidden_dim]
-        time_expanded = time_features.unsqueeze(1)   # [batch, 1, 2]
-        
-        # Pad time features to match hidden dimension
-        time_padded = torch.cat([
-            time_expanded, 
-            torch.zeros(time_expanded.shape[0], 1, self.actual_hidden_dim - 2).to(time_expanded.device)
-        ], dim=-1)
-        
-        # Time as query, hidden state as key/value
-        enhanced_hidden, _ = self.temporal_attention(
-            query=time_padded, key=hidden_expanded, value=hidden_expanded
-        )
-        
-        # Return the delta
-        return enhanced_hidden.squeeze(1) - hidden_state
+        raw_dynamics = self.net(torch.cat([z, t_vec], dim=-1))
 
-    def f(self, t, state):
-        """Drift function for SDE (same as ODE dynamics)."""
-        return self.forward(t, state)
-    
-    def g(self, t, state):
-        """Diffusion function for SDE (noise term)."""
-        if not self.enable_sde:
-            return torch.zeros_like(state)
-        
-        # For diagonal noise_type, return diffusion tensor of same shape as state
-        diffusion = self._compute_diffusion(t, state)
-        return diffusion
+        # --- 2. Calculate Dynamic Correction Force ---
+        # Slice the state to get the relevant embeddings
+        slice_dims = [self.config.hidden_dim, self.config.zone_embed_dim, self.config.latent_purpose_embed_dim, self.config.latent_mode_embed_dim]
+        _, _, purpose_embed, mode_embed = torch.split(z, slice_dims, dim=-1)
 
-    def f_and_g(self, t, state):
-        """SDE drift and diffusion function for torchsde compatibility."""
-        drift = self.forward(t, state)
+        # Calculate the penalty potential
+        potential = self._calculate_potential(purpose_embed, mode_embed)
         
-        if not self.enable_sde:
-            # For ODE mode, return zero diffusion
-            diffusion = torch.zeros_like(state)
-        else:
-            diffusion = self._compute_diffusion(t, state)
+        # If the potential is non-zero, calculate the repulsive force
+        if torch.any(potential > 0):
+            # The force is the negative gradient of the potential
+            repulsive_force = -torch.autograd.grad(
+                outputs=potential.sum(), 
+                inputs=z, 
+                create_graph=True # Allows backpropping through the correction
+            )[0]
             
-        return drift, diffusion
-    
-    def _compute_diffusion(self, t, state):
-        """Compute adaptive noise for SDE transitions."""
-        batch_size = state.shape[0]
-        
-        # Split state into components
-        h = state[:, :self.actual_hidden_dim]
-        loc_embed = state[:, self.actual_hidden_dim:self.actual_hidden_dim + self.zone_embed_dim]
-        movement_intention = state[:, -1:]
-        
-        # Adaptive noise based on movement intention
-        # High noise near decision boundary (movement_intention ≈ 0.5)
-        decision_boundary_distance = torch.abs(movement_intention - 0.5)
-        decision_noise_scale = torch.exp(-4 * decision_boundary_distance)  # Peak at 0.5, decay rapidly
-        
-        # Time-dependent noise (higher during typical transition periods)
-        if t.dim() == 0:
-            t = t.expand(1)
-        # Model higher uncertainty during rush hours (8am, 12pm, 6pm)
-        rush_hour_noise = (
-            torch.exp(-((t - 8) ** 2) / 2) +   # Morning rush
-            torch.exp(-((t - 12) ** 2) / 2) +  # Lunch time  
-            torch.exp(-((t - 18) ** 2) / 2)    # Evening rush
-        ) * 0.3
-        time_noise_scale = (0.5 + rush_hour_noise).expand(batch_size, 1)
-        
-        # Combine noise scales
-        total_noise_scale = self.sde_noise_strength * decision_noise_scale * time_noise_scale
-        
-        # Apply different noise levels to different state components
-        noise_h = total_noise_scale * 0.8  # Moderate noise for hidden state
-        noise_loc = total_noise_scale * 1.2  # Higher noise for location (enables jumps)
-        noise_movement = total_noise_scale * 2.0  # Highest noise for movement intention (sharp switches)
-        
-        # Construct diffusion tensor
-        diffusion = torch.cat([
-            noise_h.expand(-1, self.actual_hidden_dim),
-            noise_loc.expand(-1, self.zone_embed_dim),
-            noise_movement
-        ], dim=-1)
-        
-        return diffusion
+            # Add the corrective force to the raw dynamics
+            final_dynamics = raw_dynamics + self.config.correction_strength * repulsive_force
+        else:
+            final_dynamics = raw_dynamics
+            
+        return final_dynamics
+
+    def g(self, t, z):
+        """Diffusion function for SDE (noise term)."""
+        # A simple noise model for now, can be made adaptive later
+        return torch.full_like(z, self.config.sde_noise_strength)
+
+    def f(self, t, z):
+        """Drift function for SDE (just a wrapper for forward)."""
+        return self.forward(t, z)
 
 class GenerativeODE(nn.Module):
     """
-    A conditional, autoregressive Latent ODE model with movement-aware mode choice.
-    The ODE state contains the evolving location embedding and movement intention.
+    A conditional, autoregressive Latent SDE model where the latent state
+    includes embeddings for purpose and mode, which are evolved directly.
     """
     def __init__(self, person_feat_dim, num_zone_features, config):
         super().__init__()
@@ -259,41 +134,36 @@ class GenerativeODE(nn.Module):
         
         self.zone_feature_encoder = nn.Linear(num_zone_features, config.zone_embed_dim)
 
-        # The encoder produces the initial hidden state h(0)
-        # It now takes zone *characteristics* instead of embeddings
+        # The encoder produces the initial latent state z(0)
+        # It now creates mu and log_var for the hidden state h,
+        # plus initial embeddings for purpose and mode.
         encoder_input_dim = person_feat_dim + config.zone_embed_dim * 2
+        encoder_output_dim = (config.hidden_dim * 2) + config.latent_purpose_embed_dim + config.latent_mode_embed_dim
         self.encoder = nn.Sequential(
             nn.Linear(encoder_input_dim, config.encoder_hidden_dim),
             nn.ReLU(),
-            nn.Linear(config.encoder_hidden_dim, config.hidden_dim * 2), # mu and log_var for h(0)
+            nn.Linear(config.encoder_hidden_dim, encoder_output_dim),
         )
         
-        # Define the dimensions of the combined ODE state
-        # State: [hidden_state, location_embed, movement_intention]
-        self.state_dim = config.hidden_dim + config.zone_embed_dim + 1
+        # Define the dimensions of the new combined SDE state
+        # State: [hidden_state_h, location_embed, purpose_embed, mode_embed]
+        self.state_dim = config.hidden_dim + config.zone_embed_dim + config.latent_purpose_embed_dim + config.latent_mode_embed_dim
         
         self.ode_func = ODEFunc(
+            config=config,
             state_dim=self.state_dim,
             hidden_dim=config.ode_hidden_dim,
-            num_residual_blocks=config.num_residual_blocks,
-            zone_embed_dim=config.zone_embed_dim,
-            enable_attention=config.enable_attention,
-            attention_strength=config.attention_strength,
-            enable_sde=config.enable_sde,
-            sde_noise_strength=config.sde_noise_strength
+            num_residual_blocks=config.num_residual_blocks
         )
         
-        # Decoders now operate on the hidden state component h(t)
-        # The location decoder predicts a "target embedding", not logits over all zones
+        # --- New Decoders ---
+        # These decode the final latent embeddings from the SDE into logits
         self.decoder_loc = nn.Linear(config.hidden_dim, config.zone_embed_dim)
-        
-        # NEW: Structured decoder for purpose and mode with constraints
-        self.structured_decoder = MovementAwareDecoder(
-            config.hidden_dim, len(config.purpose_groups), config.num_modes
-        )
+        self.decoder_purpose = nn.Linear(config.latent_purpose_embed_dim, len(config.purpose_groups))
+        self.decoder_mode = nn.Linear(config.latent_mode_embed_dim, config.num_modes)
 
     def forward(self, person_features, home_zone_features, work_zone_features, 
-                start_purp_id, times, all_zone_features, adjacency_matrix):
+                times, all_zone_features):
         
         # Create candidate embeddings for all zones in the geography
         candidate_zone_embeds = self.zone_feature_encoder(all_zone_features)
@@ -302,40 +172,43 @@ class GenerativeODE(nn.Module):
         home_embed = self.zone_feature_encoder(home_zone_features)
         work_embed = self.zone_feature_encoder(work_zone_features)
         
-        # 1. ENCODER: Get initial hidden state h(0) from static features
+        # 1. ENCODER: Get initial latent state components from static features
         encoder_input = torch.cat([person_features, home_embed, work_embed], dim=-1)
-        h0_params = self.encoder(encoder_input)
-        mu, log_var = h0_params.chunk(2, dim=-1)
-        h0 = mu + torch.exp(0.5 * log_var) * torch.randn_like(mu)
+        encoder_output = self.encoder(encoder_input)
+        
+        # Split the encoder output into its parts
+        h0_mu, h0_log_var, initial_purpose_embed, initial_mode_embed = torch.split(
+            encoder_output,
+            [self.config.hidden_dim, self.config.hidden_dim, self.config.latent_purpose_embed_dim, self.config.latent_mode_embed_dim],
+            dim=-1
+        )
+        h0 = h0_mu + torch.exp(0.5 * h0_log_var) * torch.randn_like(h0_mu)
 
         # 2. INITIAL STATE: Construct the full initial state s(0)
-        # State: [hidden_state, location_embed, movement_intention]
-        s0_loc = home_embed # Start at home location
-        s0_movement = torch.zeros_like(h0[:, :1])  # Start stationary (movement_intention = 0)
-        s0 = torch.cat([h0, s0_loc, s0_movement], dim=-1)
+        # We assume the agent starts at home, with a purpose of home and mode of stay
+        # The initial embeddings from the encoder act as a starting "bias"
+        s0_loc = home_embed
+        s0 = torch.cat([h0, s0_loc, initial_purpose_embed, initial_mode_embed], dim=-1)
 
         # 3. SOLVER: Evolve the state s(t) over the entire time series
-        if self.config.enable_sde:
-            # Use SDE solver for stochastic dynamics  
-            pred_s = sdeint(self.ode_func, s0, times, method='euler', dt=0.01)
-            pred_s = pred_s.permute(1, 0, 2)
-        else:
-            # Use deterministic ODE solver
-            pred_s = odeint(self.ode_func, s0, times, method=self.config.ode_method).permute(1, 0, 2)
+        # We must enable gradients for the dynamic correction to work during inference
+        with torch.enable_grad():
+            if self.config.enable_sde:
+                pred_s = sdeint(self.ode_func, s0, times, method='euler', dt=0.01).permute(1, 0, 2)
+            else:
+                pred_s = odeint(self.ode_func, s0, times, method=self.config.ode_method).permute(1, 0, 2)
         
-        # 4. DECODE: Split the solved state back into its components
-        pred_h = pred_s[..., :self.config.hidden_dim]
-        pred_y_loc_embed_path = pred_s[..., self.config.hidden_dim:self.config.hidden_dim + self.config.zone_embed_dim]
-        # movement_intention_path = pred_s[..., -1:]  # Available if needed for analysis
+        # 4. DECODE: Split the solved state path back into its components
+        slice_dims = [self.config.hidden_dim, self.config.zone_embed_dim, self.config.latent_purpose_embed_dim, self.config.latent_mode_embed_dim]
+        pred_h, pred_y_loc_embed, pred_purpose_embed, pred_mode_embed = torch.split(pred_s, slice_dims, dim=-1)
         
-        # 5. PREDICT: Use the hidden state to predict a "target embedding"
+        # 5. PREDICT: Use the hidden state and latent embeddings to get final logits
+        # Location prediction
         target_loc_embeds = self.decoder_loc(pred_h)
-
-        # 6. MATCH: Find the most similar candidate zone for each predicted target embedding
-        # This computes the dot product similarity and gives us our new logits
         pred_y_loc_logits = torch.einsum('bsd,zd->bsz', target_loc_embeds, candidate_zone_embeds)
-
-        # 7. STRUCTURED PREDICTION: Purpose and mode with constraints
-        pred_y_purp_logits, pred_y_mode_logits, movement_probs = self.structured_decoder(pred_h)
         
-        return pred_y_loc_logits, pred_y_loc_embed_path, pred_y_purp_logits, pred_y_mode_logits, mu, log_var 
+        # Purpose and Mode prediction
+        pred_y_purp_logits = self.decoder_purpose(pred_purpose_embed)
+        pred_y_mode_logits = self.decoder_mode(pred_mode_embed)
+        
+        return pred_y_loc_logits, pred_y_loc_embed, pred_y_purp_logits, pred_y_mode_logits, h0_mu, h0_log_var 

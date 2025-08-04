@@ -58,10 +58,8 @@ def train():
                 batch['person_features'], 
                 batch['home_zone_features'], 
                 batch['work_zone_features'],
-                batch['start_purpose_id'],
                 batch['t_unified'],
-                batch['all_zone_features'],
-                batch['adjacency_matrix']
+                batch['all_zone_features']
             )
             
             # Calculate the composite loss on the batch (now includes mode loss)

@@ -128,13 +128,11 @@ class DataProcessor:
             "times": data["times"].to(self.device),
             "trajectory_y": data["zone_observations"].to(self.device),
             "target_purpose_ids": target_purpose_ids,
-            "target_mode_ids": target_mode_ids,  # NEW: Mode sequence
+            "target_mode_ids": target_mode_ids,
             "importance_weights": torch.tensor(importance_weights, dtype=torch.float32, device=self.device),
-            "start_purpose_id": target_purpose_ids[0].item(), # Known starting purpose
             "num_zones": len(self.zones_raw),
             "person_name": data['person_name'],
             "home_zone_features": home_zone_features,
             "work_zone_features": work_zone_features,
             "all_zone_features": zone_features,
-            "adjacency_matrix": adjacency_matrix
         } 

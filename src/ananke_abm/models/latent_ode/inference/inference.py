@@ -5,7 +5,7 @@ Provides batched inference capabilities for processing thousands of people effic
 import torch
 import numpy as np
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 import time
 
 from ananke_abm.models.latent_ode.config import GenerativeODEConfig
@@ -66,7 +66,6 @@ class BatchedInferenceEngine:
         # Cache zone features for efficiency
         sample_data = self.processor.get_data(person_id=1)
         self.all_zone_features = sample_data["all_zone_features"]
-        self.adjacency_matrix = sample_data["adjacency_matrix"]
         
     def batch_inference(self, person_ids: List[int], times: torch.Tensor, 
                        batch_size: int = 64) -> Dict[str, torch.Tensor]:
@@ -118,13 +117,11 @@ class BatchedInferenceEngine:
     
     def _process_batch(self, person_ids: List[int], times: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Process a single batch of people."""
-        current_batch_size = len(person_ids)
         
         # Collect batch data
         person_features_list = []
         home_zone_features_list = []
         work_zone_features_list = []
-        start_purpose_ids = []
         person_names = []
         
         for person_id in person_ids:
@@ -132,24 +129,20 @@ class BatchedInferenceEngine:
             person_features_list.append(data["person_features"])
             home_zone_features_list.append(data["home_zone_features"])
             work_zone_features_list.append(data["work_zone_features"])
-            start_purpose_ids.append(data["start_purpose_id"])
             person_names.append(data["person_name"])
         
         # Stack into batch tensors
         person_features_batch = torch.stack(person_features_list)
         home_zone_features_batch = torch.stack(home_zone_features_list)
         work_zone_features_batch = torch.stack(work_zone_features_list)
-        start_purpose_id_batch = torch.tensor(start_purpose_ids, dtype=torch.long, device=self.device)
         
         # Single forward pass for entire batch
         pred_y_logits, _, pred_purpose_logits, pred_mode_logits, _, _ = self.model(
             person_features_batch,
             home_zone_features_batch, 
             work_zone_features_batch,
-            start_purpose_id_batch,
             times,
-            self.all_zone_features,
-            self.adjacency_matrix
+            self.all_zone_features
         )
         
         return {
@@ -234,7 +227,7 @@ class BatchedInferenceEngine:
             
             # Benchmark
             start_time = time.time()
-            predictions = self.predict_trajectories(person_ids, time_resolution, batch_size)
+            self.predict_trajectories(person_ids, time_resolution, batch_size)
             end_time = time.time()
             
             # Calculate metrics
