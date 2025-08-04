@@ -18,60 +18,62 @@ class ResidualBlock(nn.Module):
 
 class ODEFunc(nn.Module):
     """
-    The dynamics function for the conditional SDE, now with dynamic correction.
-    It computes the derivative of the combined state [h, loc, purp_embed, mode_embed].
+    The dynamics function for the conditional SDE.
+    If configured as a second-order system, it models acceleration dv/dt = a(p,v,t).
+    Otherwise, it models velocity dp/dt = f(p,t).
     """
-    def __init__(self, config, state_dim, hidden_dim, num_residual_blocks):
+    def __init__(self, config, state_dim, position_dim, hidden_dim, num_residual_blocks):
         super().__init__()
         self.config = config
         self.state_dim = state_dim
-        
+        self.position_dim = position_dim
+
         # We assume specific dimensions in the embeddings correspond to concepts
-        # This is a simplification; a more advanced model could learn this mapping.
         self.STAY_MODE_DIM = 0
         self.TRAVEL_PURPOSE_DIM = 5 # Last purpose in the list
 
-        # Core network to learn the main dynamics
+        # Core network to learn the main dynamics (acceleration)
+        if self.config.use_second_order_sde:
+            net_input_dim = self.state_dim + 2 # [p, v, t]
+            net_output_dim = self.position_dim # learns acceleration
+        else:
+            net_input_dim = self.state_dim + 2 # [p, t]
+            net_output_dim = self.position_dim # learns velocity
+            
         self.net = nn.Sequential(
-            nn.Linear(state_dim + 2, hidden_dim), # +2 for sine/cosine time features
+            nn.Linear(net_input_dim, hidden_dim),
             nn.ReLU(),
             *[ResidualBlock(hidden_dim) for _ in range(num_residual_blocks)],
-            nn.Linear(hidden_dim, state_dim)
+            nn.Linear(hidden_dim, net_output_dim)
         )
         
         # Required for torchsde compatibility
         self.noise_type = "diagonal"
         self.sde_type = "ito"
 
-    def _calculate_potential(self, purpose_embed, mode_embed):
-        """Calculates a penalty potential for a comprehensive set of logical rules."""
-        # Use Tanh to squash activations to a predictable [-1, 1] range
+    def _calculate_potential(self, position):
+        """Calculates a penalty potential for forbidden state combinations based on position."""
+        slice_dims = [self.config.hidden_dim, self.config.zone_embed_dim, self.config.latent_purpose_embed_dim, self.config.latent_mode_embed_dim]
+        _, _, purpose_embed, mode_embed = torch.split(position, slice_dims, dim=-1)
+
         activations_purp = torch.tanh(purpose_embed)
         activations_mode = torch.tanh(mode_embed)
 
         travel_purp_activation = activations_purp[..., self.TRAVEL_PURPOSE_DIM]
         stay_mode_activation = activations_mode[..., self.STAY_MODE_DIM]
 
-        # Activation of all non-travel purposes
         other_purp_dims = [i for i in range(activations_purp.shape[-1]) if i != self.TRAVEL_PURPOSE_DIM]
         other_purp_activation = activations_purp[..., other_purp_dims].mean(dim=-1)
 
-        # Activation of all non-stay modes (i.e., moving modes)
         other_mode_dims = [i for i in range(activations_mode.shape[-1]) if i != self.STAY_MODE_DIM]
         other_mode_activation = activations_mode[..., other_mode_dims].mean(dim=-1)
 
-        # Penalty 1: (Purpose=Travel AND Mode=Stay) should not happen.
         contradiction_1 = travel_purp_activation + stay_mode_activation - 1.5
         potential_1 = (torch.relu(contradiction_1))**2
 
-        # Penalty 2: (Purpose is NOT Travel AND Mode is NOT Stay) should not happen.
-        # This enforces that activities must occur in "Stay" mode.
         contradiction_2 = other_purp_activation + other_mode_activation - 1.5
         potential_2 = (torch.relu(contradiction_2))**2
         
-        # Penalty 3: (Purpose=Travel AND Mode is NOT a moving mode) should not happen.
-        # This is implicitly handled by penalties 1 and 2, but we can add a specific one.
-        # This one encourages a moving mode to be active when purpose is travel.
         contradiction_3 = travel_purp_activation - other_mode_activation - 1.0 
         potential_3 = (torch.relu(contradiction_3))**2
 
@@ -80,43 +82,44 @@ class ODEFunc(nn.Module):
 
     def forward(self, t, z):
         """Calculates dz/dt = f(z,t) with dynamic correction."""
-        z.requires_grad_(True) # Essential for calculating the gradient of the potential
+        z.requires_grad_(True)
         
-        # --- 1. Calculate Raw Dynamics ---
+        # Time features
         batch_size = z.shape[0]
-        if t.dim() == 0:
-            t = t.expand(1)
+        if t.dim() == 0: t = t.expand(1)
         t_vec = torch.cat([torch.sin(t * 2 * torch.pi / 24), torch.cos(t * 2 * torch.pi / 24)]).expand(batch_size, -1)
-        
-        raw_dynamics = self.net(torch.cat([z, t_vec], dim=-1))
 
-        # --- 2. Calculate Dynamic Correction Force ---
-        # Slice the state to get the relevant embeddings
-        slice_dims = [self.config.hidden_dim, self.config.zone_embed_dim, self.config.latent_purpose_embed_dim, self.config.latent_mode_embed_dim]
-        _, _, purpose_embed, mode_embed = torch.split(z, slice_dims, dim=-1)
+        if self.config.use_second_order_sde:
+            p, v = torch.split(z, self.position_dim, dim=-1)
+            dp_dt = v
+            dv_dt = self.net(torch.cat([p, v, t_vec], dim=-1))
+            
+            # Apply constraint as a corrective acceleration
+            potential = self._calculate_potential(p)
+            if torch.any(potential > 0):
+                constraint_accel = -torch.autograd.grad(potential.sum(), p, create_graph=True)[0]
+                final_dv_dt = dv_dt + self.config.correction_strength * constraint_accel
+            else:
+                final_dv_dt = dv_dt
 
-        # Calculate the penalty potential
-        potential = self._calculate_potential(purpose_embed, mode_embed)
-        
-        # If the potential is non-zero, calculate the repulsive force
-        if torch.any(potential > 0):
-            # The force is the negative gradient of the potential
-            repulsive_force = -torch.autograd.grad(
-                outputs=potential.sum(), 
-                inputs=z, 
-                create_graph=True # Allows backpropping through the correction
-            )[0]
+            return torch.cat([dp_dt, final_dv_dt], dim=-1)
+
+        else: # First-order system
+            p = z
+            dp_dt = self.net(torch.cat([p, t_vec], dim=-1))
+
+            # Apply constraint as a corrective velocity
+            potential = self._calculate_potential(p)
+            if torch.any(potential > 0):
+                constraint_vel = -torch.autograd.grad(potential.sum(), p, create_graph=True)[0]
+                final_dp_dt = dp_dt + self.config.correction_strength * constraint_vel
+            else:
+                final_dp_dt = dp_dt
             
-            # Add the corrective force to the raw dynamics
-            final_dynamics = raw_dynamics + self.config.correction_strength * repulsive_force
-        else:
-            final_dynamics = raw_dynamics
-            
-        return final_dynamics
+            return final_dp_dt
 
     def g(self, t, z):
         """Diffusion function for SDE (noise term)."""
-        # A simple noise model for now, can be made adaptive later
         return torch.full_like(z, self.config.sde_noise_strength)
 
     def f(self, t, z):
@@ -145,13 +148,19 @@ class GenerativeODE(nn.Module):
             nn.Linear(config.encoder_hidden_dim, encoder_output_dim),
         )
         
-        # Define the dimensions of the new combined SDE state
-        # State: [hidden_state_h, location_embed, purpose_embed, mode_embed]
-        self.state_dim = config.hidden_dim + config.zone_embed_dim + config.latent_purpose_embed_dim + config.latent_mode_embed_dim
+        # Define the dimensions of the new SDE state components
+        self.position_dim = config.hidden_dim + config.zone_embed_dim + config.latent_purpose_embed_dim + config.latent_mode_embed_dim
+        
+        # If using a second-order system, the state is [position, velocity]
+        if config.use_second_order_sde:
+            self.state_dim = self.position_dim * 2
+        else:
+            self.state_dim = self.position_dim
         
         self.ode_func = ODEFunc(
             config=config,
             state_dim=self.state_dim,
+            position_dim=self.position_dim,
             hidden_dim=config.ode_hidden_dim,
             num_residual_blocks=config.num_residual_blocks
         )
@@ -172,7 +181,7 @@ class GenerativeODE(nn.Module):
         home_embed = self.zone_feature_encoder(home_zone_features)
         work_embed = self.zone_feature_encoder(work_zone_features)
         
-        # 1. ENCODER: Get initial latent state components from static features
+        # 1. ENCODER: Get initial latent "position" p(0) from static features
         encoder_input = torch.cat([person_features, home_embed, work_embed], dim=-1)
         encoder_output = self.encoder(encoder_input)
         
@@ -183,24 +192,35 @@ class GenerativeODE(nn.Module):
             dim=-1
         )
         h0 = h0_mu + torch.exp(0.5 * h0_log_var) * torch.randn_like(h0_mu)
+        
+        # Assemble the initial position state p(0)
+        p0_loc = home_embed
+        p0 = torch.cat([h0, p0_loc, initial_purpose_embed, initial_mode_embed], dim=-1)
 
         # 2. INITIAL STATE: Construct the full initial state s(0)
-        # We assume the agent starts at home, with a purpose of home and mode of stay
-        # The initial embeddings from the encoder act as a starting "bias"
-        s0_loc = home_embed
-        s0 = torch.cat([h0, s0_loc, initial_purpose_embed, initial_mode_embed], dim=-1)
+        if self.config.use_second_order_sde:
+            # State is [p0, v0], where v0 is initialized to zero
+            v0 = torch.zeros_like(p0)
+            s0 = torch.cat([p0, v0], dim=-1)
+        else:
+            s0 = p0
 
         # 3. SOLVER: Evolve the state s(t) over the entire time series
-        # We must enable gradients for the dynamic correction to work during inference
         with torch.enable_grad():
             if self.config.enable_sde:
                 pred_s = sdeint(self.ode_func, s0, times, method='euler', dt=0.01).permute(1, 0, 2)
             else:
                 pred_s = odeint(self.ode_func, s0, times, method=self.config.ode_method).permute(1, 0, 2)
         
-        # 4. DECODE: Split the solved state path back into its components
+        # 4. DECODE: Extract the position component from the solved state path
+        if self.config.use_second_order_sde:
+            pred_p, _ = torch.split(pred_s, self.position_dim, dim=-1)
+        else:
+            pred_p = pred_s
+
+        # Split the position path back into its components
         slice_dims = [self.config.hidden_dim, self.config.zone_embed_dim, self.config.latent_purpose_embed_dim, self.config.latent_mode_embed_dim]
-        pred_h, pred_y_loc_embed, pred_purpose_embed, pred_mode_embed = torch.split(pred_s, slice_dims, dim=-1)
+        pred_h, pred_y_loc_embed, pred_purpose_embed, pred_mode_embed = torch.split(pred_p, slice_dims, dim=-1)
         
         # 5. PREDICT: Use the hidden state and latent embeddings to get final logits
         # Location prediction

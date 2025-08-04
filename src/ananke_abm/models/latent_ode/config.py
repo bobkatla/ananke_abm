@@ -16,11 +16,12 @@ class GenerativeODEConfig:
 
     # Dynamic Correction for SDE
     correction_strength: float = 1.0
+    use_second_order_sde: bool = True
     
     # Training parameters
     learning_rate: float = 1e-3
     kl_weight: float = 0.5
-    num_iterations: int = 10000
+    num_iterations: int = 15000
     
     # --- New Composite Loss Weights ---
     loss_weight_classification: float = 1.0
