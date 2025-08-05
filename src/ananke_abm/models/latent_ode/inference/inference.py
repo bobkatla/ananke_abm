@@ -122,6 +122,8 @@ class BatchedInferenceEngine:
         person_features_list = []
         home_zone_features_list = []
         work_zone_features_list = []
+        initial_purpose_features_list = []
+        initial_mode_features_list = []
         person_names = []
         
         for person_id in person_ids:
@@ -129,18 +131,29 @@ class BatchedInferenceEngine:
             person_features_list.append(data["person_features"])
             home_zone_features_list.append(data["home_zone_features"])
             work_zone_features_list.append(data["work_zone_features"])
+            # The model's encoder needs the features at the first time step
+            initial_purpose_features_list.append(data["target_purpose_features"][0])
+            initial_mode_features_list.append(data["target_mode_features"][0])
             person_names.append(data["person_name"])
         
         # Stack into batch tensors
         person_features_batch = torch.stack(person_features_list)
         home_zone_features_batch = torch.stack(home_zone_features_list)
         work_zone_features_batch = torch.stack(work_zone_features_list)
+        initial_purpose_features_batch = torch.stack(initial_purpose_features_list)
+        initial_mode_features_batch = torch.stack(initial_mode_features_list)
         
         # Single forward pass for entire batch
-        pred_y_logits, _, pred_purpose_logits, pred_mode_logits, _, _ = self.model(
+        (
+            pred_y_logits, _, 
+            pred_purpose_logits, pred_mode_logits, 
+            _, _, _, _
+        ) = self.model(
             person_features_batch,
             home_zone_features_batch, 
             work_zone_features_batch,
+            initial_purpose_features_batch,
+            initial_mode_features_batch,
             times,
             self.all_zone_features
         )

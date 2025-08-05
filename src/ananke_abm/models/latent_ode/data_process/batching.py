@@ -6,6 +6,8 @@ DataLoader. It takes a list of individual, variable-length time series samples
 and combines them into a single, dense batch suitable for parallel processing.
 """
 import torch
+from ananke_abm.data_generator.feature_engineering import get_feature_dimensions, MODE_ID_MAP, PURPOSE_ID_MAP
+
 
 def unify_and_interpolate_batch(batch):
     """
@@ -17,31 +19,38 @@ def unify_and_interpolate_batch(batch):
     all_times = [s['times'] for s in batch]
     all_y_loc = [s['trajectory_y'] for s in batch]
     all_y_purp = [s['target_purpose_ids'] for s in batch]
-    all_y_mode = [s['target_mode_ids'] for s in batch]  # NEW: Mode sequences
+    all_y_mode = [s['target_mode_ids'] for s in batch]
+    all_y_purp_feat = [s['target_purpose_features'] for s in batch]
+    all_y_mode_feat = [s['target_mode_features'] for s in batch]
     all_imp_weights = [s['importance_weights'] for s in batch]
     
     t_unified = torch.cat(all_times).unique(sorted=True)
     unified_len = len(t_unified)
     batch_size = len(batch)
     device = batch[0]['person_features'].device
+    config = batch[0]['config']
     
+    # Get feature dimensions
+    mode_feat_dim, purp_feat_dim = get_feature_dimensions()
+
     # --- 2. Create dense tensors and masks ---
     y_loc_dense = torch.full((batch_size, unified_len), -1, dtype=torch.long, device=device)
     y_purp_dense = torch.full((batch_size, unified_len), -1, dtype=torch.long, device=device)
-    y_mode_dense = torch.full((batch_size, unified_len), -1, dtype=torch.long, device=device)  # NEW: Mode tensor
+    y_mode_dense = torch.full((batch_size, unified_len), -1, dtype=torch.long, device=device)
+    y_purp_feat_dense = torch.zeros((batch_size, unified_len, purp_feat_dim), dtype=torch.float32, device=device)
+    y_mode_feat_dense = torch.zeros((batch_size, unified_len, mode_feat_dim), dtype=torch.float32, device=device)
+    
     loss_mask = torch.zeros((batch_size, unified_len), device=device)
     importance_mask = torch.ones((batch_size, unified_len), device=device)
     
-    config = batch[0]['config']
     if config.train_on_interpolated_points:
         loss_mask.fill_(1.0)
     
-    # Get the ID for "Travel/Transit" for intelligent filling
-    # This assumes "Travel/Transit" is the last purpose group in the config.
-    travel_purpose_id = len(config.purpose_groups) - 1
+    # Get the ID for "Travel" for intelligent filling
+    travel_purpose_id = PURPOSE_ID_MAP["travel"]
     
-    # Get the ID for "Stay" mode for intelligent filling (mode 0)
-    stay_mode_id = 0
+    # Get the ID for "Stay" mode for intelligent filling (for mode transition)
+    stay_mode_id = MODE_ID_MAP["stay"]
     
     # --- 3. Pre-compute anchor indices and fill dense tensors ---
     prev_real_indices = torch.zeros((batch_size, unified_len), dtype=torch.long, device=device)
@@ -53,20 +62,16 @@ def unify_and_interpolate_batch(batch):
         original_times = all_times[i]
         indices_in_unified = torch.tensor([t_to_idx[t.item()] for t in original_times], device=device)
         
+        # Fill dense tensors with data from real observation points
         y_loc_dense[i, indices_in_unified] = all_y_loc[i]
         y_purp_dense[i, indices_in_unified] = all_y_purp[i]
-        y_mode_dense[i, indices_in_unified] = all_y_mode[i]  # NEW: Fill mode tensor
+        y_mode_dense[i, indices_in_unified] = all_y_mode[i]
+        y_purp_feat_dense[i, indices_in_unified] = all_y_purp_feat[i]
+        y_mode_feat_dense[i, indices_in_unified] = all_y_mode_feat[i]
         importance_mask[i, indices_in_unified] = all_imp_weights[i]
         
-        # Only overwrite with 1s if we are not training on all points
         if not config.train_on_interpolated_points:
             loss_mask[i, indices_in_unified] = 1.0
-        else:
-            # When training on all points, we still need to know the real locations
-            # for the anchor-based interpolation. We can reuse the y_loc_dense
-            # where -1 indicates an interpolated point.
-            pass
-
 
         real_indices = (y_loc_dense[i] != -1).nonzero().squeeze(-1)
         if len(real_indices) == 0:
@@ -74,21 +79,16 @@ def unify_and_interpolate_batch(batch):
 
         # Vectorized calculation of previous and next real indices
         arange_vec = torch.arange(unified_len, device=device)
-        # For each point in the timeline, find the insertion point into the list of real indices
-        # 'right=True' finds the index of the *next* real point
         next_indices_in_real = torch.searchsorted(real_indices, arange_vec, side='right')
-        # 'side=left' gives the index of the *previous* real point, but we need to subtract 1
         prev_indices_in_real = torch.searchsorted(real_indices, arange_vec, side='left') - 1
-
-        # Clamp to ensure we don't go out of bounds
+        
         next_indices_in_real = torch.clamp(next_indices_in_real, 0, len(real_indices) - 1)
         prev_indices_in_real = torch.clamp(prev_indices_in_real, 0, len(real_indices) - 1)
         
-        # Use the computed indices to get the actual indices in the unified timeline
         prev_real_indices[i] = real_indices[prev_indices_in_real]
         next_real_indices[i] = real_indices[next_indices_in_real]
 
-        # Intelligently fill purpose IDs
+        # Intelligently fill purpose and mode IDs for interpolated points
         if len(real_indices) > 1:
             for j in range(len(real_indices) - 1):
                 start_idx, end_idx = real_indices[j], real_indices[j+1]
@@ -97,16 +97,11 @@ def unify_and_interpolate_batch(batch):
                     fill_value = travel_purpose_id if start_purp != end_purp else start_purp.item()
                     y_purp_dense[i, start_idx + 1 : end_idx] = fill_value
                     
-                    # Intelligently fill mode IDs
                     start_mode, end_mode = y_mode_dense[i, start_idx], y_mode_dense[i, end_idx]
-                    # If we're transitioning between different purposes, use the transition mode
-                    # Otherwise, stay in the current mode
                     if start_purp != end_purp:
-                        # Find the actual mode used in this transition from the real data points
                         transition_mode = start_mode.item() if start_mode != stay_mode_id else end_mode.item()
                         y_mode_dense[i, start_idx + 1 : end_idx] = transition_mode
                     else:
-                        # Same purpose, so stay in same mode
                         y_mode_dense[i, start_idx + 1 : end_idx] = start_mode.item()
 
     # Combine the masks here to create the final weight mask
@@ -118,6 +113,8 @@ def unify_and_interpolate_batch(batch):
         'y_loc_dense': y_loc_dense,
         'y_purp_dense': y_purp_dense,
         'y_mode_dense': y_mode_dense,
+        'y_purp_feat_dense': y_purp_feat_dense,
+        'y_mode_feat_dense': y_mode_feat_dense,
         'loss_mask': final_loss_mask,
         'prev_real_indices': prev_real_indices,
         'next_real_indices': next_real_indices,
@@ -128,4 +125,4 @@ def unify_and_interpolate_batch(batch):
         'num_zones': batch[0]['num_zones'],
         'purpose_groups': config.purpose_groups,
         'person_names': [s['person_name'] for s in batch]
-    } 
+    }

@@ -12,6 +12,12 @@ from ananke_abm.data_generator.mock_2p import (
     create_sarah, create_marcus
 )
 from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
+from ananke_abm.data_generator.feature_engineering import (
+    get_purpose_features,
+    get_mode_features,
+    PURPOSE_ID_MAP,
+    MODE_ID_MAP,
+)
 from ananke_abm.models.latent_ode.config import GenerativeODEConfig
 from torch.utils.data import Dataset
 
@@ -45,37 +51,33 @@ class DataProcessor:
         # Define the mapping from detailed activities to broader categories
         self.activity_to_group = {
             # Home activities
-            "sleep": "Home", "morning_routine": "Home", "evening": "Home", 
-            "dinner": "Home", "arrive_home": "Home",
+            "sleep": "home", "morning_routine": "home", "evening": "home", 
+            "dinner": "home", "arrive_home": "home",
             # Work/Education
-            "work": "Work/Education", "arrive_work": "Work/Education", "end_work": "Work/Education",
+            "work": "work", "arrive_work": "work", "end_work": "work",
             # Subsistence
-            "lunch": "Subsistence", "lunch_start": "Subsistence", "lunch_end": "Subsistence",
+            "lunch": "shopping", "lunch_start": "shopping", "lunch_end": "shopping", # Simplified to shopping
             # Leisure & Recreation
-            "gym": "Leisure & Recreation", "gym_end": "Leisure & Recreation", 
-            "exercise": "Leisure & Recreation", "leaving_park": "Leisure & Recreation",
+            "gym": "social", "gym_end": "social", # Simplified to social
+            "exercise": "social", "leaving_park": "social",
             # Social
-            "social": "Social", "leaving_social": "Social", "dinner_social": "Social",
+            "social": "social", "leaving_social": "social", "dinner_social": "social",
             # Travel/Transit
-            "prepare_commute": "Travel/Transit", "start_commute": "Travel/Transit",
-            "transit": "Travel/Transit", "leaving_home": "Travel/Transit",
-            "break": "Travel/Transit",
+            "prepare_commute": "travel", "start_commute": "travel",
+            "transit": "travel", "leaving_home": "travel",
+            "break": "travel",
         }
-        self.purpose_map = {name: i for i, name in enumerate(self.config.purpose_groups)}
+        self.purpose_map = PURPOSE_ID_MAP
         
         # --- Mode Processing ---
         # Define the mapping from travel modes to mode IDs
-        self.mode_map = {
-            "Stay": 0,
-            "Walk": 1, 
-            "Car": 2,
-            "Public_Transit": 3
-        }
+        self.mode_map = MODE_ID_MAP
 
     def get_data(self, person_id):
         """
         Processes mock data for a single person, resampling it to a uniform time grid.
-        Now includes sequences of purpose IDs and mode IDs for loss calculation.
+        Now includes sequences of purpose IDs and mode IDs for loss calculation,
+        as well as rich feature vectors for model input.
         """
         if person_id == 1:
             schedule = create_sarah_daily_pattern()
@@ -95,18 +97,20 @@ class DataProcessor:
         travel_modes = data["travel_modes"]
         
         # --- Create the target sequence of purpose IDs ---
-        # The `activities` list directly corresponds to the `zone_observations`
         target_purpose_ids = torch.tensor(
-            [self.purpose_map[self.activity_to_group.get(act, "Travel/Transit")] for act in activities],
+            [self.purpose_map[self.activity_to_group.get(act, "travel")] for act in activities],
             dtype=torch.long
         ).to(self.device)
         
         # --- Create the target sequence of mode IDs ---
-        # The `travel_modes` list directly corresponds to the `zone_observations`
         target_mode_ids = torch.tensor(
-            [self.mode_map.get(mode, 0) for mode in travel_modes],
+            [self.mode_map.get(mode.lower(), self.mode_map["stay"]) for mode in travel_modes],
             dtype=torch.long
         ).to(self.device)
+
+        # --- Create rich feature vectors from IDs ---
+        target_purpose_features = torch.stack([get_purpose_features(pid.item()) for pid in target_purpose_ids]).to(self.device)
+        target_mode_features = torch.stack([get_mode_features(mid.item()) for mid in target_mode_ids]).to(self.device)
 
         # Convert importance strings to numerical weights
         importance_weights = [
@@ -118,9 +122,7 @@ class DataProcessor:
         home_zone_features = zone_features[data['home_zone_id']]
         work_zone_features = zone_features[data['work_zone_id']]
         
-        # Create adjacency matrix for the physics mask
         adjacency_matrix = torch.tensor(nx.to_numpy_array(self.zone_graph), dtype=torch.float32, device=self.device)
-        # Add self-loops to allow staying in the same zone
         adjacency_matrix.fill_diagonal_(1)
 
         return {
@@ -129,10 +131,12 @@ class DataProcessor:
             "trajectory_y": data["zone_observations"].to(self.device),
             "target_purpose_ids": target_purpose_ids,
             "target_mode_ids": target_mode_ids,
+            "target_purpose_features": target_purpose_features,
+            "target_mode_features": target_mode_features,
             "importance_weights": torch.tensor(importance_weights, dtype=torch.float32, device=self.device),
             "num_zones": len(self.zones_raw),
             "person_name": data['person_name'],
             "home_zone_features": home_zone_features,
             "work_zone_features": work_zone_features,
             "all_zone_features": zone_features,
-        } 
+        }
