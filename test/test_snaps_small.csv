@@ -1,0 +1,14 @@
+person_id,timestamp,location,purpose,anchor
+1,8.0,Riverside Apartments,home,1
+1,9.0,Riverside Apartments,home,0
+1,9.5,Tech Business Park,work,0
+1,17.0,Tech Business Park,work,0
+1,17.5,Riverside Apartments,home,0
+1,23.0,Riverside Apartments,home,1
+2,7.0,Downtown Residential,home,1
+2,8.0,Downtown Residential,home,0
+2,8.5,Grand Mall,education,0
+2,16.0,Grand Mall,education,0
+2,16.5,Downtown Residential,home,0
+2,22.0,Downtown Residential,home,1
+
