@@ -92,7 +92,7 @@ class ModeFromPathHead(nn.Module):
 
     def forward(self, p_slice, v_slice, t_slice):
         # 1. Compute Descriptors
-        delta_t = (t_slice[-1] - t_slice[0]) / 60.0 # Duration in hours
+        delta_t = t_slice[-1] - t_slice[0] # Duration in hours
         arc_length = torch.sum(torch.norm(p_slice[1:] - p_slice[:-1], p=2, dim=-1))
         
         # --- New Richer Descriptors ---
@@ -103,9 +103,9 @@ class ModeFromPathHead(nn.Module):
         speed_variance = torch.var(speeds)
 
         # Calculate heading change rate
-        v_norm = F.normalize(v_slice, p=2, dim=-1)
-        # Clamp to avoid acos errors from floating point inaccuracies
-        dot_products = torch.clamp((v_norm[:-1] * v_norm[1:]).sum(dim=-1), -1.0, 1.0)
+        v_norm = F.normalize(v_slice, p=2, dim=-1, eps=1e-8) # Use eps for safety
+        # Clamp to avoid acos errors from floating point inaccuracies and ensure safe gradient
+        dot_products = torch.clamp((v_norm[:-1] * v_norm[1:]).sum(dim=-1), -1.0 + 1e-6, 1.0 - 1e-6)
         heading_changes = torch.acos(dot_products)
         total_heading_change = heading_changes.sum()
         heading_change_rate = total_heading_change / delta_t.clamp(min=1e-6)
