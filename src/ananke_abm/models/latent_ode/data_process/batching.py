@@ -31,6 +31,8 @@ def sde_collate_fn(batch):
 
     loc_emb_union = torch.zeros((batch_size, s_gt, d_loc), dtype=torch.float32)
     purp_emb_union = torch.zeros((batch_size, s_gt, d_purp), dtype=torch.float32)
+    loc_ids_union = torch.full((batch_size, s_gt), -100, dtype=torch.long) # Use ignore_index
+    purp_ids_union = torch.full((batch_size, s_gt), -100, dtype=torch.long) # Use ignore_index
     is_gt_union = torch.zeros((batch_size, s_gt), dtype=torch.float32)
     anchor_union = torch.zeros((batch_size, s_gt), dtype=torch.float32)
 
@@ -38,6 +40,8 @@ def sde_collate_fn(batch):
         person_gt_times = batch[i]['gt_times']
         person_gt_indices = torch.searchsorted(gt_union, person_gt_times)
         
+        loc_ids_union[i, person_gt_indices] = batch[i]['gt_loc_ids']
+        purp_ids_union[i, person_gt_indices] = batch[i]['gt_purp_ids']
         is_gt_union[i, person_gt_indices] = 1.0
         anchor_union[i, person_gt_indices] = batch[i]['gt_anchor']
 
@@ -83,7 +87,9 @@ def sde_collate_fn(batch):
         'is_gt_grid': is_gt_grid,
         'gt_union_times': gt_union,
         'loc_emb_union': loc_emb_union,
+        'loc_ids_union': loc_ids_union,
         'purp_emb_union': purp_emb_union,
+        'purp_ids_union': purp_ids_union,
         'is_gt_union': is_gt_union,
         'anchor_union': anchor_union,
         'union_to_dense': union_to_dense,

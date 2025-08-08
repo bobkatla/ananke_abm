@@ -1,10 +1,11 @@
 """
-Model architecture for the Generative Latent ODE.
+Model architecture for the Generative Latent ODE, updated for segment-based mode prediction.
 """
 import torch
 import torch.nn as nn
-from torchdiffeq import odeint
 from torchsde import sdeint
+
+from ananke_abm.data_generator.feature_engineering import get_mode_features, MODE_ID_MAP
 
 class ResidualBlock(nn.Module):
     """A residual block with two linear layers and a skip connection."""
@@ -18,30 +19,17 @@ class ResidualBlock(nn.Module):
 
 class ODEFunc(nn.Module):
     """
-    The dynamics function for the conditional SDE.
-    If configured as a second-order system, it models acceleration dv/dt = a(p,v,t).
-    Otherwise, it models velocity dp/dt = f(p,t).
+    The dynamics function for the SDE. Models dv/dt = a(p,v,h,t).
+    The state p = [loc_emb, purp_emb] is now simpler.
     """
     def __init__(self, config, state_dim, position_dim, hidden_dim, num_residual_blocks):
         super().__init__()
         self.config = config
         self.state_dim = state_dim
-        self.position_dim = position_dim
 
-        # Define which column in the feature vectors corresponds to our physical constraints
-        self.IS_MOVING_DIM = 0      # from mode features
-        self.IS_STATIONARY_DIM = 0  # from purpose features
-
-        # Core network to learn the main dynamics
-        # The input is the full state [s] and the conditioning variable [h]
-        if self.config.use_second_order_sde:
-            # Input: [p, v, h, t]
-            net_input_dim = self.state_dim + config.hidden_dim + 2 
-            net_output_dim = self.position_dim # learns acceleration
-        else:
-            # Input: [p, h, t]
-            net_input_dim = self.state_dim + config.hidden_dim + 2
-            net_output_dim = self.position_dim # learns velocity
+        # Input to the dynamics network: [p, v, h, t]
+        net_input_dim = state_dim + config.hidden_dim + 2 
+        net_output_dim = position_dim # Learns acceleration dv/dt
             
         self.net = nn.Sequential(
             nn.Linear(net_input_dim, hidden_dim),
@@ -53,86 +41,72 @@ class ODEFunc(nn.Module):
         self.noise_type = "diagonal"
         self.sde_type = "ito"
 
-    def _calculate_potential(self, position):
-        """
-        Calculates a penalty potential for forbidden state combinations.
-        The state is physically implausible if (is_moving and is_stationary) 
-        or (not is_moving and not is_stationary).
-        A simple potential is (is_moving - (1 - is_stationary))^2.
-        """
-        slice_dims = [
-            self.config.zone_embed_dim, 
-            self.config.purpose_feature_dim, 
-            self.config.mode_feature_dim
-        ]
-        _, purpose_features, mode_features = torch.split(position, slice_dims, dim=-1)
-        
-        is_moving_prob = torch.sigmoid(mode_features[..., self.IS_MOVING_DIM])
-        is_stationary_prob = torch.sigmoid(purpose_features[..., self.IS_STATIONARY_DIM])
-        
-        potential = (is_moving_prob - (1.0 - is_stationary_prob))**2
-        return potential.sum()
-
-
     def forward(self, t, y):
-        """
-        Calculates dy/dt for the combined state y = [state, h].
-        """
-        y.requires_grad_(True)
+        """Calculates dy/dt for the combined state y = [state, h]."""
         state, h = torch.split(y, [self.state_dim, self.config.hidden_dim], dim=-1)
         
         batch_size = state.shape[0]
-        if t.dim() == 0: t = t.expand(1)
-        t_vec = torch.cat([torch.sin(t * 2 * torch.pi / 24), torch.cos(t * 2 * torch.pi / 24)]).expand(batch_size, -1)
+        t_vec = torch.stack([torch.sin(t * 2 * torch.pi / 24), torch.cos(t * 2 * torch.pi / 24)]).expand(batch_size, -1)
 
-        if self.config.use_second_order_sde:
-            p, v = torch.split(state, self.position_dim, dim=-1)
-            dp_dt = v
-            dv_dt = self.net(torch.cat([p, v, h, t_vec], dim=-1))
-            
-            potential = self._calculate_potential(p)
-            if torch.any(potential > 0):
-                constraint_accel = -torch.autograd.grad(potential.sum(), p, create_graph=True)[0]
-                final_dv_dt = dv_dt + self.config.correction_strength * constraint_accel
-            else:
-                final_dv_dt = dv_dt
-            
-            d_state = torch.cat([dp_dt, final_dv_dt], dim=-1)
-
-        else: # First-order system
-            p = state
-            dp_dt = self.net(torch.cat([p, h, t_vec], dim=-1))
-            
-            potential = self._calculate_potential(p)
-            if torch.any(potential > 0):
-                constraint_vel = -torch.autograd.grad(potential.sum(), p, create_graph=True)[0]
-                final_dp_dt = dp_dt + self.config.correction_strength * constraint_vel
-            else:
-                final_dp_dt = dp_dt
-            
-            d_state = final_dp_dt
+        p, v = torch.split(state, self.state_dim // 2, dim=-1)
+        dp_dt = v
+        dv_dt = self.net(torch.cat([p, v, h, t_vec], dim=-1))
+        d_state = torch.cat([dp_dt, dv_dt], dim=-1)
         
-        # The conditioning variable h is constant, so its derivative is zero.
         d_h = torch.zeros_like(h)
         return torch.cat([d_state, d_h], dim=-1)
 
     def g(self, t, y):
-        """Diffusion function for SDE. Noise is only applied to the state."""
-        state, h = torch.split(y, [self.state_dim, self.config.hidden_dim], dim=-1)
-        
-        state_noise = torch.full_like(state, self.config.sde_noise_strength)
-        h_noise = torch.zeros_like(h)
-        
+        """Diffusion function for SDE."""
+        state_noise = torch.full((y.shape[0], self.state_dim), self.config.sde_noise_strength, device=y.device)
+        h_noise = torch.zeros((y.shape[0], self.config.hidden_dim), device=y.device)
         return torch.cat([state_noise, h_noise], dim=-1)
 
     def f(self, t, y):
-        """Drift function for SDE (just a wrapper for forward)."""
+        """Drift function for SDE."""
         return self.forward(t, y)
+
+class ModeFromPathHead(nn.Module):
+    """
+    Predicts travel mode from latent path segment descriptors.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # Descriptors: delta_t, arc_length
+        descriptor_dim = 2 
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(descriptor_dim, config.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(config.hidden_dim, config.mode_feature_dim)
+        )
+
+        # Register mode prototypes as non-trainable buffers
+        mode_protos = torch.stack([get_mode_features(mid) for mid in sorted(MODE_ID_MAP.values())])
+        self.register_buffer("mode_prototypes", mode_protos)
+
+    def forward(self, p_slice, v_slice, t_slice):
+        # 1. Compute descriptors
+        delta_t = (t_slice[-1] - t_slice[0]) / 60.0 # Duration in hours
+        arc_length = torch.sum(torch.norm(p_slice[1:] - p_slice[:-1], p=2, dim=-1))
+        
+        x_seg = torch.stack([delta_t, arc_length], dim=-1)
+
+        # 2. Map descriptor to mode feature space
+        h = self.mlp(x_seg)
+        
+        # 3. Score against prototypes
+        # Logits are negative squared distance: shape (num_modes,)
+        logits = -torch.sum((h.unsqueeze(0) - self.mode_prototypes).pow(2), dim=1)
+        
+        return logits, h
 
 class GenerativeODE(nn.Module):
     """
-    A conditional, autoregressive Latent SDE model where the latent state
-    includes rich feature vectors for purpose and mode, which are evolved directly.
+    Conditional Latent SDE model with state = [loc_emb, purp_emb]
+    and a separate head for segment-based mode prediction.
     """
     def __init__(self, person_feat_dim, num_zone_features, config):
         super().__init__()
@@ -140,17 +114,16 @@ class GenerativeODE(nn.Module):
         
         self.zone_feature_encoder = nn.Linear(num_zone_features, config.zone_embed_dim)
 
-        # The encoder produces the initial hidden state h(0)
-        encoder_input_dim = person_feat_dim + config.zone_embed_dim * 2 + config.purpose_feature_dim + config.mode_feature_dim
-        encoder_output_dim = config.hidden_dim * 2 # mu and log_var for h0
+        # Encoder input: static features + initial purpose
+        encoder_input_dim = person_feat_dim + config.zone_embed_dim * 2 + config.purpose_feature_dim
         self.encoder = nn.Sequential(
             nn.Linear(encoder_input_dim, config.encoder_hidden_dim),
             nn.ReLU(),
-            nn.Linear(config.encoder_hidden_dim, encoder_output_dim),
+            nn.Linear(config.encoder_hidden_dim, config.hidden_dim * 2),
         )
         
-        self.position_dim = config.zone_embed_dim + config.purpose_feature_dim + config.mode_feature_dim
-        self.state_dim = self.position_dim * 2 if config.use_second_order_sde else self.position_dim
+        self.position_dim = config.zone_embed_dim + config.purpose_feature_dim
+        self.state_dim = self.position_dim * 2  # Second-order system: [p, v]
         
         self.ode_func = ODEFunc(
             config=config,
@@ -160,61 +133,72 @@ class GenerativeODE(nn.Module):
             num_residual_blocks=config.num_residual_blocks
         )
         
+        # Decoders for snap-level predictions (state only)
         self.decoder_loc = nn.Linear(config.zone_embed_dim, config.zone_embed_dim)
         self.decoder_purpose = nn.Linear(config.purpose_feature_dim, len(config.purpose_groups))
-        self.decoder_mode = nn.Linear(config.mode_feature_dim, config.num_modes)
+        
+        # New head for segment-level mode prediction
+        self.mode_predictor = ModeFromPathHead(config)
 
     def forward(self, person_features, home_zone_features, work_zone_features, 
-                initial_purpose_features, initial_mode_features,
-                times, all_zone_features):
+                initial_purpose_features, times, all_zone_features):
         
-        candidate_zone_embeds = self.zone_feature_encoder(all_zone_features)
         home_embed = self.zone_feature_encoder(home_zone_features)
         work_embed = self.zone_feature_encoder(work_zone_features)
         
-        # 1. ENCODER: Get initial hidden state h(0) from all static features
-        encoder_input = torch.cat([
-            person_features, home_embed, work_embed, 
-            initial_purpose_features, initial_mode_features
-        ], dim=-1)
+        # 1. ENCODER: Get initial hidden state h(0)
+        encoder_input = torch.cat([person_features, home_embed, work_embed, initial_purpose_features], dim=-1)
         h0_mu, h0_log_var = self.encoder(encoder_input).split(self.config.hidden_dim, dim=-1)
         h0 = h0_mu + torch.exp(0.5 * h0_log_var) * torch.randn_like(h0_mu)
         
-        # 2. INITIAL STATE: Construct the initial position p(0) and full state s(0)
-        p0 = torch.cat([home_embed, initial_purpose_features, initial_mode_features], dim=-1)
-        s0 = torch.cat([p0, torch.zeros_like(p0)], dim=-1) if self.config.use_second_order_sde else p0
+        # 2. INITIAL STATE: p(0) = [loc_emb, purp_emb], v(0) = 0
+        p0 = torch.cat([home_embed, initial_purpose_features], dim=-1)
+        s0 = torch.cat([p0, torch.zeros_like(p0)], dim=-1)
 
-        # Combine s0 and h0 into a single tensor for the solver
         y0 = torch.cat([s0, h0], dim=-1)
         
-        # 3. SOLVER: Evolve the combined state y(t) over time
-        with torch.enable_grad():
-            options = {'dtype': torch.float32}
-            if self.config.enable_sde:
-                pred_y_path = sdeint(self.ode_func, y0, times, method='euler', dt=0.01, options=options)
-            else:
-                pred_y_path = odeint(self.ode_func, y0, times, method=self.config.ode_method, options=options)
+        # 3. SOLVER: Evolve the combined state y(t)
+        options = {'dtype': torch.float32}
+        pred_y_path = sdeint(self.ode_func, y0, times, method='euler', dt=1.0, options=options).permute(1, 0, 2)
         
-        # Transpose to [batch, time, feature]
-        pred_y = pred_y_path.permute(1, 0, 2)
+        # 4. DECODE SNAPS: Split path and decode location/purpose at snap times
+        pred_s, _ = torch.split(pred_y_path, [self.state_dim, self.config.hidden_dim], dim=-1)
+        pred_p, pred_v = torch.split(pred_s, self.position_dim, dim=-1)
         
-        # 4. DECODE: Split the path back into the evolved state and the (constant) h
-        pred_s, _ = torch.split(pred_y, [self.state_dim, self.config.hidden_dim], dim=-1)
-        pred_p = torch.split(pred_s, self.position_dim, dim=-1)[0] if self.config.use_second_order_sde else pred_s
+        slice_dims = [self.config.zone_embed_dim, self.config.purpose_feature_dim]
+        pred_loc_embed, pred_purpose_features = torch.split(pred_p, slice_dims, dim=-1)
         
-        slice_dims = [self.config.zone_embed_dim, self.config.purpose_feature_dim, self.config.mode_feature_dim]
-        pred_y_loc_embed, pred_purpose_features, pred_mode_features = torch.split(pred_p, slice_dims, dim=-1)
+        candidate_zone_embeds = self.zone_feature_encoder(all_zone_features)
+        target_loc_embeds = self.decoder_loc(pred_loc_embed)
+        # Transpose candidate_zone_embeds for matmul: (D_zone, Z)
+        pred_loc_logits = torch.matmul(target_loc_embeds, candidate_zone_embeds.t())
         
-        # 5. PREDICT: Get final logits for classification
-        target_loc_embeds = self.decoder_loc(pred_y_loc_embed)
-        pred_y_loc_logits = torch.einsum('bsd,zd->bsz', target_loc_embeds, candidate_zone_embeds)
-        
-        pred_y_purp_logits = self.decoder_purpose(pred_purpose_features)
-        pred_y_mode_logits = self.decoder_mode(pred_mode_features)
+        pred_purp_logits = self.decoder_purpose(pred_purpose_features)
         
         return (
-            pred_y_loc_logits, pred_y_loc_embed, 
-            pred_y_purp_logits, pred_y_mode_logits, 
-            pred_purpose_features, pred_mode_features,
+            pred_loc_logits, pred_loc_embed, 
+            pred_purp_logits, pred_purpose_features,
+            pred_p, pred_v, # Return full path for segment processing
             h0_mu, h0_log_var
         )
+
+    def predict_mode_from_segments(self, pred_p, pred_v, grid_times, segments_batch):
+        """Processes a batch of segments to predict travel modes."""
+        all_logits = []
+        all_h = []
+
+        for seg in segments_batch:
+            b, i0, i1 = seg['b'], seg['i0'], seg['i1']
+            
+            p_slice = pred_p[b, i0:i1+1]
+            v_slice = pred_v[b, i0:i1+1]
+            t_slice = grid_times[i0:i1+1]
+
+            logits, h = self.mode_predictor(p_slice, v_slice, t_slice)
+            all_logits.append(logits)
+            all_h.append(h)
+        
+        if not all_logits: # Handle cases with no travel segments in batch
+            return torch.empty(0, self.config.num_modes), torch.empty(0, self.config.mode_feature_dim)
+
+        return torch.stack(all_logits), torch.stack(all_h)

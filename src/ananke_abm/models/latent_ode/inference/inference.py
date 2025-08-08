@@ -1,288 +1,106 @@
 """
-Scalable inference module for the Generative Latent ODE model.
-Provides batched inference capabilities for processing thousands of people efficiently.
+Inference module for the SDE model with segment-based mode prediction.
 """
 import torch
 import numpy as np
-from pathlib import Path
 from typing import List, Dict, Optional
-import time
 
 from ananke_abm.models.latent_ode.config import GenerativeODEConfig
 from ananke_abm.models.latent_ode.data_process.data import DataProcessor
 from ananke_abm.models.latent_ode.architecture.model import GenerativeODE
 
-class BatchedInferenceEngine:
-    """
-    High-performance batched inference engine for the Generative ODE model.
-    Designed to process thousands of people simultaneously.
-    """
-    
+STAY_VELOCITY_THRESHOLD = 0.1
+
+class InferenceEngine:
     def __init__(self, model_path: str, config: Optional[GenerativeODEConfig] = None, device: str = "auto"):
-        """
-        Initialize the batched inference engine.
-        
-        Args:
-            model_path: Path to trained model weights
-            config: Model configuration (uses default if None)
-            device: Device to use ("auto", "cpu", "cuda")
-        """
         self.config = config or GenerativeODEConfig()
-        
-        # Device selection
-        if device == "auto":
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = torch.device(device)
-            
-        print(f"🔬 Inference engine using device: {self.device}")
-        
-        # Initialize data processor
-        self.processor = DataProcessor(self.device, self.config)
-        
-        # Load model
+        self.device = torch.device("cuda" if torch.cuda.is_available() and device == "auto" else "cpu")
+        self.processor = DataProcessor(self.device)
         self._load_model(model_path)
-        
+
     def _load_model(self, model_path: str):
-        """Load the trained model."""
-        # Get dimensions from sample data
-        init_data = self.processor.get_data(person_id=1)
+        sample_data = self.processor.get_data(person_id=1)
+        person_feat_dim = 8 # Placeholder
         
         self.model = GenerativeODE(
-            person_feat_dim=init_data["person_features"].shape[-1],
-            num_zone_features=init_data["all_zone_features"].shape[-1],
+            person_feat_dim=person_feat_dim,
+            num_zone_features=sample_data['gt_loc_emb'].shape[-1],
             config=self.config,
         ).to(self.device)
-        
-        # Load weights
-        model_path = Path(model_path)
-        if not model_path.exists():
-            raise FileNotFoundError(f"Model not found at {model_path}")
-            
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval()
-        print(f"✅ Model loaded from {model_path}")
-        
-        # Cache zone features for efficiency
-        sample_data = self.processor.get_data(person_id=1)
-        self.all_zone_features = sample_data["all_zone_features"]
-        
-    def batch_inference(self, person_ids: List[int], times: torch.Tensor, 
-                       batch_size: int = 64) -> Dict[str, torch.Tensor]:
-        """
-        Perform batched inference on multiple people.
-        
-        Args:
-            person_ids: List of person IDs to process
-            times: Time points for trajectory generation [num_times]
-            batch_size: Number of people to process simultaneously
-            
-        Returns:
-            Dictionary with predictions for all people
-        """
-        all_predictions = {
-            'location_logits': [],
-            'purpose_logits': [], 
-            'mode_logits': [],
-            'person_names': []
-        }
-        
-        num_people = len(person_ids)
-        print(f"🚀 Starting batched inference for {num_people} people (batch_size={batch_size})")
-        
+
+    def predict_trajectories(self, person_ids: List[int], time_resolution: int = 500) -> List[Dict]:
+        """Generates full itineraries (stays and trips) for a list of people."""
+        itineraries = []
         with torch.no_grad():
-            for batch_start in range(0, num_people, batch_size):
-                batch_end = min(batch_start + batch_size, num_people)
-                current_batch_ids = person_ids[batch_start:batch_end]
+            for person_id in person_ids:
+                data = self.processor.get_data(person_id)
+                times = torch.linspace(0, 24 * 60, time_resolution).to(self.device)
                 
-                print(f"   Processing batch {batch_start//batch_size + 1}/{(num_people-1)//batch_size + 1}: people {batch_start+1}-{batch_end}")
-                
-                # Process current batch
-                batch_predictions = self._process_batch(current_batch_ids, times)
-                
-                # Accumulate results
-                for key in ['location_logits', 'purpose_logits', 'mode_logits']:
-                    all_predictions[key].append(batch_predictions[key])
-                all_predictions['person_names'].extend(batch_predictions['person_names'])
-        
-        # Concatenate all batches
-        final_predictions = {}
-        for key in ['location_logits', 'purpose_logits', 'mode_logits']:
-            final_predictions[key] = torch.cat(all_predictions[key], dim=0)
-        final_predictions['person_names'] = all_predictions['person_names']
-        final_predictions['times'] = times
-        
-        print(f"✅ Batched inference complete for {num_people} people")
-        return final_predictions
-    
-    def _process_batch(self, person_ids: List[int], times: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Process a single batch of people."""
-        
-        # Collect batch data
-        person_features_list = []
-        home_zone_features_list = []
-        work_zone_features_list = []
-        initial_purpose_features_list = []
-        initial_mode_features_list = []
-        person_names = []
-        
-        for person_id in person_ids:
-            data = self.processor.get_data(person_id=person_id)
-            person_features_list.append(data["person_features"])
-            home_zone_features_list.append(data["home_zone_features"])
-            work_zone_features_list.append(data["work_zone_features"])
-            # The model's encoder needs the features at the first time step
-            initial_purpose_features_list.append(data["target_purpose_features"][0])
-            initial_mode_features_list.append(data["target_mode_features"][0])
-            person_names.append(data["person_name"])
-        
-        # Stack into batch tensors
-        person_features_batch = torch.stack(person_features_list)
-        home_zone_features_batch = torch.stack(home_zone_features_list)
-        work_zone_features_batch = torch.stack(work_zone_features_list)
-        initial_purpose_features_batch = torch.stack(initial_purpose_features_list)
-        initial_mode_features_batch = torch.stack(initial_mode_features_list)
-        
-        # Single forward pass for entire batch
-        (
-            pred_y_logits, _, 
-            pred_purpose_logits, pred_mode_logits, 
-            _, _, _, _
-        ) = self.model(
-            person_features_batch,
-            home_zone_features_batch, 
-            work_zone_features_batch,
-            initial_purpose_features_batch,
-            initial_mode_features_batch,
-            times,
-            self.all_zone_features
-        )
-        
-        return {
-            'location_logits': pred_y_logits,
-            'purpose_logits': pred_purpose_logits,
-            'mode_logits': pred_mode_logits,
-            'person_names': person_names
-        }
-    
-    def predict_trajectories(self, person_ids: List[int], time_resolution: int = 100,
-                           batch_size: int = 64, times_to_predict: Optional[torch.Tensor] = None,
-                           num_samples: int = 1) -> Dict[str, np.ndarray]:
-        """
-        Generate predicted trajectories for multiple people.
+                # --- SDE Forward Pass ---
+                model_outputs = self.model(
+                    person_features=torch.randn(1, 8, device=self.device), # Placeholder
+                    home_zone_features=data['gt_loc_emb'][0].unsqueeze(0),
+                    work_zone_features=data['gt_loc_emb'][0].unsqueeze(0), # Simplification
+                    initial_purpose_features=data['gt_purp_emb'][0].unsqueeze(0),
+                    times=times,
+                    all_zone_features=data['gt_loc_emb'] # Simplification
+                )
+                pred_p, pred_v = model_outputs[4][0], model_outputs[5][0]
 
-        Args:
-            person_ids: List of person IDs to process
-            time_resolution: Number of time points (0-24 hours). Used if times_to_predict is None.
-            batch_size: Batch size for processing
-            times_to_predict: Specific time points to predict at.
-            num_samples: The number of different trajectories to generate for each person.
+                # --- Itinerary Assembly ---
+                itinerary = self._assemble_itinerary(pred_p, pred_v, times)
+                itineraries.append({"person_id": person_id, "itinerary": itinerary})
+        return itineraries
 
-        Returns:
-            Dictionary with trajectory predictions as numpy arrays. Output shapes will have a new
-            `num_samples` dimension, e.g., locations will be [num_people, num_samples, num_times].
-        """
-        if times_to_predict is not None:
-            times = times_to_predict.to(self.device)
-        else:
-            times = torch.linspace(0, 24, time_resolution).to(self.device)
-
-        all_samples_loc = []
-        all_samples_purp = []
-        all_samples_mode = []
-
-        for i in range(num_samples):
-            print(f"   Generating sample {i+1}/{num_samples}...")
-            # Get predictions
-            predictions = self.batch_inference(person_ids, times, batch_size)
-
-            # Convert to discrete predictions
-            pred_locations = torch.argmax(predictions['location_logits'], dim=-1)
-            pred_purposes = torch.argmax(predictions['purpose_logits'], dim=-1)
-            pred_modes = torch.argmax(predictions['mode_logits'], dim=-1)
-
-            all_samples_loc.append(pred_locations)
-            all_samples_purp.append(pred_purposes)
-            all_samples_mode.append(pred_modes)
-
-        # Stack samples to create a new dimension
-        final_locations = torch.stack(all_samples_loc, dim=1).cpu().numpy()
-        final_purposes = torch.stack(all_samples_purp, dim=1).cpu().numpy()
-        final_modes = torch.stack(all_samples_mode, dim=1).cpu().numpy()
-
-        return {
-            'times': times.cpu().numpy(),
-            'locations': final_locations,  # [num_people, num_samples, num_times]
-            'purposes': final_purposes,    # [num_people, num_samples, num_times]
-            'modes': final_modes,         # [num_people, num_samples, num_times]
-            'person_names': predictions['person_names'] # This will be the same for all samples
-        }
-    
-    def benchmark_performance(self, num_people_list: List[int] = [1, 10, 50, 100], 
-                            batch_size: int = 64, time_resolution: int = 100):
-        """
-        Benchmark inference performance at different scales.
+    def _assemble_itinerary(self, p_path, v_path, times):
+        """Identifies stays and trips from a latent path."""
+        velocities = torch.norm(v_path, p=2, dim=-1)
+        is_staying = (velocities < STAY_VELOCITY_THRESHOLD).cpu().numpy()
         
-        Args:
-            num_people_list: List of population sizes to test
-            batch_size: Batch size for processing
-            time_resolution: Number of time points
-        """
-        print("🏁 Performance Benchmarking")
-        print("=" * 50)
+        itinerary = []
+        current_segment = None
+
+        for t_idx in range(len(times)):
+            if is_staying[t_idx]:
+                if current_segment is None or current_segment['type'] == 'travel':
+                    # Start of a new stay
+                    if current_segment is not None: itinerary.append(current_segment)
+                    current_segment = {'type': 'stay', 'start_time': times[t_idx].item(), 'path_indices': [t_idx]}
+                else:
+                    # Continue existing stay
+                    current_segment['path_indices'].append(t_idx)
+            else: # Traveling
+                if current_segment is None or current_segment['type'] == 'stay':
+                    # Start of a new travel
+                    if current_segment is not None: itinerary.append(current_segment)
+                    current_segment = {'type': 'travel', 'start_time': times[t_idx].item(), 'path_indices': [t_idx]}
+                else:
+                    # Continue existing travel
+                    current_segment['path_indices'].append(t_idx)
         
-        # Use available person IDs (cycling if needed)
-        available_ids = [1, 2]
+        if current_segment is not None:
+            itinerary.append(current_segment)
         
-        for num_people in num_people_list:
-            # Create person ID list (cycling through available IDs)
-            person_ids = [available_ids[i % len(available_ids)] for i in range(num_people)]
+        # Finalize segments
+        for seg in itinerary:
+            seg['end_time'] = times[seg['path_indices'][-1]].item()
+            path_slice = p_path[seg['path_indices']]
             
-            # Benchmark
-            start_time = time.time()
-            self.predict_trajectories(person_ids, time_resolution, batch_size)
-            end_time = time.time()
-            
-            # Calculate metrics
-            inference_time = end_time - start_time
-            people_per_second = num_people / inference_time
-            time_per_person = inference_time / num_people
-            
-            print(f"📊 {num_people:4d} people: {inference_time:6.2f}s total | {people_per_second:8.1f} people/s | {time_per_person*1000:6.1f}ms per person")
-        
-        print("=" * 50)
-        
-        # Project to 1M people
-        if len(num_people_list) >= 2:
-            # Estimate performance for 1M people based on largest test
-            largest_test = max(num_people_list)
-            largest_time = None
-            
-            # Re-run largest test for accurate timing
-            person_ids = [available_ids[i % len(available_ids)] for i in range(largest_test)]
-            start_time = time.time()
-            self.predict_trajectories(person_ids, time_resolution, batch_size)
-            largest_time = time.time() - start_time
-            
-            projected_time_1m = (largest_time / largest_test) * 1_000_000
-            projected_hours = projected_time_1m / 3600
-            
-            print(f"📈 Projected time for 1M people: {projected_time_1m:.0f}s ({projected_hours:.1f} hours)")
+            if seg['type'] == 'stay':
+                # For stays, determine location and purpose from average embedding
+                avg_embedding = path_slice.mean(dim=0)
+                loc_emb, purp_emb = torch.split(avg_embedding, [self.config.zone_embed_dim, self.config.purpose_feature_dim])
+                # Note: Reverse mapping from embedding to label is non-trivial, returning embeddings for now
+                seg['location_embedding'] = loc_emb.cpu().numpy()
+                seg['purpose_embedding'] = purp_emb.cpu().numpy()
+            else: # Travel
+                # For travel, predict mode
+                v_slice = v_path[seg['path_indices']]
+                t_slice = times[seg['path_indices']]
+                logits, h = self.model.mode_predictor(path_slice.unsqueeze(0), v_slice.unsqueeze(0), t_slice)
+                seg['mode_id'] = torch.argmax(logits, dim=-1).item()
+                seg['mode_embedding'] = h.squeeze(0).cpu().numpy()
 
-# Convenience function for quick inference
-def quick_inference(person_ids: List[int], model_path: str = "saved_models/mode_generative_ode_batched/latent_ode_best_model_batched.pth",
-                   batch_size: int = 64, time_resolution: int = 100) -> Dict[str, np.ndarray]:
-    """
-    Quick inference function for immediate use.
-    
-    Args:
-        person_ids: List of person IDs to process
-        model_path: Path to trained model
-        batch_size: Batch size for processing
-        time_resolution: Number of time points
-        
-    Returns:
-        Dictionary with trajectory predictions
-    """
-    engine = BatchedInferenceEngine(model_path)
-    return engine.predict_trajectories(person_ids, time_resolution, batch_size) 
+        return itinerary

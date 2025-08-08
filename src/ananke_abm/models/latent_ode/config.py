@@ -21,7 +21,7 @@ class GenerativeODEConfig:
     hidden_dim: int = 32
     encoder_hidden_dim: int = 64
     ode_hidden_dim: int = 128
-    zone_embed_dim: int = 8
+    zone_embed_dim: int = 7
     
     # New rich feature dimensions, set dynamically
     purpose_feature_dim: int = PURPOSE_FEAT_DIM
