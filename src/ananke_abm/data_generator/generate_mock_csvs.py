@@ -93,7 +93,7 @@ def build_person_periods(person, schedule, zone_data) -> List[Dict]:
                     "type": "travel",
                     "location": "travel",
                     "purpose": "travel",
-                    "mode": event["travel_mode"],
+                    "mode": event["travel_mode"].lower(),
                 }
             )
         i = j
