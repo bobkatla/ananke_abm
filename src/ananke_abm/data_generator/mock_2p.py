@@ -57,8 +57,8 @@ def create_sarah():
         has_car=True,
         
         # Location
-        home_zone=1,  # Riverside Apartments
-        work_zone=5   # Tech Business Park
+        home_zone="Riverside Apartments",
+        work_zone="Tech Business Park"
     )
 
 def create_marcus():
@@ -85,8 +85,8 @@ def create_marcus():
         has_car=False,  # No car
         
         # Location - Different zones
-        home_zone=3,  # Downtown Residential (high transit access)
-        work_zone=6   # Grand Mall (retail job)
+        home_zone="Downtown Residential",
+        work_zone="Grand Mall"
     )
 
 def create_sarah_daily_pattern():

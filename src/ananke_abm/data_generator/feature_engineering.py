@@ -42,12 +42,12 @@ def get_mode_features(mode_id: int) -> torch.Tensor:
     return torch.tensor(MODE_FEATURES[mode_name], dtype=torch.float32)
 
 
-def get_purpose_features(purpose_id: int) -> torch.Tensor:
-    """Returns the feature vector for a given purpose ID."""
-    purpose_name = ID_TO_PURPOSE_MAP.get(purpose_id)
-    if purpose_name is None:
-        raise ValueError(f"Invalid purpose_id: {purpose_id}")
-    return torch.tensor(PURPOSE_FEATURES[purpose_name], dtype=torch.float32)
+def get_purpose_features(purpose: str) -> torch.Tensor:
+    """Returns the feature vector for a given purpose name."""
+    features = PURPOSE_FEATURES.get(purpose)
+    if features is None:
+        raise ValueError(f"Invalid purpose name: {purpose}")
+    return torch.tensor(features, dtype=torch.float32)
 
 def get_feature_dimensions():
     """Returns the dimensions of the feature vectors."""

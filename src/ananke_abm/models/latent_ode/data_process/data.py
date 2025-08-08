@@ -41,7 +41,7 @@ class DataProcessor:
         self._load_and_process_data(periods_path, snaps_path, location_to_embedding)
 
     def _get_purpose_embeddings(self):
-        return {name: get_purpose_features(pid) for name, pid in PURPOSE_ID_MAP.items()}
+        return {name: get_purpose_features(name) for name in PURPOSE_ID_MAP.keys()}
     
     def _get_mode_embeddings(self):
         return {name: get_mode_features(mid) for name, mid in MODE_ID_MAP.items()}

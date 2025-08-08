@@ -10,7 +10,9 @@ from ananke_abm.models.latent_ode.data_process.data import DataProcessor, Latent
 from ananke_abm.models.latent_ode.architecture.model import GenerativeODE
 from ananke_abm.models.latent_ode.architecture.loss import calculate_snap_loss, calculate_segment_mode_loss
 from ananke_abm.models.latent_ode.data_process.batching import sde_collate_fn
+from ananke_abm.data_generator.feature_engineering import get_purpose_features
 from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
+from ananke_abm.data_generator.mock_2p import create_sarah, create_marcus
 
 
 def get_location_mappings():
@@ -34,6 +36,20 @@ def get_location_mappings():
     return location_to_embedding, location_name_to_id
 
 
+def get_person_features(person):
+    """Generates a normalized feature tensor for a person."""
+    return torch.tensor([
+        person.age / 100.0,
+        person.income / 100000.0,
+        1.0 if person.employment_status == "full_time" else 0.0,
+        1.0 if person.commute_preference == "car" else 0.0,
+        person.activity_flexibility,
+        person.social_tendency,
+        person.household_size / 10.0,
+        1.0 if person.has_car else 0.0
+    ], dtype=torch.float32)
+
+
 def train():
     """Orchestrates the training of the Generative SDE model."""
     config = GenerativeODEConfig()
@@ -49,11 +65,31 @@ def train():
 
 
     # --- Model Initialization ---
-    sample_batch = next(iter(data_loader))
     sample_data = processor.get_data(1)
     
-    # This needs a more robust way to get these dimensions
-    person_feat_dim = 8 # Hardcoded based on previous implementation
+    # --- Create consistent person and context features ---
+    sarah = create_sarah()
+    marcus = create_marcus()
+    person_features = torch.stack([
+        get_person_features(sarah),
+        get_person_features(marcus)
+    ]).to(device)
+    person_feat_dim = person_features.shape[1]
+    
+    home_zone_features = torch.stack([
+        location_to_embedding[sarah.home_zone],
+        location_to_embedding[marcus.home_zone]
+    ]).to(device)
+    
+    work_zone_features = torch.stack([
+        location_to_embedding[sarah.work_zone],
+        location_to_embedding[marcus.work_zone]
+    ]).to(device)
+
+    initial_purpose_features = torch.stack([
+        get_purpose_features("home"),
+        get_purpose_features("home") # Both start at home
+    ]).to(device)
     
     model = GenerativeODE(
         person_feat_dim=person_feat_dim,
@@ -78,10 +114,10 @@ def train():
             # --- Forward Pass ---
             # 1. SDE forward pass to get the latent path
             model_outputs = model(
-                person_features=torch.randn(2, person_feat_dim, device=device), # Placeholder
-                home_zone_features=batch['loc_emb_union'][:, 0, :], # Simplification
-                work_zone_features=batch['loc_emb_union'][:, 0, :], # Simplification
-                initial_purpose_features=batch['purp_emb_union'][:, 0, :],
+                person_features=person_features, 
+                home_zone_features=home_zone_features,
+                work_zone_features=work_zone_features, 
+                initial_purpose_features=initial_purpose_features,
                 times=batch['grid_times'],
                 all_zone_features=processor.location_embeddings
             )
@@ -107,7 +143,7 @@ def train():
                 config.kl_weight * kl_loss
             )
 
-            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
         if (i + 1) % 500 == 0:

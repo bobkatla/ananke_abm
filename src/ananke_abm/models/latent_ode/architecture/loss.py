@@ -46,13 +46,17 @@ def calculate_snap_loss(batch, model_outputs, model, distance_matrix, config):
         ignore_index=-100,
         reduction='none'
     ) * is_gt_mask
-    loss_purp_ce = loss_purp_ce.sum() / is_gt_mask.sum().clamp(min=1)
+    loss_purp_ce = (loss_purp_ce * is_gt_mask).sum() / is_gt_mask.sum().clamp(min=1)
     
-    # Feature Reconstruction MSE Loss
-    loss_loc_mse = F.mse_loss(pred_loc_embed_union, batch['loc_emb_union'], reduction='none').mean(dim=-1)
+    # --- Feature Reconstruction MSE Loss (on Normalized Embeddings) ---
+    pred_loc_embed_union_norm = F.normalize(pred_loc_embed_union, p=2, dim=-1)
+    gt_loc_emb_union_norm = F.normalize(batch['loc_emb_union'], p=2, dim=-1) # Normalize GT for fair comparison
+    loss_loc_mse = F.mse_loss(pred_loc_embed_union_norm, gt_loc_emb_union_norm, reduction='none').mean(dim=-1)
     loss_loc_mse = (loss_loc_mse * is_gt_mask).sum() / is_gt_mask.sum().clamp(min=1)
     
-    loss_purp_mse = F.mse_loss(pred_purpose_features_union, batch['purp_emb_union'], reduction='none').mean(dim=-1)
+    pred_purpose_features_union_norm = F.normalize(pred_purpose_features_union, p=2, dim=-1)
+    gt_purp_emb_union_norm = F.normalize(batch['purp_emb_union'], p=2, dim=-1)
+    loss_purp_mse = F.mse_loss(pred_purpose_features_union_norm, gt_purp_emb_union_norm, reduction='none').mean(dim=-1)
     loss_purp_mse = (loss_purp_mse * is_gt_mask).sum() / is_gt_mask.sum().clamp(min=1)
     
     # --- 2. KL Divergence ---
@@ -74,7 +78,9 @@ def calculate_segment_mode_loss(seg_logits, seg_h, segments_batch, config):
     # Mode CE Loss
     loss_mode_ce = F.cross_entropy(seg_logits, target_mode_ids)
 
-    # Mode Feature MSE Loss
-    loss_mode_feat = F.mse_loss(seg_h, target_mode_protos)
+    # Mode Feature MSE Loss (on Normalized Embeddings)
+    seg_h_norm = F.normalize(seg_h, p=2, dim=-1)
+    target_mode_protos_norm = F.normalize(target_mode_protos, p=2, dim=-1)
+    loss_mode_feat = F.mse_loss(seg_h_norm, target_mode_protos_norm)
     
     return loss_mode_ce, loss_mode_feat

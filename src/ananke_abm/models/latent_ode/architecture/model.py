@@ -3,6 +3,7 @@ Model architecture for the Generative Latent ODE, updated for segment-based mode
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchsde import sdeint
 
 from ananke_abm.data_generator.feature_engineering import get_mode_features, MODE_ID_MAP
@@ -35,7 +36,8 @@ class ODEFunc(nn.Module):
             nn.Linear(net_input_dim, hidden_dim),
             nn.ReLU(),
             *[ResidualBlock(hidden_dim) for _ in range(num_residual_blocks)],
-            nn.Linear(hidden_dim, net_output_dim)
+            nn.Linear(hidden_dim, net_output_dim),
+            nn.Tanh() # Constrain acceleration output
         )
         
         self.noise_type = "diagonal"
@@ -170,10 +172,17 @@ class GenerativeODE(nn.Module):
         
         candidate_zone_embeds = self.zone_feature_encoder(all_zone_features)
         target_loc_embeds = self.decoder_loc(pred_loc_embed)
-        # Transpose candidate_zone_embeds for matmul: (D_zone, Z)
-        pred_loc_logits = torch.matmul(target_loc_embeds, candidate_zone_embeds.t())
+
+        # --- L2 Normalize embeddings for stable logit calculation ---
+        target_loc_embeds_norm = F.normalize(target_loc_embeds, p=2, dim=-1)
+        candidate_zone_embeds_norm = F.normalize(candidate_zone_embeds, p=2, dim=-1)
         
-        pred_purp_logits = self.decoder_purpose(pred_purpose_features)
+        # Logits are now based on cosine similarity
+        pred_loc_logits = torch.matmul(target_loc_embeds_norm, candidate_zone_embeds_norm.t())
+        
+        # --- L2 Normalize purpose features for stable logit calculation ---
+        pred_purpose_features_norm = F.normalize(pred_purpose_features, p=2, dim=-1)
+        pred_purp_logits = self.decoder_purpose(pred_purpose_features_norm)
         
         return (
             pred_loc_logits, pred_loc_embed, 
