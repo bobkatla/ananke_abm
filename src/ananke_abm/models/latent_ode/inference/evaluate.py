@@ -5,10 +5,11 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
+from pathlib import Path
 
 from ananke_abm.models.latent_ode.config import GenerativeODEConfig
-from ananke_abm.models.latent_ode.inference.inference import InferenceEngine
-from ananke_abm.data_generator.feature_engineering import MODE_ID_MAP
+from ananke_abm.models.latent_ode.inference.inference import InferenceEngine, get_location_mappings
+from ananke_abm.data_generator.feature_engineering import MODE_ID_MAP, get_purpose_features, PURPOSE_ID_MAP
 
 
 def plot_itinerary(ax, itinerary, person_data, title):
@@ -34,10 +35,16 @@ def plot_itinerary(ax, itinerary, person_data, title):
 def evaluate():
     """Loads a trained model and evaluates its generated itineraries."""
     config = GenerativeODEConfig()
-    model_path = "saved_models/mode_generative_ode_batched/latent_ode_best_model_batched.pth" # Dummy path
+    save_folder = Path("saved_models/mode_separated")
+    save_folder.mkdir(parents=True, exist_ok=True)
+    model_path = "saved_models/best_model.pth"
     
     inference_engine = InferenceEngine(model_path, config)
     processor = inference_engine.processor
+    
+    # Create the mappings we need for evaluation
+    location_to_embedding, _ = get_location_mappings()
+    purpose_to_embedding = {name: get_purpose_features(pid) for name, pid in PURPOSE_ID_MAP.items()}
     
     person_ids = [1, 2]
     generated_itineraries = inference_engine.predict_trajectories(person_ids)
@@ -57,8 +64,8 @@ def evaluate():
                 "type": row['type'],
                 "start_time": row['start_time'] * 60,
                 "end_time": row['end_time'] * 60,
-                "location_embedding": processor._get_location_embeddings().get(row['location'], torch.zeros(config.zone_embed_dim)).numpy(),
-                "purpose_embedding": processor._get_purpose_embeddings().get(row['purpose'], torch.zeros(config.purpose_feature_dim)).numpy(),
+                "location_embedding": location_to_embedding.get(row['location'], torch.zeros(config.zone_embed_dim)).numpy(),
+                "purpose_embedding": purpose_to_embedding.get(row['purpose'], torch.zeros(config.purpose_feature_dim)).numpy(),
                 "mode_id": MODE_ID_MAP.get(row['mode'], -1)
             })
 
@@ -68,7 +75,7 @@ def evaluate():
         plot_itinerary(ax2, itinerary, person_data, f"Generated Itinerary for Person {person_id}")
         
         plt.tight_layout()
-        plt.savefig(f"evaluation_itinerary_person_{person_id}.png")
+        plt.savefig(save_folder / f"evaluation_itinerary_person_{person_id}.png")
         plt.close()
         
         print(f"Generated evaluation plot for person {person_id}.")
