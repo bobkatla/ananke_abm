@@ -9,7 +9,6 @@ import torch
 # --- Enriched Mode Features ---
 
 MODE_FEATURES: Dict[str, List[float]] = {
-    "stay":           [0.0, 0.0,  0.0, 1.0],
     "walk":           [1.0, 0.1,  0.0, 0.8],
     "bike":           [1.0, 0.25, 0.1, 0.7],
     "car":            [1.0, 0.7,  0.8, 0.9],
@@ -26,8 +25,7 @@ PURPOSE_FEATURES: Dict[str, List[float]] = {
     "work":           [1.0, 1.0,  0.8,  0.6],
     "education":      [1.0, 0.9,  0.6,  0.7],
     "shopping":       [1.0, 0.2,  0.2,  0.2],
-    "social":         [1.0, 0.1,  0.3,  1.0],
-    "travel":         [0.0, 0.5,  0.05, 0.0],
+    "social":         [1.0, 0.1,  0.3,  1.0]
 }
 PURPOSE_FEATURE_NAMES = ["is_stationary", "is_mandatory", "typical_duration", "social_level"]
 PURPOSE_ID_MAP = {name: i for i, name in enumerate(PURPOSE_FEATURES.keys())}

@@ -18,7 +18,7 @@ def get_graphs(people_df, zones_df, adjacency_matrix):
         for j in range(len(adjacency_matrix)):
             if adjacency_matrix[i, j] == 1:
                 zone_graph.add_edge(i + 1, j + 1)
-
+    
     # Create people graph
     people_graph = nx.Graph()
     for _, person in people_df.iterrows():
