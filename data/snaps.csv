@@ -1,25 +1,25 @@
 person_id,timestamp,location,purpose,anchor
-1,0.0,Riverside Apartments,sleep,1
-1,7.5,Riverside Apartments,sleep,0
+1,0.0,Riverside Apartments,home,1
+1,7.5,Riverside Apartments,home,0
 1,8.45,Tech Business Park,work,0
 1,12.0,Tech Business Park,work,0
-1,12.08,Grand Mall,lunch,0
-1,13.0,Grand Mall,lunch,0
+1,12.08,Grand Mall,shopping,0
+1,13.0,Grand Mall,shopping,0
 1,13.08,Tech Business Park,work,0
 1,17.0,Tech Business Park,work,0
-1,17.4,Fitness Complex,gym,0
-1,19.0,Fitness Complex,gym,0
-1,19.17,Riverside Apartments,arrive_home,0
-1,24.0,Riverside Apartments,arrive_home,1
-2,0.0,Downtown Residential,sleep,1
-2,10.0,Downtown Residential,sleep,0
-2,10.27,Central Park,exercise,0
-2,11.5,Central Park,exercise,0
+1,17.4,Fitness Complex,social,0
+1,19.0,Fitness Complex,social,0
+1,19.17,Riverside Apartments,home,0
+1,24.0,Riverside Apartments,home,1
+2,0.0,Downtown Residential,home,1
+2,10.0,Downtown Residential,home,0
+2,10.27,Central Park,social,0
+2,11.5,Central Park,social,0
 2,12.1,Entertainment District,social,0
 2,13.5,Entertainment District,social,0
 2,13.73,Grand Mall,work,0
 2,20.0,Grand Mall,work,0
-2,20.25,Entertainment District,dinner_social,0
-2,22.0,Entertainment District,dinner_social,0
-2,22.08,Downtown Residential,arrive_home,0
-2,24.0,Downtown Residential,arrive_home,1
+2,20.25,Entertainment District,social,0
+2,22.0,Entertainment District,social,0
+2,22.08,Downtown Residential,home,0
+2,24.0,Downtown Residential,home,1

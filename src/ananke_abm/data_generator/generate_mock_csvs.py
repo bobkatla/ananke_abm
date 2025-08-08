@@ -54,10 +54,9 @@ create_marcus_daily_pattern = mock_2p.create_marcus_daily_pattern
 create_mock_zone_graph = mock_locations.create_mock_zone_graph
 
 
-def build_person_data(person, schedule, zone_data) -> Tuple[List[Dict], List[Dict]]:
-    """Convert a daily schedule into periods and snaps for one person."""
+def build_person_periods(person, schedule, zone_data) -> List[Dict]:
+    """Convert a daily schedule into periods for one person."""
     periods: List[Dict] = []
-    snaps: List[Dict] = []
 
     n = len(schedule)
     i = 0
@@ -85,24 +84,6 @@ def build_person_data(person, schedule, zone_data) -> Tuple[List[Dict], List[Dic
                     "mode": "stay",
                 }
             )
-            snaps.append(
-                {
-                    "person_id": person.person_id,
-                    "timestamp": start_time,
-                    "location": location,
-                    "purpose": purpose,
-                    "anchor": 0,
-                }
-            )
-            snaps.append(
-                {
-                    "person_id": person.person_id,
-                    "timestamp": end_time,
-                    "location": location,
-                    "purpose": purpose,
-                    "anchor": 0,
-                }
-            )
         else:  # travel
             periods.append(
                 {
@@ -116,13 +97,68 @@ def build_person_data(person, schedule, zone_data) -> Tuple[List[Dict], List[Dic
                 }
             )
         i = j
+    return periods
 
-    # mark anchors for start and end of day
-    if snaps:
-        snaps[0]["anchor"] = 1
-        snaps[-1]["anchor"] = 1
 
-    return periods, snaps
+def build_snaps_from_periods(periods: List[Dict]) -> List[Dict]:
+    """Create snaps from a list of period data."""
+    snaps: List[Dict] = []
+
+    activity_to_group = {
+        # Home activities
+        "sleep": "home", "morning_routine": "home", "evening": "home",
+        "dinner": "home", "arrive_home": "home",
+        # Work/Education
+        "work": "work", "arrive_work": "work", "end_work": "work",
+        # Subsistence
+        "lunch": "shopping", "lunch_start": "shopping", "lunch_end": "shopping",
+        # Leisure & Recreation
+        "gym": "social", "gym_end": "social",
+        "exercise": "social", "leaving_park": "social",
+        # Social
+        "social": "social", "leaving_social": "social", "dinner_social": "social",
+        # Travel/Transit
+        "prepare_commute": "travel", "start_commute": "travel",
+        "transit": "travel", "leaving_home": "travel",
+        "break": "travel",
+    }
+    
+    person_periods = {}
+    for p in periods:
+        person_periods.setdefault(p['person_id'], []).append(p)
+
+    all_snaps = []
+    for person_id, single_person_periods in person_periods.items():
+        person_snaps = []
+        for period in single_person_periods:
+            if period["type"] == "stay":
+                grouped_purpose = activity_to_group.get(period["purpose"], period["purpose"])
+                
+                person_snaps.append({
+                    "person_id": person_id,
+                    "timestamp": period["start_time"],
+                    "location": period["location"],
+                    "purpose": grouped_purpose,
+                    "anchor": 0,
+                })
+                person_snaps.append({
+                    "person_id": person_id,
+                    "timestamp": period["end_time"],
+                    "location": period["location"],
+                    "purpose": grouped_purpose,
+                    "anchor": 0,
+                })
+        
+        if person_snaps:
+            person_snaps.sort(key=lambda x: x['timestamp'])
+            person_snaps[0]["anchor"] = 1
+            person_snaps[-1]["anchor"] = 1
+        
+        all_snaps.extend(person_snaps)
+        
+    all_snaps.sort(key=lambda x: (x['person_id'], x['timestamp']))
+
+    return all_snaps
 
 
 def main() -> None:
@@ -134,11 +170,14 @@ def main() -> None:
 
     sarah = create_sarah()
     sarah_schedule = create_sarah_daily_pattern()
-    sarah_periods, sarah_snaps = build_person_data(sarah, sarah_schedule, zone_data)
+    sarah_periods = build_person_periods(sarah, sarah_schedule, zone_data)
 
     marcus = create_marcus()
     marcus_schedule = create_marcus_daily_pattern()
-    marcus_periods, marcus_snaps = build_person_data(marcus, marcus_schedule, zone_data)
+    marcus_periods = build_person_periods(marcus, marcus_schedule, zone_data)
+
+    all_periods = sarah_periods + marcus_periods
+    all_snaps = build_snaps_from_periods(all_periods)
 
     periods_path = data_dir / "periods.csv"
     snaps_path = data_dir / "snaps.csv"
@@ -155,13 +194,13 @@ def main() -> None:
     with periods_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=period_fields)
         writer.writeheader()
-        writer.writerows(sarah_periods + marcus_periods)
+        writer.writerows(all_periods)
 
     snap_fields = ["person_id", "timestamp", "location", "purpose", "anchor"]
     with snaps_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=snap_fields)
         writer.writeheader()
-        writer.writerows(sarah_snaps + marcus_snaps)
+        writer.writerows(all_snaps)
 
 
 if __name__ == "__main__":
