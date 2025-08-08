@@ -129,7 +129,7 @@ class InferenceEngine:
                     # Start of a new travel
                     if current_segment is not None: itinerary.append(current_segment)
                     current_segment = {'type': 'travel', 'start_time': times[t_idx].item(), 'path_indices': [t_idx]}
-        else:
+                else:
                     # Continue existing travel
                     current_segment['path_indices'].append(t_idx)
         

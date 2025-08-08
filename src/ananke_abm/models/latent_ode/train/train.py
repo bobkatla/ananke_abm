@@ -142,7 +142,7 @@ def train():
                 config.loss_weight_mode_feat_segment * loss_mode_feat +
                 config.kl_weight * kl_loss
             )
-
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
