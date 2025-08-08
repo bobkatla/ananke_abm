@@ -22,7 +22,7 @@ def load_mobility_data() -> Tuple[Dict, pd.DataFrame, pd.DataFrame]:
     
     # Get mock data
     sarah_data, marcus_data = create_two_person_training_data()
-    zone_graph, zones_raw = create_mock_zone_graph()
+    zone_graph, zones_raw, _ = create_mock_zone_graph()
     
     # Format trajectories
     trajectories = {}
@@ -94,7 +94,7 @@ def load_mobility_data() -> Tuple[Dict, pd.DataFrame, pd.DataFrame]:
 
 def get_zone_adjacency_matrix() -> np.ndarray:
     """Get the zone adjacency matrix for physics constraints"""
-    zone_graph, _ = create_mock_zone_graph()
+    zone_graph, _, _ = create_mock_zone_graph()
     
     # Create adjacency matrix
     num_zones = len(zone_graph.nodes())

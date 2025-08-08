@@ -271,7 +271,7 @@ def create_two_person_training_data(repeat_pattern=True):
     """
     
     # Create the shared zone graph
-    zone_graph, zone_data = create_mock_zone_graph()
+    zone_graph, _, _ = create_mock_zone_graph()
     
     # --- Sarah ---
     sarah = create_sarah()
