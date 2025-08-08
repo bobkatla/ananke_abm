@@ -69,7 +69,8 @@ def calculate_segment_mode_loss(seg_logits, seg_h, segments_batch, config):
     Calculates segment-level mode classification and feature reconstruction loss.
     """
     if not segments_batch:
-        return torch.tensor(0.0), torch.tensor(0.0)
+        device = seg_logits.device if isinstance(seg_logits, torch.Tensor) and seg_logits.numel() > 0 else torch.device("cpu")
+        return torch.zeros((), device=device), torch.zeros((), device=device)
 
     # Gather ground truth from the ragged segment batch
     target_mode_ids = torch.tensor([s['mode_id'] for s in segments_batch], dtype=torch.long, device=seg_logits.device)
