@@ -11,7 +11,7 @@ from ananke_abm.models.latent_ode.architecture.model import GenerativeODE
 from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
 from ananke_abm.data_generator.mock_2p import create_sarah, create_marcus
 
-STAY_VELOCITY_THRESHOLD = 5.0
+STAY_VELOCITY_THRESHOLD = 0.5
 
 def get_location_mappings():
     """Creates authoritative mappings from the mock locations."""
