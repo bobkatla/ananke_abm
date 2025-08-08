@@ -72,12 +72,12 @@ class ModeFromPathHead(nn.Module):
     """
     Predicts travel mode from latent path segment descriptors.
     """
-    def __init__(self, config):
+    def __init__(self, config, position_dim):
         super().__init__()
         self.config = config
         
-        # Descriptors: delta_t, arc_length
-        descriptor_dim = 2 
+        # Descriptors: delta_t, arc_length, mean_velocity, mean_speed, speed_variance, heading_change_rate
+        descriptor_dim = 2 + position_dim + 3
         
         self.mlp = nn.Sequential(
             nn.Linear(descriptor_dim, config.hidden_dim),
@@ -91,12 +91,39 @@ class ModeFromPathHead(nn.Module):
         self.register_buffer("mode_prototypes", mode_protos)
 
     def forward(self, p_slice, v_slice, t_slice):
-        # 1. Compute descriptors
+        # 1. Compute Descriptors
         delta_t = (t_slice[-1] - t_slice[0]) / 60.0 # Duration in hours
         arc_length = torch.sum(torch.norm(p_slice[1:] - p_slice[:-1], p=2, dim=-1))
         
-        x_seg = torch.stack([delta_t, arc_length], dim=-1)
+        # --- New Richer Descriptors ---
+        v_bar = v_slice.mean(dim=0) # Mean velocity vector
+        
+        speeds = torch.norm(v_slice, p=2, dim=-1)
+        speed_bar = speeds.mean()
+        speed_variance = torch.var(speeds)
 
+        # Calculate heading change rate
+        v_norm = F.normalize(v_slice, p=2, dim=-1)
+        # Clamp to avoid acos errors from floating point inaccuracies
+        dot_products = torch.clamp((v_norm[:-1] * v_norm[1:]).sum(dim=-1), -1.0, 1.0)
+        heading_changes = torch.acos(dot_products)
+        total_heading_change = heading_changes.sum()
+        heading_change_rate = total_heading_change / delta_t.clamp(min=1e-6)
+
+        # Ensure all descriptors are tensors with one element for concatenation
+        if speed_bar.dim() == 0: speed_bar = speed_bar.unsqueeze(0)
+        if speed_variance.dim() == 0: speed_variance = speed_variance.unsqueeze(0)
+        if heading_change_rate.dim() == 0: heading_change_rate = heading_change_rate.unsqueeze(0)
+            
+        x_seg = torch.cat([
+            delta_t.unsqueeze(0),
+            arc_length.unsqueeze(0),
+            v_bar, 
+            speed_bar,
+            speed_variance,
+            heading_change_rate
+        ])
+        
         # 2. Map descriptor to mode feature space
         h = self.mlp(x_seg)
         
@@ -141,7 +168,7 @@ class GenerativeODE(nn.Module):
         self.decoder_purpose = nn.Linear(config.purpose_feature_dim, len(config.purpose_groups))
         
         # New head for segment-level mode prediction
-        self.mode_predictor = ModeFromPathHead(config)
+        self.mode_predictor = ModeFromPathHead(config, self.position_dim)
 
     def forward(self, person_features, home_zone_features, work_zone_features, 
                 initial_purpose_features, times, all_zone_features):
