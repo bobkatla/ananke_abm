@@ -121,7 +121,7 @@ def train():
             best_loss = total_loss.item()
             save_path = saved_models_dir / "best_model.pth"
             torch.save(model.state_dict(), save_path)
-            print(f"✨ New best model saved to {save_path} with loss: {best_loss:.4f}")
+            print(f"✨ Epoch {i+1}: New best model saved to {save_path} with loss: {best_loss:.4f}")
 
     print("✅ Training complete.")
 
