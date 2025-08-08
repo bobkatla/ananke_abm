@@ -2,27 +2,18 @@
 Data processing for the Generative Latent ODE model.
 """
 import torch
-import torch.nn.functional as F
-import networkx as nx
-
-from ananke_abm.data_generator.mock_2p import (
-    create_training_data_single_person,
-    create_sarah_daily_pattern,
-    create_marcus_daily_pattern,
-    create_sarah, create_marcus
-)
-from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
+import pandas as pd
 from ananke_abm.data_generator.feature_engineering import (
     get_purpose_features,
-    get_mode_features,
     PURPOSE_ID_MAP,
-    MODE_ID_MAP,
 )
-from ananke_abm.models.latent_ode.config import GenerativeODEConfig
+from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
 from torch.utils.data import Dataset
 
-class LatentODEDataset(Dataset):
+
+class LatentSDEDataset(Dataset):
     """PyTorch Dataset to provide individual samples for the DataLoader."""
+
     def __init__(self, person_ids, processor):
         self.person_ids = person_ids
         self.processor = processor
@@ -32,111 +23,100 @@ class LatentODEDataset(Dataset):
 
     def __getitem__(self, idx):
         person_id = self.person_ids[idx]
-        data = self.processor.get_data(person_id)
-        data['config'] = self.processor.config
-        return data
+        return self.processor.get_data(person_id)
+
 
 class DataProcessor:
-    """Processes mock data, preparing it for the Generative ODE model."""
+    """Processes mock data, preparing it for the Generative SDE model."""
 
-    def __init__(self, device, config: GenerativeODEConfig):
+    def __init__(self, device, periods_path="data/periods.csv", snaps_path="data/snaps.csv"):
         self.device = device
-        self.config = config
-        
-        # Load the static graph and distance matrix once
-        self.zone_graph, self.zones_raw, self.distance_matrix = create_mock_zone_graph()
-        self.distance_matrix = self.distance_matrix.to(device)
+        self.person_data = {}
+        self._load_and_process_data(periods_path, snaps_path)
 
-        # --- Activity/Purpose Processing ---
-        # Define the mapping from detailed activities to broader categories
-        self.activity_to_group = {
-            # Home activities
-            "sleep": "home", "morning_routine": "home", "evening": "home", 
-            "dinner": "home", "arrive_home": "home",
-            # Work/Education
-            "work": "work", "arrive_work": "work", "end_work": "work",
-            # Subsistence
-            "lunch": "shopping", "lunch_start": "shopping", "lunch_end": "shopping", # Simplified to shopping
-            # Leisure & Recreation
-            "gym": "social", "gym_end": "social", # Simplified to social
-            "exercise": "social", "leaving_park": "social",
-            # Social
-            "social": "social", "leaving_social": "social", "dinner_social": "social",
-            # Travel/Transit
-            "prepare_commute": "travel", "start_commute": "travel",
-            "transit": "travel", "leaving_home": "travel",
-            "break": "travel",
-        }
-        self.purpose_map = PURPOSE_ID_MAP
-        
-        # --- Mode Processing ---
-        # Define the mapping from travel modes to mode IDs
-        self.mode_map = MODE_ID_MAP
+    def _get_location_embeddings(self):
+        _, zones_raw, _ = create_mock_zone_graph()
+        location_to_embedding = {}
+        for zone_id, zone_data in zones_raw.items():
+            # Normalize features as done in the original data generation
+            features = [
+                zone_data["population"] / 10000.0,
+                zone_data["job_opportunities"] / 5000.0,
+                zone_data["retail_accessibility"],
+                zone_data["transit_accessibility"],
+                zone_data["attractiveness"],
+                zone_data["coordinates"][0] / 5.0,
+                zone_data["coordinates"][1] / 5.0,
+            ]
+            location_to_embedding[zone_data["name"]] = torch.tensor(
+                features, dtype=torch.float32
+            )
+        return location_to_embedding
+
+    def _get_purpose_embeddings(self):
+        purpose_to_embedding = {}
+        for name, pid in PURPOSE_ID_MAP.items():
+            purpose_to_embedding[name] = get_purpose_features(pid)
+        return purpose_to_embedding
+
+    def _load_and_process_data(self, periods_path, snaps_path):
+        """Loads, validates, and processes CSV data for all persons."""
+        periods_df = pd.read_csv(periods_path)
+        snaps_df = pd.read_csv(snaps_path)
+
+        location_to_embedding = self._get_location_embeddings()
+        purpose_to_embedding = self._get_purpose_embeddings()
+
+        for person_id in periods_df["person_id"].unique():
+            person_periods = periods_df[periods_df["person_id"] == person_id].sort_values(
+                by="start_time"
+            )
+            person_snaps = snaps_df[snaps_df["person_id"] == person_id].sort_values(
+                by="timestamp"
+            )
+
+            # --- Validation ---
+            assert person_periods.iloc[0]["type"] == "stay", f"Person {person_id} does not start with a stay."
+            assert person_periods.iloc[-1]["type"] == "stay", f"Person {person_id} does not end with a stay."
+            assert all(
+                person_periods["type"].iloc[i] != person_periods["type"].iloc[i + 1]
+                for i in range(len(person_periods) - 1)
+            ), f"Person {person_id} has consecutive periods of the same type."
+
+            for _, period in person_periods[person_periods["type"] == "stay"].iterrows():
+                stay_snaps = person_snaps[
+                    (person_snaps["timestamp"] == period["start_time"])
+                    | (person_snaps["timestamp"] == period["end_time"])
+                ]
+                assert len(stay_snaps) == 2, f"Stay period at {period['start_time']} for person {person_id} does not have 2 snaps."
+                assert stay_snaps.iloc[0]["location"] == period["location"], "Snap location mismatch."
+
+            # --- Feature Engineering ---
+            # Convert times to minutes since midnight
+            gt_times = torch.tensor(person_snaps["timestamp"].values * 60, dtype=torch.float32)
+
+            gt_loc_emb = torch.stack(
+                [
+                    location_to_embedding[loc]
+                    for loc in person_snaps["location"]
+                ]
+            )
+            gt_purp_emb = torch.stack(
+                [
+                    purpose_to_embedding[purp]
+                    for purp in person_snaps["purpose"]
+                ]
+            )
+            gt_anchor = torch.tensor(person_snaps["anchor"].values, dtype=torch.float32)
+
+            self.person_data[person_id] = {
+                "gt_times": gt_times.to(self.device),
+                "gt_loc_emb": gt_loc_emb.to(self.device),
+                "gt_purp_emb": gt_purp_emb.to(self.device),
+                "gt_anchor": gt_anchor.to(self.device),
+                "person_id": person_id,
+            }
 
     def get_data(self, person_id):
-        """
-        Processes mock data for a single person, resampling it to a uniform time grid.
-        Now includes sequences of purpose IDs and mode IDs for loss calculation,
-        as well as rich feature vectors for model input.
-        """
-        if person_id == 1:
-            schedule = create_sarah_daily_pattern()
-            person_obj = create_sarah()
-        else:
-            schedule = create_marcus_daily_pattern()
-            person_obj = create_marcus()
-            
-        data = create_training_data_single_person(
-            person=person_obj,
-            schedule=schedule,
-            zone_graph=self.zone_graph,
-            repeat_pattern=False
-        )
-
-        activities = data["activities"]
-        travel_modes = data["travel_modes"]
-        
-        # --- Create the target sequence of purpose IDs ---
-        target_purpose_ids = torch.tensor(
-            [self.purpose_map[self.activity_to_group.get(act, "travel")] for act in activities],
-            dtype=torch.long
-        ).to(self.device)
-        
-        # --- Create the target sequence of mode IDs ---
-        target_mode_ids = torch.tensor(
-            [self.mode_map.get(mode.lower(), self.mode_map["stay"]) for mode in travel_modes],
-            dtype=torch.long
-        ).to(self.device)
-
-        # --- Create rich feature vectors from IDs ---
-        target_purpose_features = torch.stack([get_purpose_features(pid.item()) for pid in target_purpose_ids]).to(self.device)
-        target_mode_features = torch.stack([get_mode_features(mid.item()) for mid in target_mode_ids]).to(self.device)
-
-        # Convert importance strings to numerical weights
-        importance_weights = [
-            self.config.anchor_loss_weight if imp == 'anchor' else 1.0
-            for imp in data['importances']
-        ]
-        
-        zone_features = data['zone_features'].to(self.device)
-        home_zone_features = zone_features[data['home_zone_id']]
-        work_zone_features = zone_features[data['work_zone_id']]
-        
-        adjacency_matrix = torch.tensor(nx.to_numpy_array(self.zone_graph), dtype=torch.float32, device=self.device)
-        adjacency_matrix.fill_diagonal_(1)
-
-        return {
-            "person_features": data["person_attrs"].to(self.device),
-            "times": data["times"].to(self.device),
-            "trajectory_y": data["zone_observations"].to(self.device),
-            "target_purpose_ids": target_purpose_ids,
-            "target_mode_ids": target_mode_ids,
-            "target_purpose_features": target_purpose_features,
-            "target_mode_features": target_mode_features,
-            "importance_weights": torch.tensor(importance_weights, dtype=torch.float32, device=self.device),
-            "num_zones": len(self.zones_raw),
-            "person_name": data['person_name'],
-            "home_zone_features": home_zone_features,
-            "work_zone_features": work_zone_features,
-            "all_zone_features": zone_features,
-        }
+        """Returns the processed data for a single person."""
+        return self.person_data[person_id]

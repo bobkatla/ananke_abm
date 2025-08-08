@@ -1,128 +1,83 @@
 """
-Implements the 'Unified Timeline' batching strategy for the Latent ODE model.
+Implements a simplified 'Unified Timeline' batching strategy for the SDE model.
 
-This module provides a function to be used as a `collate_fn` in a PyTorch
-DataLoader. It takes a list of individual, variable-length time series samples
-and combines them into a single, dense batch suitable for parallel processing.
+This module provides a collate_fn for a PyTorch DataLoader that combines 
+variable-length time series samples into a dense batch suitable for the SDE model,
+using linear interpolation for state embeddings between ground-truth points.
 """
 import torch
-from ananke_abm.data_generator.feature_engineering import get_feature_dimensions, MODE_ID_MAP, PURPOSE_ID_MAP
 
 
-def unify_and_interpolate_batch(batch):
+def sde_collate_fn(batch):
     """
-    Takes a list of individual data samples and collates them into a single batch
-    using the "Unified Timeline" strategy, with intelligent interpolation and
-    pre-computed anchor indices for time-weighted embedding loss.
+    Collates individual data samples into a single batch using a simplified 
+    "Unified Timeline" strategy with linear interpolation.
     """
-    # --- 1. Collect all features and create the unified timeline ---
-    all_times = [s['times'] for s in batch]
-    all_y_loc = [s['trajectory_y'] for s in batch]
-    all_y_purp = [s['target_purpose_ids'] for s in batch]
-    all_y_mode = [s['target_mode_ids'] for s in batch]
-    all_y_purp_feat = [s['target_purpose_features'] for s in batch]
-    all_y_mode_feat = [s['target_mode_features'] for s in batch]
-    all_imp_weights = [s['importance_weights'] for s in batch]
+    # --- 1. Collect all features and create the unified timeline in minutes ---
+    all_gt_times = [s['gt_times'] for s in batch]
+    grid_times = torch.cat(all_gt_times).unique(sorted=True)
     
-    t_unified = torch.cat(all_times).unique(sorted=True)
-    unified_len = len(t_unified)
     batch_size = len(batch)
-    device = batch[0]['person_features'].device
-    config = batch[0]['config']
+    grid_len = len(grid_times)
+    device = grid_times.device
     
-    # Get feature dimensions
-    mode_feat_dim, purp_feat_dim = get_feature_dimensions()
+    # Assuming embeddings dimensions are consistent across the batch
+    d_loc = batch[0]['gt_loc_emb'].shape[1]
+    d_purp = batch[0]['gt_purp_emb'].shape[1]
 
     # --- 2. Create dense tensors and masks ---
-    y_loc_dense = torch.full((batch_size, unified_len), -1, dtype=torch.long, device=device)
-    y_purp_dense = torch.full((batch_size, unified_len), -1, dtype=torch.long, device=device)
-    y_mode_dense = torch.full((batch_size, unified_len), -1, dtype=torch.long, device=device)
-    y_purp_feat_dense = torch.zeros((batch_size, unified_len, purp_feat_dim), dtype=torch.float32, device=device)
-    y_mode_feat_dense = torch.zeros((batch_size, unified_len, mode_feat_dim), dtype=torch.float32, device=device)
-    
-    loss_mask = torch.zeros((batch_size, unified_len), device=device)
-    importance_mask = torch.ones((batch_size, unified_len), device=device)
-    
-    if config.train_on_interpolated_points:
-        loss_mask.fill_(1.0)
-    
-    # Get the ID for "Travel" for intelligent filling
-    travel_purpose_id = PURPOSE_ID_MAP["travel"]
-    
-    # Get the ID for "Stay" mode for intelligent filling (for mode transition)
-    stay_mode_id = MODE_ID_MAP["stay"]
-    
-    # --- 3. Pre-compute anchor indices and fill dense tensors ---
-    prev_real_indices = torch.zeros((batch_size, unified_len), dtype=torch.long, device=device)
-    next_real_indices = torch.zeros((batch_size, unified_len), dtype=torch.long, device=device)
-    
-    t_to_idx = {t.item(): i for i, t in enumerate(t_unified)}
+    loc_emb_batch = torch.zeros((batch_size, grid_len, d_loc), dtype=torch.float32, device=device)
+    purp_emb_batch = torch.zeros((batch_size, grid_len, d_purp), dtype=torch.float32, device=device)
+    is_gt_batch = torch.zeros((batch_size, grid_len), dtype=torch.float32, device=device)
+    anchor_mask_batch = torch.zeros((batch_size, grid_len), dtype=torch.float32, device=device)
 
+    # --- 3. Interpolate and fill dense tensors for each person ---
     for i in range(batch_size):
-        original_times = all_times[i]
-        indices_in_unified = torch.tensor([t_to_idx[t.item()] for t in original_times], device=device)
+        gt_times = batch[i]['gt_times']
+        gt_loc_emb = batch[i]['gt_loc_emb']
+        gt_purp_emb = batch[i]['gt_purp_emb']
+        gt_anchor = batch[i]['gt_anchor']
+
+        # Find indices of person's GT times in the unified grid
+        gt_indices_in_grid = torch.searchsorted(grid_times, gt_times)
         
-        # Fill dense tensors with data from real observation points
-        y_loc_dense[i, indices_in_unified] = all_y_loc[i]
-        y_purp_dense[i, indices_in_unified] = all_y_purp[i]
-        y_mode_dense[i, indices_in_unified] = all_y_mode[i]
-        y_purp_feat_dense[i, indices_in_unified] = all_y_purp_feat[i]
-        y_mode_feat_dense[i, indices_in_unified] = all_y_mode_feat[i]
-        importance_mask[i, indices_in_unified] = all_imp_weights[i]
+        # Populate batch tensors at ground-truth points
+        loc_emb_batch[i, gt_indices_in_grid] = gt_loc_emb
+        purp_emb_batch[i, gt_indices_in_grid] = gt_purp_emb
+        is_gt_batch[i, gt_indices_in_grid] = 1.0
+        anchor_mask_batch[i, gt_indices_in_grid] = gt_anchor
         
-        if not config.train_on_interpolated_points:
-            loss_mask[i, indices_in_unified] = 1.0
+        # Interpolate between ground-truth points
+        for j in range(len(gt_times) - 1):
+            t_prev, t_next = gt_times[j], gt_times[j+1]
+            idx_prev, idx_next = gt_indices_in_grid[j], gt_indices_in_grid[j+1]
 
-        real_indices = (y_loc_dense[i] != -1).nonzero().squeeze(-1)
-        if len(real_indices) == 0:
-            continue
+            if idx_next > idx_prev + 1: # If there are points to interpolate
+                loc_emb_prev, loc_emb_next = gt_loc_emb[j], gt_loc_emb[j+1]
+                purp_emb_prev, purp_emb_next = gt_purp_emb[j], gt_purp_emb[j+1]
+                
+                # Time-weighted interpolation
+                time_gap = (t_next - t_prev).clamp(min=1e-6)
+                interp_times = grid_times[idx_prev + 1 : idx_next]
+                w_next = (interp_times - t_prev) / time_gap
+                w_prev = 1.0 - w_next
 
-        # Vectorized calculation of previous and next real indices
-        arange_vec = torch.arange(unified_len, device=device)
-        next_indices_in_real = torch.searchsorted(real_indices, arange_vec, side='right')
-        prev_indices_in_real = torch.searchsorted(real_indices, arange_vec, side='left') - 1
-        
-        next_indices_in_real = torch.clamp(next_indices_in_real, 0, len(real_indices) - 1)
-        prev_indices_in_real = torch.clamp(prev_indices_in_real, 0, len(real_indices) - 1)
-        
-        prev_real_indices[i] = real_indices[prev_indices_in_real]
-        next_real_indices[i] = real_indices[next_indices_in_real]
+                loc_emb_batch[i, idx_prev + 1 : idx_next] = w_prev.unsqueeze(1) * loc_emb_prev + w_next.unsqueeze(1) * loc_emb_next
+                purp_emb_batch[i, idx_prev + 1 : idx_next] = w_prev.unsqueeze(1) * purp_emb_prev + w_next.unsqueeze(1) * purp_emb_next
 
-        # Intelligently fill purpose and mode IDs for interpolated points
-        if len(real_indices) > 1:
-            for j in range(len(real_indices) - 1):
-                start_idx, end_idx = real_indices[j], real_indices[j+1]
-                if start_idx + 1 < end_idx:
-                    start_purp, end_purp = y_purp_dense[i, start_idx], y_purp_dense[i, end_idx]
-                    fill_value = travel_purpose_id if start_purp != end_purp else start_purp.item()
-                    y_purp_dense[i, start_idx + 1 : end_idx] = fill_value
-                    
-                    start_mode, end_mode = y_mode_dense[i, start_idx], y_mode_dense[i, end_idx]
-                    if start_purp != end_purp:
-                        transition_mode = start_mode.item() if start_mode != stay_mode_id else end_mode.item()
-                        y_mode_dense[i, start_idx + 1 : end_idx] = transition_mode
-                    else:
-                        y_mode_dense[i, start_idx + 1 : end_idx] = start_mode.item()
+        # Clamp before the first and after the last snap
+        if gt_indices_in_grid[0] > 0:
+            loc_emb_batch[i, :gt_indices_in_grid[0]] = gt_loc_emb[0]
+            purp_emb_batch[i, :gt_indices_in_grid[0]] = gt_purp_emb[0]
+        if gt_indices_in_grid[-1] < grid_len - 1:
+            loc_emb_batch[i, gt_indices_in_grid[-1]+1:] = gt_loc_emb[-1]
+            purp_emb_batch[i, gt_indices_in_grid[-1]+1:] = gt_purp_emb[-1]
 
-    # Combine the masks here to create the final weight mask
-    final_loss_mask = loss_mask * importance_mask
-
-    # --- 4. Stack all other features ---
     return {
-        't_unified': t_unified,
-        'y_loc_dense': y_loc_dense,
-        'y_purp_dense': y_purp_dense,
-        'y_mode_dense': y_mode_dense,
-        'y_purp_feat_dense': y_purp_feat_dense,
-        'y_mode_feat_dense': y_mode_feat_dense,
-        'loss_mask': final_loss_mask,
-        'prev_real_indices': prev_real_indices,
-        'next_real_indices': next_real_indices,
-        'person_features': torch.stack([s['person_features'] for s in batch]),
-        'home_zone_features': torch.stack([s['home_zone_features'] for s in batch]),
-        'work_zone_features': torch.stack([s['work_zone_features'] for s in batch]),
-        'all_zone_features': batch[0]['all_zone_features'], # Same for all samples
-        'num_zones': batch[0]['num_zones'],
-        'purpose_groups': config.purpose_groups,
-        'person_names': [s['person_name'] for s in batch]
+        'grid_times': grid_times,
+        'loc_emb_batch': loc_emb_batch,
+        'purp_emb_batch': purp_emb_batch,
+        'is_gt_batch': is_gt_batch,
+        'anchor_mask_batch': anchor_mask_batch,
+        'person_ids': [s['person_id'] for s in batch]
     }
