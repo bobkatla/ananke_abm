@@ -95,6 +95,7 @@ class DataProcessor:
                 "gt_purp_ids": gt_purp_ids.to(self.device),
                 "gt_anchor": gt_anchor.to(self.device),
                 "segments": segments,
+                "stay_intervals": [(round(p["start_time"], 2), round(p["end_time"], 2)) for _, p in person_periods[person_periods["type"] == "stay"].iterrows()],
                 "person_id": person_id,
             }
 

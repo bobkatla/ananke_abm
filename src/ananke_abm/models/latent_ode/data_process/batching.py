@@ -82,6 +82,15 @@ def sde_collate_fn(batch):
                 "mode_proto": seg["mode_proto"],
             })
 
+    # --- 6. Create Stay Mask for Velocity Loss ---
+    device = batch[0]['gt_times'].device
+    B, S_dense = len(batch), len(grid_times)
+    stay_mask = torch.zeros(B, S_dense, device=device)
+    for i, item in enumerate(batch):
+        for start_time, end_time in item['stay_intervals']:
+            interval_mask = (grid_times >= start_time) & (grid_times <= end_time)
+            stay_mask[i, interval_mask] = 1.0
+
     return {
         'grid_times': grid_times,
         'is_gt_grid': is_gt_grid,
@@ -94,5 +103,6 @@ def sde_collate_fn(batch):
         'anchor_union': anchor_union,
         'union_to_dense': union_to_dense,
         'segments_batch': segments_batch,
+        'stay_mask': stay_mask,
         'person_ids': [s['person_id'] for s in batch]
     }

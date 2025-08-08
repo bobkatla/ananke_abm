@@ -23,10 +23,10 @@ def plot_itinerary(ax, itinerary, person_data, title):
         if seg['type'] == 'stay':
             # Simplified: Use y-coordinate as a proxy for location
             y_val = np.mean(seg['location_embedding'][:2])
-            ax.plot([seg['start_time']/60, seg['end_time']/60], [y_val, y_val], linewidth=4, label=f"Stay")
+            ax.plot([seg['start_time'], seg['end_time']], [y_val, y_val], linewidth=4, label=f"Stay")
 
     # Plot GT snaps for reference
-    ax.plot(person_data['gt_times'].cpu()/60, 
+    ax.plot(person_data['gt_times'].cpu(), 
             [np.mean(e.cpu().numpy()[:2]) for e in person_data['gt_loc_emb']], 
             'o', color='black', markersize=8, label="GT Snaps")
     ax.legend()
@@ -44,7 +44,7 @@ def evaluate():
     
     # Create the mappings we need for evaluation
     location_to_embedding, _ = get_location_mappings()
-    purpose_to_embedding = {name: get_purpose_features(pid) for name, pid in PURPOSE_ID_MAP.items()}
+    purpose_to_embedding = {name: get_purpose_features(name) for name in PURPOSE_ID_MAP.keys()}
     
     person_ids = [1, 2]
     generated_itineraries = inference_engine.predict_trajectories(person_ids)
@@ -62,8 +62,8 @@ def evaluate():
         for _, row in person_periods.iterrows():
             gt_itinerary.append({
                 "type": row['type'],
-                "start_time": row['start_time'] * 60,
-                "end_time": row['end_time'] * 60,
+                "start_time": row['start_time'],
+                "end_time": row['end_time'],
                 "location_embedding": location_to_embedding.get(row['location'], torch.zeros(config.zone_embed_dim)).numpy(),
                 "purpose_embedding": purpose_to_embedding.get(row['purpose'], torch.zeros(config.purpose_feature_dim)).numpy(),
                 "mode_id": MODE_ID_MAP.get(row['mode'], -1)

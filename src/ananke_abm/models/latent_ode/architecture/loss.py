@@ -4,22 +4,18 @@ Composite loss function for the SDE model with segment-based mode loss.
 import torch
 import torch.nn.functional as F
 
-def calculate_snap_loss(batch, model_outputs, model, distance_matrix, config):
+def calculate_path_loss(batch, model_outputs, model, distance_matrix, config):
     """
-    Calculates snap-level losses for location and purpose.
-    Mode loss is now handled separately.
+    Calculates snap-level losses for location and purpose, and stay velocity loss.
     """
     (
         pred_loc_logits, pred_loc_embed, 
         pred_purp_logits, pred_purpose_features,
-        _, _, # p_path, v_path (not needed for snap loss)
+        pred_p, pred_v,
         mu, log_var
     ) = model_outputs
     
     # --- Map union grid predictions to dense grid for loss calculation ---
-    # The model predicts on the dense grid, but GT is on the union grid.
-    # We need to gather the predictions at the union grid points.
-    
     union_indices = batch['union_to_dense']
     
     pred_loc_logits_union = pred_loc_logits[:, union_indices, :]
@@ -36,8 +32,8 @@ def calculate_snap_loss(batch, model_outputs, model, distance_matrix, config):
         batch['loc_ids_union'],
         ignore_index=-100, # Important: ignore interpolated points
         reduction='none'
-    ) * is_gt_mask
-    loss_loc_ce = loss_loc_ce.sum() / is_gt_mask.sum().clamp(min=1)
+    )
+    loss_loc_ce = (loss_loc_ce * is_gt_mask).sum() / is_gt_mask.sum().clamp(min=1)
 
     # Purpose CE Loss
     loss_purp_ce = F.cross_entropy(
@@ -45,7 +41,7 @@ def calculate_snap_loss(batch, model_outputs, model, distance_matrix, config):
         batch['purp_ids_union'],
         ignore_index=-100,
         reduction='none'
-    ) * is_gt_mask
+    )
     loss_purp_ce = (loss_purp_ce * is_gt_mask).sum() / is_gt_mask.sum().clamp(min=1)
     
     # --- Feature Reconstruction MSE Loss (on Normalized Embeddings) ---
@@ -59,10 +55,17 @@ def calculate_snap_loss(batch, model_outputs, model, distance_matrix, config):
     loss_purp_mse = F.mse_loss(pred_purpose_features_union_norm, gt_purp_emb_union_norm, reduction='none').mean(dim=-1)
     loss_purp_mse = (loss_purp_mse * is_gt_mask).sum() / is_gt_mask.sum().clamp(min=1)
     
-    # --- 2. KL Divergence ---
+    # --- 2. Stay Velocity Loss ---
+    stay_mask = batch['stay_mask']
+    velocity_loss_raw = pred_v.pow(2)
+    loss_stay_velocity = (velocity_loss_raw.sum(dim=-1) * stay_mask).sum()
+    num_stay_points = stay_mask.sum().clamp(min=1)
+    loss_stay_velocity = loss_stay_velocity / num_stay_points
+
+    # --- 3. KL Divergence ---
     kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp()) / mu.shape[0]
 
-    return loss_loc_ce, loss_loc_mse, loss_purp_ce, loss_purp_mse, kl_loss
+    return loss_loc_ce, loss_loc_mse, loss_purp_ce, loss_purp_mse, kl_loss, loss_stay_velocity
 
 def calculate_segment_mode_loss(seg_logits, seg_h, segments_batch, config):
     """

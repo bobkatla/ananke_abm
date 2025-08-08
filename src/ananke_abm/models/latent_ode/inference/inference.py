@@ -149,8 +149,8 @@ class InferenceEngine:
                 # For travel, predict mode
                 v_slice = v_path[seg['path_indices']]
                 t_slice = times[seg['path_indices']]
-                logits, h = self.model.mode_predictor(path_slice.unsqueeze(0), v_slice.unsqueeze(0), t_slice)
+                logits, h = self.model.mode_predictor(path_slice, v_slice, t_slice)
                 seg['mode_id'] = torch.argmax(logits, dim=-1).item()
-                seg['mode_embedding'] = h.squeeze(0).cpu().numpy()
+                seg['mode_embedding'] = h.cpu().numpy()
 
         return itinerary

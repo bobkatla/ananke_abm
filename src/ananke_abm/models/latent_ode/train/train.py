@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from ananke_abm.models.latent_ode.config import GenerativeODEConfig
 from ananke_abm.models.latent_ode.data_process.data import DataProcessor, LatentSDEDataset
 from ananke_abm.models.latent_ode.architecture.model import GenerativeODE
-from ananke_abm.models.latent_ode.architecture.loss import calculate_snap_loss, calculate_segment_mode_loss
+from ananke_abm.models.latent_ode.architecture.loss import calculate_path_loss, calculate_segment_mode_loss
 from ananke_abm.models.latent_ode.data_process.batching import sde_collate_fn
 from ananke_abm.data_generator.feature_engineering import get_purpose_features
 from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
@@ -127,10 +127,10 @@ def train():
             seg_logits, seg_h = model.predict_mode_from_segments(pred_p, pred_v, batch['grid_times'], batch['segments_batch'])
             
             # --- Loss Calculation ---
-            snap_losses = calculate_snap_loss(batch, model_outputs, model, None, config)
+            path_losses = calculate_path_loss(batch, model_outputs, model, None, config)
             mode_losses = calculate_segment_mode_loss(seg_logits, seg_h, batch['segments_batch'], config)
             
-            loss_loc_ce, loss_loc_mse, loss_purp_ce, loss_purp_mse, kl_loss = snap_losses
+            loss_loc_ce, loss_loc_mse, loss_purp_ce, loss_purp_mse, kl_loss, loss_stay_velocity = path_losses
             loss_mode_ce, loss_mode_feat = mode_losses
 
             total_loss = (
@@ -140,6 +140,7 @@ def train():
                 config.loss_weight_purpose_mse * loss_purp_mse +
                 config.loss_weight_mode_ce_segment * loss_mode_ce +
                 config.loss_weight_mode_feat_segment * loss_mode_feat +
+                config.loss_weight_stay_velocity * loss_stay_velocity +
                 config.kl_weight * kl_loss
             )
             total_loss.backward()
@@ -150,6 +151,7 @@ def train():
             print(f"Iter {i+1}, Loss: {total_loss.item():.4f} | "
                   f"Snap (Loc/Purp): {loss_loc_ce.item():.2f}/{loss_purp_ce.item():.2f} | "
                   f"Segment (Mode CE/Feat): {loss_mode_ce.item():.2f}/{loss_mode_feat.item():.2f} | "
+                  f"Stay Vel: {loss_stay_velocity.item():.2f} | "
                   f"KL: {kl_loss.item():.2f}")
 
         # Save the model if it's the best so far

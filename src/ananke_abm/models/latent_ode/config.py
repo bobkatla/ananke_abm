@@ -46,6 +46,7 @@ class GenerativeODEConfig:
     loss_weight_purpose_mse: float = 0.5
     loss_weight_mode_ce_segment: float = 1.0  # New segment-level loss
     loss_weight_mode_feat_segment: float = 0.5 # New segment-level loss
+    loss_weight_stay_velocity: float = 1.0
 
     # --- New Anchor Loss Weight ---
     anchor_loss_weight: float = 15.0
