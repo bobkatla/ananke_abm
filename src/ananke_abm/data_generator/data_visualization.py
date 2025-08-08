@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
+import textwrap
 from ananke_abm.data_generator.load_data import load_mobility_data, get_zone_adjacency_matrix
 
 def get_graphs(people_df, zones_df, adjacency_matrix):
@@ -66,8 +67,8 @@ def visualize_zone_graph(zone_graph):
     ax.legend(handles=handles, title='Population', labelspacing=1.5, borderpad=1)
 
     ax.set_title('Zone Connectivity Graph')
-    ax.set_xlabel('X Coordinate')
-    ax.set_ylabel('Y Coordinate')
+    # ax.set_xlabel('X Coordinate')
+    # ax.set_ylabel('Y Coordinate')
     plt.show()
 
 def visualize_people_graph(people_graph):
@@ -123,7 +124,7 @@ def visualize_agent_trajectories_over_time(snaps_df, periods_df, zones_df):
                  linestyle=person_linestyles[person_id],
                  color='black',
                  alpha=0.3,
-                 label=f"{name}'s Trajectory")
+                 label=f"{name}")
 
         # Plot stay periods with purpose colors
         for _, period in periods_df[(periods_df['person_id'] == person_id) & (periods_df['type'] == 'stay')].iterrows():
@@ -143,25 +144,35 @@ def visualize_agent_trajectories_over_time(snaps_df, periods_df, zones_df):
             ax.text(mid_time, y_pos, symbol, fontsize=12, ha='center', va='center',
                     bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='circle,pad=0.2'))
     
-    # Create legends
-    purpose_patches = [plt.Rectangle((0, 0), 1, 1, color=color, label=purpose) for purpose, color in purpose_colors.items()]
-    legend1 = ax.legend(handles=purpose_patches, title='Stay Purposes', loc='upper left', bbox_to_anchor=(1.02, 1))
-    ax.add_artist(legend1)
+    # --- Create Legends ---
+    # Trajectory legend for person linestyles
+    traj_handles, traj_labels = ax.get_legend_handles_labels()
+    traj_legend = ax.legend(handles=traj_handles, labels=traj_labels, title='Agent', loc='upper center', 
+                            bbox_to_anchor=(0.5, -0.1), ncol=len(person_names), frameon=False)
+    ax.add_artist(traj_legend)
 
-    # Manual legend for travel modes
-    ax.text(1.02, 0.4, 'Travel Modes', transform=ax.transAxes, fontsize=10, weight='bold')
-    y_offset = 0.35
+    # Purpose legend for colors
+    purpose_patches = [plt.Rectangle((0, 0), 1, 1, color=color, label=purpose) for purpose, color in purpose_colors.items()]
+    purpose_legend = ax.legend(handles=purpose_patches, title='Stay Purposes', loc='upper left', bbox_to_anchor=(1.02, 1))
+    ax.add_artist(purpose_legend)
+
+    # Manual legend for travel mode symbols
+    ax.text(1.02, 0.6, 'Travel Modes', transform=ax.transAxes, fontsize=10, weight='bold')
+    y_offset = 0.55
     for mode, symbol in mode_symbols.items():
         ax.text(1.03, y_offset, f"{symbol} : {mode.replace('_', ' ').title()}", transform=ax.transAxes, fontsize=10, verticalalignment='top')
         y_offset -= 0.05
 
+    wrapped_labels = [textwrap.fill(label, width=20) for label in zone_name_to_id.keys()]
     ax.set_yticks(list(zone_name_to_id.values()))
-    ax.set_yticklabels(list(zone_name_to_id.keys()))
+    ax.set_yticklabels(wrapped_labels)
     ax.set_xlabel('Time of Day (hours)')
     ax.set_ylabel('Location')
     ax.set_title('Agent Trajectories Over Time')
     ax.grid(True, axis='y')
-    plt.tight_layout(rect=[0, 0, 0.85, 1])
+    
+    # Adjust layout to prevent labels from being cut off
+    plt.subplots_adjust(left=0.2, right=0.8, top=0.9, bottom=0.2)
     plt.show()
 
 if __name__ == "__main__":
