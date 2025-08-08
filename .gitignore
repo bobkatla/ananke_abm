@@ -5,7 +5,9 @@ build/
 dist/
 wheels/
 *.egg-info
-data/
+data/*
+!data/periods.csv
+!data/snaps.csv
 output/
 saved_models/
 

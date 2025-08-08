@@ -1,0 +1,23 @@
+person_id,start_time,end_time,type,location,purpose,mode
+1,0.0,7.5,stay,Riverside Apartments,sleep,stay
+1,7.5,8.45,travel,travel,travel,Car
+1,8.45,12.0,stay,Tech Business Park,work,stay
+1,12.0,12.08,travel,travel,travel,Walk
+1,12.08,13.0,stay,Grand Mall,lunch,stay
+1,13.0,13.08,travel,travel,travel,Walk
+1,13.08,17.0,stay,Tech Business Park,work,stay
+1,17.0,17.4,travel,travel,travel,Car
+1,17.4,19.0,stay,Fitness Complex,gym,stay
+1,19.0,19.17,travel,travel,travel,Car
+1,19.17,24.0,stay,Riverside Apartments,arrive_home,stay
+2,0.0,10.0,stay,Downtown Residential,sleep,stay
+2,10.0,10.27,travel,travel,travel,Walk
+2,10.27,11.5,stay,Central Park,exercise,stay
+2,11.5,12.1,travel,travel,travel,Walk
+2,12.1,13.5,stay,Entertainment District,social,stay
+2,13.5,13.73,travel,travel,travel,Public_Transit
+2,13.73,20.0,stay,Grand Mall,work,stay
+2,20.0,20.25,travel,travel,travel,Public_Transit
+2,20.25,22.0,stay,Entertainment District,dinner_social,stay
+2,22.0,22.08,travel,travel,travel,Public_Transit
+2,22.08,24.0,stay,Downtown Residential,arrive_home,stay
