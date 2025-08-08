@@ -77,16 +77,13 @@ class InferenceEngine:
         with torch.no_grad():
             for person_id in person_ids:
                 person = self.persons[person_id]
-                times = torch.linspace(0, 24 * 60, time_resolution).to(self.device)
+                times = torch.linspace(0, 24, time_resolution).to(self.device)
                 
                 # --- Get Correct Person and Location Features ---
                 person_features = get_person_features(person).unsqueeze(0).to(self.device)
                 
-                home_zone_name = self.zones_raw[person.home_zone]['name']
-                work_zone_name = self.zones_raw[person.work_zone]['name']
-                
-                home_zone_features = self.location_to_embedding[home_zone_name].unsqueeze(0).to(self.device)
-                work_zone_features = self.location_to_embedding[work_zone_name].unsqueeze(0).to(self.device)
+                home_zone_features = self.location_to_embedding[person.home_zone].unsqueeze(0).to(self.device)
+                work_zone_features = self.location_to_embedding[person.work_zone].unsqueeze(0).to(self.device)
                 
                 # Use first purpose from GT data as initial purpose
                 initial_purpose_features = self.processor.get_data(person_id)['gt_purp_emb'][0].unsqueeze(0)

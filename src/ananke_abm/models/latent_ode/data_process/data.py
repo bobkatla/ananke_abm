@@ -59,7 +59,7 @@ class DataProcessor:
             
             # --- Snaps Processing ---
             person_snaps = snaps_df[snaps_df["person_id"] == person_id].sort_values(by="timestamp")
-            gt_times_minutes = torch.tensor(np.round(person_snaps["timestamp"].values * 60, 2), dtype=torch.float32)
+            gt_times_hours = torch.tensor(np.round(person_snaps["timestamp"].values, 2), dtype=torch.float32)
             gt_loc_emb = torch.stack([location_to_embedding[loc] for loc in person_snaps["location"]])
             gt_loc_ids = torch.tensor([self.location_name_to_id[loc] for loc in person_snaps["location"]], dtype=torch.long)
             gt_purp_emb = torch.stack([purpose_to_embedding[purp] for purp in person_snaps["purpose"]])
@@ -69,11 +69,11 @@ class DataProcessor:
             # --- Segments Processing ---
             travel_periods = person_periods[person_periods["type"] == "travel"]
             segments = []
-            time_to_snap_idx = {round(t.item(), 2): i for i, t in enumerate(gt_times_minutes)}
+            time_to_snap_idx = {round(t.item(), 2): i for i, t in enumerate(gt_times_hours)}
 
             for _, period in travel_periods.iterrows():
-                t0 = round(period["start_time"] * 60, 2)
-                t1 = round(period["end_time"] * 60, 2)
+                t0 = round(period["start_time"], 2)
+                t1 = round(period["end_time"], 2)
                 
                 assert t0 in time_to_snap_idx, f"Segment start time {t0} not in snaps for person {person_id}"
                 assert t1 in time_to_snap_idx, f"Segment end time {t1} not in snaps for person {person_id}"
@@ -88,7 +88,7 @@ class DataProcessor:
                 })
 
             self.person_data[person_id] = {
-                "gt_times": gt_times_minutes.to(self.device),
+                "gt_times": gt_times_hours.to(self.device),
                 "gt_loc_emb": gt_loc_emb.to(self.device),
                 "gt_loc_ids": gt_loc_ids.to(self.device),
                 "gt_purp_emb": gt_purp_emb.to(self.device),
