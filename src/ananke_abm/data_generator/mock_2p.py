@@ -246,6 +246,9 @@ def create_training_data_single_person(
     
     zone_features = torch.tensor(zone_features, dtype=torch.float32)
     
+    # Create a mapping from zone name to 0-indexed ID
+    zone_name_to_id = {data['name']: i for i, (node, data) in enumerate(sorted(zone_graph.nodes(data=True)))}
+    
     return {
         "person_attrs": person_attrs,
         "times": times,
@@ -258,8 +261,8 @@ def create_training_data_single_person(
         "num_zones": len(zone_graph.nodes()),
         "person_name": person.name,
         "person_id": person.person_id,
-        "home_zone_id": person.home_zone - 1, # 0-indexed
-        "work_zone_id": person.work_zone - 1  # 0-indexed
+        "home_zone_id": zone_name_to_id[person.home_zone],
+        "work_zone_id": zone_name_to_id[person.work_zone]
     }
 
 def create_two_person_training_data(repeat_pattern=True):
