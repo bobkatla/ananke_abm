@@ -82,7 +82,8 @@ class ModeFromPathHead(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(descriptor_dim, config.hidden_dim),
             nn.ReLU(),
-            nn.Linear(config.hidden_dim, config.mode_feature_dim)
+            nn.Linear(config.hidden_dim, config.mode_feature_dim),
+            nn.Tanh() # Constrain the output space
         )
 
         # Register mode prototypes as non-trainable buffers
