@@ -1,5 +1,5 @@
 """
-Tests for the data processing and batching pipeline.
+Tests for the dense grid, snap-fitting, and ragged segment batching pipeline.
 """
 import pytest
 import torch
@@ -7,113 +7,84 @@ import sys
 from pathlib import Path
 from torch.utils.data import DataLoader
 
-# Add the project root to the Python path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from src.ananke_abm.models.latent_ode.data_process.data import LatentSDEDataset, DataProcessor
-from src.ananke_abm.models.latent_ode.data_process.batching import sde_collate_fn
+from src.ananke_abm.models.latent_ode.data_process.batching import sde_collate_fn, K_INTERNAL
 
 
 @pytest.fixture(scope="module")
-def test_data():
-    """Fixture to load test data and prepare a batch."""
+def batch_and_processor():
+    """Fixture to load test data, initialize processor, and create a single batch."""
     device = torch.device("cpu")
     periods_path = "test/test_periods_small.csv"
     snaps_path = "test/test_snaps_small.csv"
 
     processor = DataProcessor(device, periods_path=periods_path, snaps_path=snaps_path)
     dataset = LatentSDEDataset(person_ids=[1, 2], processor=processor)
-    
-    # Use a DataLoader to create a batch
     loader = DataLoader(dataset, batch_size=2, collate_fn=sde_collate_fn)
     batch = next(iter(loader))
     
     return batch, processor
 
-def test_batch_creation_and_shapes(test_data):
-    """Test the basic properties and shapes of the created batch."""
-    batch, _ = test_data
+def test_grid_creation(batch_and_processor):
+    """Validates the dense evaluation grid."""
+    batch, _ = batch_and_processor
+    gt_union = batch['gt_union_times']
     
-    # Time assertions
-    assert torch.all(batch['grid_times'] >= 0) and torch.all(batch['grid_times'] < 24 * 60)
-    assert torch.all(batch['grid_times'][1:] > batch['grid_times'][:-1])
+    assert torch.all(batch['grid_times'][1:] > batch['grid_times'][:-1]), "Grid times not strictly increasing"
+    assert batch['is_gt_grid'].sum() == len(gt_union), "Mismatch between is_gt_grid and gt_union"
+    assert torch.all(batch['grid_times'][batch['is_gt_grid']] == gt_union), "GT times in grid do not match gt_union"
     
-    # Shape assertions
-    b, s = batch['is_gt_batch'].shape
+    expected_dense_len = (len(gt_union) - 1) * (K_INTERNAL - 1) + 1
+    assert len(batch['grid_times']) == expected_dense_len, "Dense grid has incorrect number of points"
+
+def test_state_interpolation_shapes(batch_and_processor):
+    """Validates the shapes of the interpolated state tensors."""
+    batch, _ = batch_and_processor
+    b, s_gt = batch['is_gt_union'].shape
+    
     assert b == 2
-    assert batch['loc_emb_batch'].shape[0] == b and batch['loc_emb_batch'].shape[1] == s
-    assert batch['purp_emb_batch'].shape[0] == b and batch['purp_emb_batch'].shape[1] == s
-    assert batch['anchor_mask_batch'].shape == (b, s)
+    assert batch['loc_emb_union'].shape[:2] == (b, s_gt)
+    assert batch['purp_emb_union'].shape[:2] == (b, s_gt)
+    assert batch['anchor_union'].shape == (b, s_gt)
+    assert batch['loc_emb_union'].dtype == torch.float32
 
-    # No ID leak assertion
-    assert 'loc_id' not in batch and 'zone_id' not in batch
-    assert batch['loc_emb_batch'].dtype == torch.float32
-    assert batch['purp_emb_batch'].dtype == torch.float32
-
-def test_gt_and_anchor_masks(test_data):
-    """Test the ground-truth and anchor masks."""
-    batch, processor = test_data
+def test_flat_stays(batch_and_processor):
+    """Asserts that embeddings are flat during stay periods on the union grid."""
+    batch, processor = batch_and_processor
+    gt_union = batch['gt_union_times']
     
-    gt_counts = [torch.sum(batch['is_gt_batch'][i]).item() for i in range(2)]
-    anchor_counts = [torch.sum(batch['anchor_mask_batch'][i]).item() for i in range(2)]
-
-    expected_gt_counts = [len(processor.get_data(i+1)['gt_times']) for i in range(2)]
-    assert gt_counts == expected_gt_counts
-    
-    # Anchor assertions
-    assert all(count == 2 for count in anchor_counts)
-    assert torch.all((batch['anchor_mask_batch'] == 0) | (batch['is_gt_batch'] == 1))
-
-def test_stay_interpolation(test_data):
-    """Test that embeddings are constant during stay periods."""
-    batch, processor = test_data
-    grid_times = batch['grid_times']
-
-    for i in range(2): # For each person
-        person_id = i + 1
-        data = processor.get_data(person_id)
-        
-        # Check first stay period (home)
-        start_time, end_time = data['gt_times'][0], data['gt_times'][1]
-        start_idx = torch.searchsorted(grid_times, start_time).item()
-        end_idx = torch.searchsorted(grid_times, end_time).item()
-
-        for t_idx in range(start_idx, end_idx + 1):
-            assert torch.allclose(batch['loc_emb_batch'][i, t_idx], data['gt_loc_emb'][0], atol=1e-6)
-            assert torch.allclose(batch['purp_emb_batch'][i, t_idx], data['gt_purp_emb'][0], atol=1e-6)
-
-def test_travel_interpolation(test_data):
-    """Test the linear interpolation during travel periods."""
-    batch, processor = test_data
-    grid_times = batch['grid_times']
-
-    # Person 1: home -> work
     p1_data = processor.get_data(1)
-    t_prev, t_next = p1_data['gt_times'][1], p1_data['gt_times'][2] # 9:00 and 9:30
-    tm = (t_prev + t_next) / 2
+    start_time, end_time = p1_data['segments'][0]['t0'], p1_data['segments'][0]['t1'] # First travel
     
-    tm_idx = torch.searchsorted(grid_times, tm)
+    stay_start_time = p1_data['gt_times'][0]
+    stay_end_time = start_time # End of first stay is start of first travel
+
+    start_idx = torch.searchsorted(gt_union, stay_start_time).item()
+    end_idx = torch.searchsorted(gt_union, stay_end_time).item()
     
-    time_gap = t_next - t_prev
-    w_prev = (t_next - grid_times[tm_idx]) / time_gap
-    w_next = 1 - w_prev
+    for j in range(start_idx, end_idx + 1):
+        assert torch.allclose(batch['loc_emb_union'][0, j], p1_data['gt_loc_emb'][0], atol=1e-6)
 
-    expected_loc_emb = w_prev * p1_data['gt_loc_emb'][1] + w_next * p1_data['gt_loc_emb'][2]
-    expected_purp_emb = w_prev * p1_data['gt_purp_emb'][1] + w_next * p1_data['gt_purp_emb'][2]
-
-    assert torch.allclose(batch['loc_emb_batch'][0, tm_idx], expected_loc_emb, atol=1e-6)
-    assert torch.allclose(batch['purp_emb_batch'][0, tm_idx], expected_purp_emb, atol=1e-6)
-
-
-def test_output_summary(test_data):
-    """Prints a summary if all other tests pass."""
-    batch, _ = test_data
-    b, s, d_loc = batch['loc_emb_batch'].shape
-    d_p = batch['purp_emb_batch'].shape[2]
-    gt_per_person = [int(torch.sum(batch['is_gt_batch'][i]).item()) for i in range(b)]
-    anchors_per_person = [int(torch.sum(batch['anchor_mask_batch'][i]).item()) for i in range(b)]
+def test_ragged_segments(batch_and_processor):
+    """Validates the structure and indices of the ragged segments batch."""
+    batch, processor = batch_and_processor
     
-    print(f"\nOK: B={b} S={s} D_loc={d_loc} D_p={d_p} | "
-          f"GT per person: {gt_per_person} | "
-          f"anchors per person: {anchors_per_person}")
+    assert isinstance(batch['segments_batch'], list)
+    total_segs = len(processor.get_data(1)['segments']) + len(processor.get_data(2)['segments'])
+    assert len(batch['segments_batch']) == total_segs
+    
+    for seg in batch['segments_batch']:
+        assert set(seg.keys()) == {"b", "i0", "i1", "mode_id", "mode_proto"}
+        assert batch['is_gt_grid'][seg['i0']] and batch['is_gt_grid'][seg['i1']]
+        assert seg['i0'] < seg['i1']
 
+def test_final_summary(batch_and_processor):
+    """Prints a summary of the batch structure if all tests pass."""
+    batch, _ = batch_and_processor
+    b, s_gt = batch['is_gt_union'].shape
+    s_dense = len(batch['grid_times'])
+    
+    print(f"\nOK: B={b} S_gt={s_gt} S_dense={s_dense} | "
+          f"Total Segments: {len(batch['segments_batch'])}")

@@ -43,9 +43,9 @@ class GenerativeODEConfig:
     loss_weight_embedding: float = 0.5
     loss_weight_distance: float = 2.0
     loss_weight_purpose_class: float = 0.75
-    loss_weight_mode_class: float = 1.0
-    loss_weight_purpose_mse: float = 0.5  # New MSE weight
-    loss_weight_mode_mse: float = 0.5   # New MSE weight
+    loss_weight_purpose_mse: float = 0.5
+    loss_weight_mode_ce_segment: float = 1.0  # New segment-level loss
+    loss_weight_mode_feat_segment: float = 0.5 # New segment-level loss
 
     # --- New Anchor Loss Weight ---
     anchor_loss_weight: float = 15.0
@@ -58,7 +58,7 @@ class GenerativeODEConfig:
 
     # SDE settings for stochastic dynamics
     enable_sde: bool = True
-    sde_noise_strength: float = 0.1
+    sde_noise_strength: float = 0.05
     
     # Attention mechanisms
     enable_attention: bool = True
