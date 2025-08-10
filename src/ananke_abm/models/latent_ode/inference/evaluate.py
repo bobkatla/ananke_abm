@@ -1,190 +1,133 @@
 """
-Script for evaluating the SDE model with segment-based mode prediction.
+Script for evaluating a trained Generative Latent ODE model.
+Enhanced with batched inference for scalable evaluation.
 """
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-import pandas as pd
 from pathlib import Path
+import matplotlib.cm as cm
 
 from ananke_abm.models.latent_ode.config import GenerativeODEConfig
-from ananke_abm.models.latent_ode.inference.inference import InferenceEngine, get_location_mappings
-from ananke_abm.data_generator.feature_engineering import MODE_ID_MAP, get_purpose_features, PURPOSE_ID_MAP
-from matplotlib.patches import Patch
-
-
-def _get_zone_names_and_embeds(location_to_embedding: dict):
-    zone_names = list(location_to_embedding.keys())
-    zone_feats = torch.stack([location_to_embedding[name] for name in zone_names])
-    return zone_names, zone_feats
-
-
-def _encode_zone_features(model, zone_feats: torch.Tensor, device: torch.device):
-    with torch.no_grad():
-        return model.zone_feature_encoder(zone_feats.to(device))  # (Z, D)
-
-
-def _nearest_location_name(model, location_to_embedding, loc_embed_np, device):
-    zone_names, zone_feats = _get_zone_names_and_embeds(location_to_embedding)
-    zone_embeds = _encode_zone_features(model, zone_feats, device)  # (Z, D)
-    loc_embed = torch.tensor(loc_embed_np, dtype=torch.float32, device=device)
-    loc_embed = loc_embed / (loc_embed.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-8))
-    zone_norm = zone_embeds / (zone_embeds.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-8))
-    sims = torch.matmul(zone_norm, loc_embed)
-    idx = int(torch.argmax(sims).item())
-    return zone_names[idx], idx
-
-
-def _nearest_purpose_name(purpose_embed_np):
-    purpose_names = list(PURPOSE_ID_MAP.keys())
-    purpose_feats = torch.stack([get_purpose_features(name) for name in purpose_names])
-    pe = torch.tensor(purpose_embed_np, dtype=torch.float32)
-    pe = pe / (pe.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-8))
-    pf = purpose_feats / (purpose_feats.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-8))
-    sims = torch.matmul(pf, pe)
-    idx = int(torch.argmax(sims).item())
-    return purpose_names[idx]
-
-
-def _build_gt_timeline(person_id: int, periods_df: pd.DataFrame, snaps_df: pd.DataFrame):
-    """Build GT timeline using periods for timing and snaps.csv for grouped purpose labels."""
-    rows = periods_df[periods_df["person_id"] == person_id].copy().sort_values(["start_time"])  # hours
-    timeline = []
-    # Pre-index snaps for quick lookup by (person_id, timestamp)
-    snaps_person = snaps_df[snaps_df["person_id"] == person_id].set_index("timestamp")
-    for _, r in rows.iterrows():
-        start = float(r["start_time"]) ; end = float(r["end_time"]) ; loc = r["location"]
-        if r["type"] == "stay":
-            # Use grouped purpose from snaps.csv at the stay start timestamp
-            purpose = snaps_person.loc[start]["purpose"] if start in snaps_person.index else r["purpose"]
-            timeline.append({
-                "type": "stay",
-                "start": start,
-                "end": end,
-                "location": loc,
-                "purpose": str(purpose),
-            })
-        else:
-            timeline.append({
-                "type": "travel",
-                "start": start,
-                "end": end,
-                "location": loc,
-                "purpose": "travel",
-                "mode": r.get("mode", "unknown"),
-            })
-    return timeline
-
-
-def _build_pred_timeline(itinerary: list, model, location_to_embedding, device):
-    # First pass: map stays to labels
-    labeled = []
-    for seg in itinerary:
-        if seg["type"] == "stay":
-            loc_name, _ = _nearest_location_name(model, location_to_embedding, seg["location_embedding"], device)
-            purpose_name = _nearest_purpose_name(seg["purpose_embedding"])
-            labeled.append({
-                "type": "stay",
-                "start": float(seg["start_time"]),
-                "end": float(seg["end_time"]),
-                "location": loc_name,
-                "purpose": purpose_name,
-            })
-        else:
-            labeled.append({
-                "type": "travel",
-                "start": float(seg["start_time"]),
-                "end": float(seg["end_time"]),
-                "mode": list(MODE_ID_MAP.keys())[seg.get("mode_id", -1)] if seg.get("mode_id", -1) >= 0 else "unknown",
-            })
-    # Second pass: ensure we know start/end locations for travel to position mode label
-    # We derive start/end location IDs from neighboring stays when available
-    return labeled
-
-
-def _plot_person(ax_top, ax_bot, gt_timeline, pred_timeline, zone_names_order, title_suffix=""):
-    zone_to_id = {name: i for i, name in enumerate(zone_names_order)}
-
-    # Build purpose color map from union of GT and Pred purposes
-    gt_purposes = {seg["purpose"] for seg in gt_timeline if seg["type"] == "stay"}
-    pred_purposes = {seg["purpose"] for seg in pred_timeline if seg["type"] == "stay"}
-    purposes = sorted(gt_purposes.union(pred_purposes))
-    if not purposes:
-        purposes = ["unknown"]
-    purpose_colors = {p: plt.cm.tab10(i % 10) for i, p in enumerate(purposes)}
-
-    # Helper to draw timeline on a given axis
-    def draw(ax, timeline, label_modes=True):
-        for seg in timeline:
-            if seg["type"] == "stay":
-                y = zone_to_id.get(seg["location"], -1)
-                if y >= 0:
-                    ax.fill_betweenx([y - 0.35, y + 0.35], seg["start"], seg["end"],
-                                     color=purpose_colors.get(seg["purpose"], "#cccccc"), alpha=0.85)
-                    ax.plot([seg["start"], seg["end"]], [y, y], color="#333333", linewidth=1)
-            else:
-                if not label_modes:
-                    continue
-                mid_t = (seg["start"] + seg["end"]) / 2.0
-                ax.text(mid_t, -0.8, seg.get("mode", ""),
-                        ha="center", va="center", fontsize=10,
-                        bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"))
-
-        ax.set_yticks(list(range(len(zone_names_order))))
-        ax.set_yticklabels(zone_names_order)
-        ax.set_xlim(0, 24)
-        ax.set_xlabel("Time (hours)")
-        ax.grid(True, axis="y", alpha=0.2)
-
-    draw(ax_top, gt_timeline)
-    ax_top.set_title(f"Ground Truth {title_suffix}")
-    draw(ax_bot, pred_timeline)
-    ax_bot.set_title(f"Generated {title_suffix}")
-
-    # Purpose legend (shared, shown on top axis)
-    legend_patches = [Patch(facecolor=purpose_colors[p], edgecolor='none', label=p) for p in purposes]
-    ax_top.legend(handles=legend_patches, title='Stay Purposes', loc='upper left', bbox_to_anchor=(1.02, 1.0))
-
+from ananke_abm.models.latent_ode.data_process.data import DataProcessor
+from ananke_abm.models.latent_ode.inference.inference import BatchedInferenceEngine
+from ananke_abm.data_generator.feature_engineering import ID_TO_MODE_MAP, ID_TO_PURPOSE_MAP
 
 def evaluate():
-    """Loads a trained model and evaluates its generated itineraries."""
+    """Loads a trained model and generates evaluation plots."""
     config = GenerativeODEConfig()
-    save_folder = Path("saved_models/mode_separated")
-    save_folder.mkdir(parents=True, exist_ok=True)
-    model_path = "saved_models/best_model.pth"
-    
-    inference_engine = InferenceEngine(model_path, config)
-    processor = inference_engine.processor
-    device = inference_engine.device
-    
-    # Create the mappings we need for evaluation
-    location_to_embedding, _ = get_location_mappings()
-    zone_names_order = list(location_to_embedding.keys())
-    
-    person_ids = [1, 2]
-    generated_itineraries = inference_engine.predict_trajectories(person_ids)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    processor = DataProcessor(device, config)
+    print(f"🔬 Using device: {device}")
 
-    periods = pd.read_csv("data/periods.csv")
-    snaps = pd.read_csv("data/snaps.csv")
-
-    for result in generated_itineraries:
-        person_id = result['person_id']
-        itinerary = result['itinerary']
+    # --- Load Trained Model ---
+    folder_path = Path("saved_models/mode_generative_ode_batched")
+    model_path = folder_path / "latent_ode_best_model_batched.pth"
+    print(f"📈 Evaluating model from '{model_path}'...")
+    
+    try:
+        inference_engine = BatchedInferenceEngine(str(model_path), config, device=str(device))
+    except FileNotFoundError:
+        print(f"ERROR: Model file not found at {model_path}. Please run train.py first.")
+        return
         
-        # GT timeline in real labels, using grouped purposes from snaps.csv
-        gt_timeline = _build_gt_timeline(person_id, periods, snaps)
+    # --- Plot Training Loss ---
+    training_stats_path = folder_path / "latent_ode_training_stats_batched.npz"
+    try:
+        stats = np.load(training_stats_path)
+        plt.figure(figsize=(16, 8))
+        loss_keys = {k: k.replace('_', ' ').title() for k in stats.files}
         
-        # Predicted timeline (map embeddings to nearest labels)
-        pred_timeline = _build_pred_timeline(itinerary, inference_engine.model, location_to_embedding, device)
+        for key, label in loss_keys.items():
+            plt.plot(stats[key], label=label, alpha=0.9)
 
-        # --- Plotting: two stacked panels per person ---
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 9), sharex=True)
-        _plot_person(ax1, ax2, gt_timeline, pred_timeline, zone_names_order, title_suffix=f"Itinerary for Person {person_id}")
+        plt.title("All Training Loss Components")
+        plt.xlabel("Iteration")
+        plt.ylabel("Average Loss (Log Scale)")
+        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+        plt.legend()
+        plt.yscale('log')
         plt.tight_layout()
-        plt.savefig(save_folder / f"evaluation_itinerary_person_{person_id}.png")
+        loss_plot_path = folder_path / "all_training_loss_curves_batched.png"
+        plt.savefig(loss_plot_path)
+        print(f"   📉 All training loss plots saved to '{loss_plot_path}'")
         plt.close()
-        print(f"Generated evaluation plot for person {person_id}.")
+            
+    except FileNotFoundError:
+        print(f"WARNING: Training stats file not found at {training_stats_path}. Skipping loss plot.")
 
+    # --- Batched Inference ---
+    person_ids = [1, 2]
+    time_resolution = 500
+    num_samples_to_plot = 3 # Generate multiple trajectories to see stochasticity
+    
+    print(f"🚀 Performing batched inference for {len(person_ids)} people ({num_samples_to_plot} samples each)...")
+    
+    predictions = inference_engine.predict_trajectories(
+        person_ids=person_ids,
+        time_resolution=time_resolution,
+        batch_size=len(person_ids),
+        num_samples=num_samples_to_plot
+    )
+    
+    plot_times = predictions['times']
+    pred_locations = predictions['locations'] # Shape: [num_people, num_samples, num_times]
+    pred_purposes = predictions['purposes'] 
+    pred_modes = predictions['modes']
+
+    # --- Dynamic Labels from Feature Engineering ---
+    purpose_names = [ID_TO_PURPOSE_MAP[i] for i in sorted(ID_TO_PURPOSE_MAP.keys())]
+    mode_names = [ID_TO_MODE_MAP[i] for i in sorted(ID_TO_MODE_MAP.keys())]
+
+    # --- Individual Visualizations ---
+    for i, person_id in enumerate(person_ids):
+        data = processor.get_data(person_id=person_id)
+        person_name = data['person_name']
+        print(f"   -> Generating visualization for {person_name}...")
+
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 14), sharex=True)
+        colors = cm.viridis(np.linspace(0, 1, num_samples_to_plot))
+
+        # --- Plot Ground Truth ---
+        ax1.plot(data["times"].cpu().numpy(), data["trajectory_y"].cpu().numpy(), 'o', color='black', label='Ground Truth Location', markersize=8)
+        ax2.plot(data["times"].cpu().numpy(), data["target_purpose_ids"].cpu().numpy(), 'o', color='black', label='Ground Truth Purpose', markersize=8)
+        ax3.plot(data["times"].cpu().numpy(), data["target_mode_ids"].cpu().numpy(), 'o', color='black', label='Ground Truth Mode', markersize=8)
+
+        # --- Plot Generated Samples ---
+        for s_idx in range(num_samples_to_plot):
+            label = f'Generated Sample {s_idx+1}'
+            ax1.plot(plot_times, pred_locations[i, s_idx, :], '-', color=colors[s_idx], label=label, alpha=0.8)
+            ax2.plot(plot_times, pred_purposes[i, s_idx, :], '-', color=colors[s_idx], label=label, alpha=0.8)
+            ax3.plot(plot_times, pred_modes[i, s_idx, :], '-', color=colors[s_idx], label=label, alpha=0.8)
+
+        # Formatting
+        ax1.set_ylabel("Zone ID")
+        ax1.set_title(f"Generated vs. Ground Truth for {person_name}")
+        ax1.set_yticks(np.arange(data["num_zones"]))
+        ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
+        
+        ax2.set_ylabel("Purpose ID")
+        ax2.set_yticks(np.arange(len(purpose_names)))
+        ax2.set_yticklabels(purpose_names, rotation=30, ha='right')
+        ax2.grid(True, which='both', linestyle='--', linewidth=0.5)
+        
+        ax3.set_xlabel("Time (hours)")
+        ax3.set_ylabel("Mode ID")
+        ax3.set_yticks(np.arange(len(mode_names)))
+        ax3.set_yticklabels(mode_names, rotation=0, ha='right')
+        ax3.grid(True, which='both', linestyle='--', linewidth=0.5)
+        
+        # Create a single legend for the figure
+        handles, labels = ax1.get_legend_handles_labels()
+        unique_labels = dict(zip(labels, handles))
+        fig.legend(unique_labels.values(), unique_labels.keys(), loc='upper right')
+
+        plt.tight_layout(rect=[0, 0, 0.9, 1]) # Adjust layout to make space for legend
+        
+        save_path = folder_path / f"evaluation_trajectory_{person_name.replace(' ', '_')}.png"
+        plt.savefig(save_path)
+        print(f"   📄 Plot saved to '{save_path}'")
+        plt.close()
 
 if __name__ == "__main__":
     evaluate()

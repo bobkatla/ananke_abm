@@ -1,23 +1,28 @@
 """
-Data processing for the Generative SDE model, providing snap-based state
-and segment-based travel information.
+Data processing for the Generative Latent ODE model.
 """
 import torch
-import pandas as pd
-import numpy as np
+import torch.nn.functional as F
+import networkx as nx
+
+from ananke_abm.data_generator.mock_2p import (
+    create_training_data_single_person,
+    create_sarah_daily_pattern,
+    create_marcus_daily_pattern,
+    create_sarah, create_marcus
+)
+from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
 from ananke_abm.data_generator.feature_engineering import (
     get_purpose_features,
     get_mode_features,
     PURPOSE_ID_MAP,
     MODE_ID_MAP,
 )
-from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
+from ananke_abm.models.latent_ode.config import GenerativeODEConfig
 from torch.utils.data import Dataset
 
-
-class LatentSDEDataset(Dataset):
+class LatentODEDataset(Dataset):
     """PyTorch Dataset to provide individual samples for the DataLoader."""
-
     def __init__(self, person_ids, processor):
         self.person_ids = person_ids
         self.processor = processor
@@ -27,77 +32,111 @@ class LatentSDEDataset(Dataset):
 
     def __getitem__(self, idx):
         person_id = self.person_ids[idx]
-        return self.processor.get_data(person_id)
-
+        data = self.processor.get_data(person_id)
+        data['config'] = self.processor.config
+        return data
 
 class DataProcessor:
-    """Processes CSV data to produce snap and segment tensors for the SDE model."""
+    """Processes mock data, preparing it for the Generative ODE model."""
 
-    def __init__(self, device, location_to_embedding, location_name_to_id, periods_path="data/periods.csv", snaps_path="data/snaps.csv"):
+    def __init__(self, device, config: GenerativeODEConfig):
         self.device = device
-        self.person_data = {}
-        self.location_embeddings = torch.stack(list(location_to_embedding.values())).to(self.device)
-        self.location_name_to_id = location_name_to_id
-        self._load_and_process_data(periods_path, snaps_path, location_to_embedding)
+        self.config = config
+        
+        # Load the static graph and distance matrix once
+        self.zone_graph, self.zones_raw, self.distance_matrix = create_mock_zone_graph()
+        self.distance_matrix = self.distance_matrix.to(device)
 
-    def _get_purpose_embeddings(self):
-        return {name: get_purpose_features(name) for name in PURPOSE_ID_MAP.keys()}
-    
-    def _get_mode_embeddings(self):
-        return {name: get_mode_features(mid) for name, mid in MODE_ID_MAP.items()}
-
-    def _load_and_process_data(self, periods_path, snaps_path, location_to_embedding):
-        """Loads, validates, and processes CSV data for all persons."""
-        periods_df = pd.read_csv(periods_path)
-        snaps_df = pd.read_csv(snaps_path)
-
-        purpose_to_embedding = self._get_purpose_embeddings()
-        mode_to_embedding = self._get_mode_embeddings()
-
-        for person_id in periods_df["person_id"].unique():
-            person_periods = periods_df[periods_df["person_id"] == person_id].sort_values(by="start_time")
-            
-            # --- Snaps Processing ---
-            person_snaps = snaps_df[snaps_df["person_id"] == person_id].sort_values(by="timestamp")
-            gt_times_hours = torch.tensor(np.round(person_snaps["timestamp"].values, 2), dtype=torch.float32)
-            gt_loc_emb = torch.stack([location_to_embedding[loc] for loc in person_snaps["location"]])
-            gt_loc_ids = torch.tensor([self.location_name_to_id[loc] for loc in person_snaps["location"]], dtype=torch.long)
-            gt_purp_emb = torch.stack([purpose_to_embedding[purp] for purp in person_snaps["purpose"]])
-            gt_purp_ids = torch.tensor([PURPOSE_ID_MAP[purp] for purp in person_snaps["purpose"]], dtype=torch.long)
-            gt_anchor = torch.tensor(person_snaps["anchor"].values, dtype=torch.float32)
-
-            # --- Segments Processing ---
-            travel_periods = person_periods[person_periods["type"] == "travel"]
-            segments = []
-            time_to_snap_idx = {round(t.item(), 2): i for i, t in enumerate(gt_times_hours)}
-
-            for _, period in travel_periods.iterrows():
-                t0 = round(period["start_time"], 2)
-                t1 = round(period["end_time"], 2)
-                
-                assert t0 in time_to_snap_idx, f"Segment start time {t0} not in snaps for person {person_id}"
-                assert t1 in time_to_snap_idx, f"Segment end time {t1} not in snaps for person {person_id}"
-
-                segments.append({
-                    "t0": t0,
-                    "t1": t1,
-                    "mode_id": MODE_ID_MAP[period["mode"]],
-                    "mode_proto": mode_to_embedding[period["mode"]],
-                    "snap_i0": time_to_snap_idx[t0],
-                    "snap_i1": time_to_snap_idx[t1],
-                })
-
-            self.person_data[person_id] = {
-                "gt_times": gt_times_hours.to(self.device),
-                "gt_loc_emb": gt_loc_emb.to(self.device),
-                "gt_loc_ids": gt_loc_ids.to(self.device),
-                "gt_purp_emb": gt_purp_emb.to(self.device),
-                "gt_purp_ids": gt_purp_ids.to(self.device),
-                "gt_anchor": gt_anchor.to(self.device),
-                "segments": segments,
-                "stay_intervals": [(round(p["start_time"], 2), round(p["end_time"], 2)) for _, p in person_periods[person_periods["type"] == "stay"].iterrows()],
-                "person_id": person_id,
-            }
+        # --- Activity/Purpose Processing ---
+        # Define the mapping from detailed activities to broader categories
+        self.activity_to_group = {
+            # Home activities
+            "sleep": "home", "morning_routine": "home", "evening": "home", 
+            "dinner": "home", "arrive_home": "home",
+            # Work/Education
+            "work": "work", "arrive_work": "work", "end_work": "work",
+            # Subsistence
+            "lunch": "shopping", "lunch_start": "shopping", "lunch_end": "shopping", # Simplified to shopping
+            # Leisure & Recreation
+            "gym": "social", "gym_end": "social", # Simplified to social
+            "exercise": "social", "leaving_park": "social",
+            # Social
+            "social": "social", "leaving_social": "social", "dinner_social": "social",
+            # Travel/Transit
+            "prepare_commute": "travel", "start_commute": "travel",
+            "transit": "travel", "leaving_home": "travel",
+            "break": "travel",
+        }
+        self.purpose_map = PURPOSE_ID_MAP
+        
+        # --- Mode Processing ---
+        # Define the mapping from travel modes to mode IDs
+        self.mode_map = MODE_ID_MAP
 
     def get_data(self, person_id):
-        return self.person_data[person_id]
+        """
+        Processes mock data for a single person, resampling it to a uniform time grid.
+        Now includes sequences of purpose IDs and mode IDs for loss calculation,
+        as well as rich feature vectors for model input.
+        """
+        if person_id == 1:
+            schedule = create_sarah_daily_pattern()
+            person_obj = create_sarah()
+        else:
+            schedule = create_marcus_daily_pattern()
+            person_obj = create_marcus()
+            
+        data = create_training_data_single_person(
+            person=person_obj,
+            schedule=schedule,
+            zone_graph=self.zone_graph,
+            repeat_pattern=False
+        )
+
+        activities = data["activities"]
+        travel_modes = data["travel_modes"]
+        
+        # --- Create the target sequence of purpose IDs ---
+        target_purpose_ids = torch.tensor(
+            [self.purpose_map[self.activity_to_group.get(act, "travel")] for act in activities],
+            dtype=torch.long
+        ).to(self.device)
+        
+        # --- Create the target sequence of mode IDs ---
+        target_mode_ids = torch.tensor(
+            [self.mode_map.get(mode.lower(), self.mode_map["stay"]) for mode in travel_modes],
+            dtype=torch.long
+        ).to(self.device)
+
+        # --- Create rich feature vectors from IDs ---
+        target_purpose_features = torch.stack([get_purpose_features(pid.item()) for pid in target_purpose_ids]).to(self.device)
+        target_mode_features = torch.stack([get_mode_features(mid.item()) for mid in target_mode_ids]).to(self.device)
+
+        # Convert importance strings to numerical weights
+        importance_weights = [
+            self.config.anchor_loss_weight if imp == 'anchor' else 1.0
+            for imp in data['importances']
+        ]
+        
+        zone_features = data['zone_features'].to(self.device)
+        home_zone_features = zone_features[data['home_zone_id']]
+        work_zone_features = zone_features[data['work_zone_id']]
+        
+        adjacency_matrix = torch.tensor(nx.to_numpy_array(self.zone_graph), dtype=torch.float32, device=self.device)
+        adjacency_matrix.fill_diagonal_(1)
+
+        return {
+            "person_features": data["person_attrs"].to(self.device),
+            "times": data["times"].to(self.device),
+            "trajectory_y": data["zone_observations"].to(self.device),
+            "target_purpose_ids": target_purpose_ids,
+            "target_mode_ids": target_mode_ids,
+            "target_purpose_features": target_purpose_features,
+            "target_mode_features": target_mode_features,
+            "importance_weights": torch.tensor(importance_weights, dtype=torch.float32, device=self.device),
+            "num_zones": len(self.zones_raw),
+            "person_name": data['person_name'],
+            "home_zone_features": home_zone_features,
+            "work_zone_features": work_zone_features,
+            "all_zone_features": zone_features,
+        }

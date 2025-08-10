@@ -1,167 +1,115 @@
 """
-Main script for training the SDE model with segment-based mode prediction.
+Main script for training the Generative Latent ODE model.
 """
 import torch
+import numpy as np
 from pathlib import Path
 from torch.utils.data import DataLoader
 
 from ananke_abm.models.latent_ode.config import GenerativeODEConfig
-from ananke_abm.models.latent_ode.data_process.data import DataProcessor, LatentSDEDataset
+from ananke_abm.models.latent_ode.data_process.data import DataProcessor, LatentODEDataset
 from ananke_abm.models.latent_ode.architecture.model import GenerativeODE
-from ananke_abm.models.latent_ode.architecture.loss import calculate_path_loss, calculate_segment_mode_loss
-from ananke_abm.models.latent_ode.data_process.batching import sde_collate_fn
-from ananke_abm.data_generator.feature_engineering import get_purpose_features
-from ananke_abm.data_generator.mock_locations import create_mock_zone_graph
-from ananke_abm.data_generator.mock_2p import create_sarah, create_marcus
-
-
-def get_location_mappings():
-    """Creates authoritative mappings from the mock locations."""
-    _, zones_raw, _ = create_mock_zone_graph()
-    location_to_embedding = {}
-    location_name_to_id = {}
-    for i, (zone_id, zone_data) in enumerate(sorted(zones_raw.items())):
-        zone_name = zone_data["name"]
-        features = [
-            zone_data["population"] / 10000.0,
-            zone_data["job_opportunities"] / 5000.0,
-            zone_data["retail_accessibility"],
-            zone_data["transit_accessibility"],
-            zone_data["attractiveness"],
-            zone_data["coordinates"][0] / 5.0,
-            zone_data["coordinates"][1] / 5.0,
-        ]
-        location_to_embedding[zone_name] = torch.tensor(features, dtype=torch.float32)
-        location_name_to_id[zone_name] = i
-    return location_to_embedding, location_name_to_id
-
-
-def get_person_features(person):
-    """Generates a normalized feature tensor for a person."""
-    return torch.tensor([
-        person.age / 100.0,
-        person.income / 100000.0,
-        1.0 if person.employment_status == "full_time" else 0.0,
-        1.0 if person.commute_preference == "car" else 0.0,
-        person.activity_flexibility,
-        person.social_tendency,
-        person.household_size / 10.0,
-        1.0 if person.has_car else 0.0
-    ], dtype=torch.float32)
-
+from ananke_abm.models.latent_ode.architecture.loss import calculate_composite_loss
+from ananke_abm.models.latent_ode.data_process.batching import unify_and_interpolate_batch
 
 def train():
-    """Orchestrates the training of the Generative SDE model."""
+    """Orchestrates the training of the Generative ODE model using batched data."""
     config = GenerativeODEConfig()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # --- Create authoritative location mappings ---
-    location_to_embedding, location_name_to_id = get_location_mappings()
+    processor = DataProcessor(device, config)
+    print(f"🔬 Using device: {device}", flush=True)
+    print(f"🎲 SDE enabled: {config.enable_sde} (noise strength: {config.sde_noise_strength})", flush=True)
 
-    # --- Setup DataProcessor and DataLoader ---
-    processor = DataProcessor(device, location_to_embedding, location_name_to_id)
-    dataset = LatentSDEDataset(person_ids=[1, 2], processor=processor)
-    data_loader = DataLoader(dataset, batch_size=2, shuffle=True, collate_fn=sde_collate_fn)
-
+    # --- Setup DataLoader ---
+    person_ids = [1, 2] # Sarah and Marcus
+    dataset = LatentODEDataset(person_ids, processor)
+    data_loader = DataLoader(dataset, batch_size=len(person_ids), shuffle=True, collate_fn=unify_and_interpolate_batch)
 
     # --- Model Initialization ---
-    sample_data = processor.get_data(1)
-    
-    # --- Create consistent person and context features ---
-    sarah = create_sarah()
-    marcus = create_marcus()
-    person_features = torch.stack([
-        get_person_features(sarah),
-        get_person_features(marcus)
-    ]).to(device)
-    person_feat_dim = person_features.shape[1]
-    
-    home_zone_features = torch.stack([
-        location_to_embedding[sarah.home_zone],
-        location_to_embedding[marcus.home_zone]
-    ]).to(device)
-    
-    work_zone_features = torch.stack([
-        location_to_embedding[sarah.work_zone],
-        location_to_embedding[marcus.work_zone]
-    ]).to(device)
-
-    initial_purpose_features = torch.stack([
-        get_purpose_features("home"),
-        get_purpose_features("home") # Both start at home
-    ]).to(device)
-    
+    init_batch = next(iter(data_loader))
     model = GenerativeODE(
-        person_feat_dim=person_feat_dim,
-        num_zone_features=sample_data['gt_loc_emb'].shape[-1],
+        person_feat_dim=init_batch["person_features"].shape[-1],
+        num_zone_features=init_batch["all_zone_features"].shape[-1],
         config=config,
     ).to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     
-    # --- Prepare for saving the best model ---
-    saved_models_dir = Path("saved_models")
-    saved_models_dir.mkdir(exist_ok=True)
-    best_loss = float('inf')
+    # --- Training Loop (Batched) ---
+    print("🚀 Starting training with hybrid MSE loss...", flush=True)
+    folder_path = Path("saved_models/mode_generative_ode_batched")
+    folder_path.mkdir(exist_ok=True, parents=True)
+    model_path = folder_path / "latent_ode_best_model_batched.pth"
+    training_stats_path = folder_path / "latent_ode_training_stats_batched.npz"
 
-    # --- Training Loop ---
-    print("🚀 Starting training...")
+    best_loss = float('inf')
+    all_losses = []
+
     for i in range(config.num_iterations):
         for batch in data_loader:
             model.train()
             optimizer.zero_grad()
             
-            # --- Forward Pass ---
-            # 1. SDE forward pass to get the latent path
+            # We need the purpose/mode features at the first time step for the encoder
+            initial_purpose_features = batch['y_purp_feat_dense'][:, 0, :]
+            initial_mode_features = batch['y_mode_feat_dense'][:, 0, :]
+            
             model_outputs = model(
-                person_features=person_features, 
-                home_zone_features=home_zone_features,
-                work_zone_features=work_zone_features, 
-                initial_purpose_features=initial_purpose_features,
-                times=batch['grid_times'],
-                all_zone_features=processor.location_embeddings
+                batch['person_features'], 
+                batch['home_zone_features'], 
+                batch['work_zone_features'],
+                initial_purpose_features,
+                initial_mode_features,
+                batch['t_unified'],
+                batch['all_zone_features']
             )
-            pred_p, pred_v = model_outputs[4], model_outputs[5]
-
-            # 2. Segment processing
-            seg_logits, seg_h = model.predict_mode_from_segments(pred_p, pred_v, batch['grid_times'], batch['segments_batch'])
             
-            # --- Loss Calculation ---
-            path_losses = calculate_path_loss(batch, model_outputs, model, None, config)
-            mode_losses = calculate_segment_mode_loss(seg_logits, seg_h, batch['segments_batch'], config)
-            
-            loss_loc_ce, loss_loc_mse, loss_purp_ce, loss_purp_mse, kl_loss, loss_stay_velocity = path_losses
-            loss_mode_ce, loss_mode_feat = mode_losses
-
-            total_loss = (
-                config.loss_weight_classification * loss_loc_ce +
-                config.loss_weight_embedding * loss_loc_mse +
-                config.loss_weight_purpose_class * loss_purp_ce +
-                config.loss_weight_purpose_mse * loss_purp_mse +
-                config.loss_weight_mode_ce_segment * loss_mode_ce +
-                config.loss_weight_mode_feat_segment * loss_mode_feat +
-                config.loss_weight_stay_velocity * loss_stay_velocity +
-                config.kl_weight * kl_loss
+            # Calculate the composite loss, now with MSE components
+            losses = calculate_composite_loss(
+                batch, model_outputs, model, processor.distance_matrix, config
             )
+            total_loss = losses[0]
+
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+        
+        # Store all loss components for the iteration
+        all_losses.append([l.item() for l in losses])
 
         if (i + 1) % 500 == 0:
+            (
+                _, loss_c, loss_e, loss_d, 
+                loss_pc, loss_pm, loss_mc, loss_mm, loss_kl
+            ) = [l.item() for l in losses]
             print(f"Iter {i+1}, Loss: {total_loss.item():.4f} | "
-                  f"Snap (Loc/Purp): {loss_loc_ce.item():.2f}/{loss_purp_ce.item():.2f} | "
-                  f"Segment (Mode CE/Feat): {loss_mode_ce.item():.2f}/{loss_mode_feat.item():.2f} | "
-                  f"Stay Vel: {loss_stay_velocity.item():.2f} | "
-                  f"KL: {kl_loss.item():.2f}")
+                  f"Loc (C/E/D): {loss_c:.2f}/{loss_e:.2f}/{loss_d:.2f} | "
+                  f"Purp (C/MSE): {loss_pc:.2f}/{loss_pm:.2f} | "
+                  f"Mode (C/MSE): {loss_mc:.2f}/{loss_mm:.2f} | "
+                  f"KL: {loss_kl:.2f}", flush=True)
 
-        # Save the model if it's the best so far
+
         if total_loss.item() < best_loss:
             best_loss = total_loss.item()
-            save_path = saved_models_dir / "best_model.pth"
-            torch.save(model.state_dict(), save_path)
-            print(f"✨ Epoch {i+1}: New best model saved to {save_path} with loss: {best_loss:.4f}")
+            torch.save(model.state_dict(), model_path)
+            print(f"💾 New best model saved at iteration {i+1} with loss {best_loss:.4f}", flush=True)
+            
+    print("✅ Training complete.", flush=True)
 
-    print("✅ Training complete.")
+    # --- Save Training Statistics ---
+    all_losses = np.array(all_losses)
+    np.savez(
+        training_stats_path, 
+        total_loss=all_losses[:, 0],
+        classification_loss=all_losses[:, 1],
+        embedding_loss=all_losses[:, 2],
+        distance_loss=all_losses[:, 3],
+        purpose_class_loss=all_losses[:, 4],
+        purpose_mse_loss=all_losses[:, 5],
+        mode_class_loss=all_losses[:, 6],
+        mode_mse_loss=all_losses[:, 7],
+        kl_loss=all_losses[:, 8]
+    )
+    print(f"   💾 Training stats saved to '{training_stats_path}'", flush=True)
 
 if __name__ == "__main__":
     train()

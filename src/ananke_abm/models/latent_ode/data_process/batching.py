@@ -1,108 +1,128 @@
 """
-Implements the dense evaluation grid batching strategy for the SDE model.
+Implements the 'Unified Timeline' batching strategy for the Latent ODE model.
+
+This module provides a function to be used as a `collate_fn` in a PyTorch
+DataLoader. It takes a list of individual, variable-length time series samples
+and combines them into a single, dense batch suitable for parallel processing.
 """
 import torch
+from ananke_abm.data_generator.feature_engineering import get_feature_dimensions, MODE_ID_MAP, PURPOSE_ID_MAP
 
-K_INTERNAL = 8  # Number of evaluation points per segment (including endpoints)
 
-def sde_collate_fn(batch):
+def unify_and_interpolate_batch(batch):
     """
-    Collates samples into a batch with a dense evaluation grid and ragged segments.
+    Takes a list of individual data samples and collates them into a single batch
+    using the "Unified Timeline" strategy, with intelligent interpolation and
+    pre-computed anchor indices for time-weighted embedding loss.
     """
-    # --- 1. Unified GT Snap Grid ---
-    all_gt_times = [s['gt_times'] for s in batch]
-    gt_union = torch.cat(all_gt_times).unique(sorted=True)
+    # --- 1. Collect all features and create the unified timeline ---
+    all_times = [s['times'] for s in batch]
+    all_y_loc = [s['trajectory_y'] for s in batch]
+    all_y_purp = [s['target_purpose_ids'] for s in batch]
+    all_y_mode = [s['target_mode_ids'] for s in batch]
+    all_y_purp_feat = [s['target_purpose_features'] for s in batch]
+    all_y_mode_feat = [s['target_mode_features'] for s in batch]
+    all_imp_weights = [s['importance_weights'] for s in batch]
     
-    # --- 2. Dense Evaluation Grid ---
-    dense_times = []
-    for i in range(len(gt_union) - 1):
-        t_start, t_end = gt_union[i], gt_union[i+1]
-        dense_times.append(torch.linspace(t_start, t_end, K_INTERNAL)[:-1])
-    dense_times.append(gt_union[-1].unsqueeze(0))
-    grid_times = torch.cat(dense_times)
-    
-    is_gt_grid = torch.isin(grid_times, gt_union)
-    
-    # --- 3. Interpolate State to GT Union Grid ---
+    t_unified = torch.cat(all_times).unique(sorted=True)
+    unified_len = len(t_unified)
     batch_size = len(batch)
-    d_loc = batch[0]['gt_loc_emb'].shape[1]
-    d_purp = batch[0]['gt_purp_emb'].shape[1]
-    s_gt = len(gt_union)
+    device = batch[0]['person_features'].device
+    config = batch[0]['config']
+    
+    # Get feature dimensions
+    mode_feat_dim, purp_feat_dim = get_feature_dimensions()
 
-    loc_emb_union = torch.zeros((batch_size, s_gt, d_loc), dtype=torch.float32)
-    purp_emb_union = torch.zeros((batch_size, s_gt, d_purp), dtype=torch.float32)
-    loc_ids_union = torch.full((batch_size, s_gt), -100, dtype=torch.long) # Use ignore_index
-    purp_ids_union = torch.full((batch_size, s_gt), -100, dtype=torch.long) # Use ignore_index
-    is_gt_union = torch.zeros((batch_size, s_gt), dtype=torch.float32)
-    anchor_union = torch.zeros((batch_size, s_gt), dtype=torch.float32)
+    # --- 2. Create dense tensors and masks ---
+    y_loc_dense = torch.full((batch_size, unified_len), -1, dtype=torch.long, device=device)
+    y_purp_dense = torch.full((batch_size, unified_len), -1, dtype=torch.long, device=device)
+    y_mode_dense = torch.full((batch_size, unified_len), -1, dtype=torch.long, device=device)
+    y_purp_feat_dense = torch.zeros((batch_size, unified_len, purp_feat_dim), dtype=torch.float32, device=device)
+    y_mode_feat_dense = torch.zeros((batch_size, unified_len, mode_feat_dim), dtype=torch.float32, device=device)
+    
+    loss_mask = torch.zeros((batch_size, unified_len), device=device)
+    importance_mask = torch.ones((batch_size, unified_len), device=device)
+    
+    if config.train_on_interpolated_points:
+        loss_mask.fill_(1.0)
+    
+    # Get the ID for "Travel" for intelligent filling
+    travel_purpose_id = PURPOSE_ID_MAP["travel"]
+    
+    # Get the ID for "Stay" mode for intelligent filling (for mode transition)
+    stay_mode_id = MODE_ID_MAP["stay"]
+    
+    # --- 3. Pre-compute anchor indices and fill dense tensors ---
+    prev_real_indices = torch.zeros((batch_size, unified_len), dtype=torch.long, device=device)
+    next_real_indices = torch.zeros((batch_size, unified_len), dtype=torch.long, device=device)
+    
+    t_to_idx = {t.item(): i for i, t in enumerate(t_unified)}
 
     for i in range(batch_size):
-        person_gt_times = batch[i]['gt_times']
-        person_gt_indices = torch.searchsorted(gt_union, person_gt_times)
+        original_times = all_times[i]
+        indices_in_unified = torch.tensor([t_to_idx[t.item()] for t in original_times], device=device)
         
-        loc_ids_union[i, person_gt_indices] = batch[i]['gt_loc_ids']
-        purp_ids_union[i, person_gt_indices] = batch[i]['gt_purp_ids']
-        is_gt_union[i, person_gt_indices] = 1.0
-        anchor_union[i, person_gt_indices] = batch[i]['gt_anchor']
-
-        for j, t_union in enumerate(gt_union):
-            # Find bracketing GT snaps for this person
-            k_next = torch.searchsorted(person_gt_times, t_union, side='left')
-            k_prev = k_next - 1
-            
-            k_prev = torch.clamp(k_prev, 0, len(person_gt_times) - 1)
-            k_next = torch.clamp(k_next, 0, len(person_gt_times) - 1)
-            
-            t_prev, t_next = person_gt_times[k_prev], person_gt_times[k_next]
-            
-            if t_prev == t_next:
-                w_prev, w_next = 1.0, 0.0
-            else:
-                w_next = (t_union - t_prev) / (t_next - t_prev).clamp(min=1e-6)
-                w_prev = 1.0 - w_next
-
-            loc_emb_union[i, j] = w_prev * batch[i]['gt_loc_emb'][k_prev] + w_next * batch[i]['gt_loc_emb'][k_next]
-            purp_emb_union[i, j] = w_prev * batch[i]['gt_purp_emb'][k_prev] + w_next * batch[i]['gt_purp_emb'][k_next]
-
-    # --- 4. Map Union -> Dense Indices ---
-    union_to_dense = torch.searchsorted(grid_times, gt_union)
-
-    # --- 5. Segments as Ragged List ---
-    segments_batch = []
-    for i in range(batch_size):
-        person_gt_times = batch[i]['gt_times']
-        union_indices = torch.searchsorted(gt_union, person_gt_times)
+        # Fill dense tensors with data from real observation points
+        y_loc_dense[i, indices_in_unified] = all_y_loc[i]
+        y_purp_dense[i, indices_in_unified] = all_y_purp[i]
+        y_mode_dense[i, indices_in_unified] = all_y_mode[i]
+        y_purp_feat_dense[i, indices_in_unified] = all_y_purp_feat[i]
+        y_mode_feat_dense[i, indices_in_unified] = all_y_mode_feat[i]
+        importance_mask[i, indices_in_unified] = all_imp_weights[i]
         
-        for seg in batch[i]['segments']:
-            segments_batch.append({
-                "b": i,
-                "i0": union_to_dense[union_indices[seg["snap_i0"]]].item(),
-                "i1": union_to_dense[union_indices[seg["snap_i1"]]].item(),
-                "mode_id": seg["mode_id"],
-                "mode_proto": seg["mode_proto"],
-            })
+        if not config.train_on_interpolated_points:
+            loss_mask[i, indices_in_unified] = 1.0
 
-    # --- 6. Create Stay Mask for Velocity Loss ---
-    device = batch[0]['gt_times'].device
-    B, S_dense = len(batch), len(grid_times)
-    stay_mask = torch.zeros(B, S_dense, device=device)
-    for i, item in enumerate(batch):
-        for start_time, end_time in item['stay_intervals']:
-            interval_mask = (grid_times >= start_time) & (grid_times <= end_time)
-            stay_mask[i, interval_mask] = 1.0
+        real_indices = (y_loc_dense[i] != -1).nonzero().squeeze(-1)
+        if len(real_indices) == 0:
+            continue
 
+        # Vectorized calculation of previous and next real indices
+        arange_vec = torch.arange(unified_len, device=device)
+        next_indices_in_real = torch.searchsorted(real_indices, arange_vec, side='right')
+        prev_indices_in_real = torch.searchsorted(real_indices, arange_vec, side='left') - 1
+        
+        next_indices_in_real = torch.clamp(next_indices_in_real, 0, len(real_indices) - 1)
+        prev_indices_in_real = torch.clamp(prev_indices_in_real, 0, len(real_indices) - 1)
+        
+        prev_real_indices[i] = real_indices[prev_indices_in_real]
+        next_real_indices[i] = real_indices[next_indices_in_real]
+
+        # Intelligently fill purpose and mode IDs for interpolated points
+        if len(real_indices) > 1:
+            for j in range(len(real_indices) - 1):
+                start_idx, end_idx = real_indices[j], real_indices[j+1]
+                if start_idx + 1 < end_idx:
+                    start_purp, end_purp = y_purp_dense[i, start_idx], y_purp_dense[i, end_idx]
+                    fill_value = travel_purpose_id if start_purp != end_purp else start_purp.item()
+                    y_purp_dense[i, start_idx + 1 : end_idx] = fill_value
+                    
+                    start_mode, end_mode = y_mode_dense[i, start_idx], y_mode_dense[i, end_idx]
+                    if start_purp != end_purp:
+                        transition_mode = start_mode.item() if start_mode != stay_mode_id else end_mode.item()
+                        y_mode_dense[i, start_idx + 1 : end_idx] = transition_mode
+                    else:
+                        y_mode_dense[i, start_idx + 1 : end_idx] = start_mode.item()
+
+    # Combine the masks here to create the final weight mask
+    final_loss_mask = loss_mask * importance_mask
+
+    # --- 4. Stack all other features ---
     return {
-        'grid_times': grid_times,
-        'is_gt_grid': is_gt_grid,
-        'gt_union_times': gt_union,
-        'loc_emb_union': loc_emb_union,
-        'loc_ids_union': loc_ids_union,
-        'purp_emb_union': purp_emb_union,
-        'purp_ids_union': purp_ids_union,
-        'is_gt_union': is_gt_union,
-        'anchor_union': anchor_union,
-        'union_to_dense': union_to_dense,
-        'segments_batch': segments_batch,
-        'stay_mask': stay_mask,
-        'person_ids': [s['person_id'] for s in batch]
+        't_unified': t_unified,
+        'y_loc_dense': y_loc_dense,
+        'y_purp_dense': y_purp_dense,
+        'y_mode_dense': y_mode_dense,
+        'y_purp_feat_dense': y_purp_feat_dense,
+        'y_mode_feat_dense': y_mode_feat_dense,
+        'loss_mask': final_loss_mask,
+        'prev_real_indices': prev_real_indices,
+        'next_real_indices': next_real_indices,
+        'person_features': torch.stack([s['person_features'] for s in batch]),
+        'home_zone_features': torch.stack([s['home_zone_features'] for s in batch]),
+        'work_zone_features': torch.stack([s['work_zone_features'] for s in batch]),
+        'all_zone_features': batch[0]['all_zone_features'], # Same for all samples
+        'num_zones': batch[0]['num_zones'],
+        'purpose_groups': config.purpose_groups,
+        'person_names': [s['person_name'] for s in batch]
     }
