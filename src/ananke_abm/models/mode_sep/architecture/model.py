@@ -8,6 +8,7 @@ from typing import Tuple
 import torch
 from torch import nn
 from torchdiffeq import odeint
+from torchsde import sdeint
 
 from ananke_abm.models.mode_sep.config import ModeSepConfig
 
@@ -45,7 +46,7 @@ class ODEFunc(nn.Module):
         raise RuntimeError("ODEFunc.forward should be called through WrappedODE which injects dims.")
 
 
-class WrappedODE(nn.Module):
+class WrappedSDE(nn.Module):
     def __init__(self, func: ODEFunc, emb_dim: int, context_dim: int):
         super().__init__()
         self.func = func
@@ -71,6 +72,22 @@ class WrappedODE(nn.Module):
         dh_dt = torch.zeros_like(h)
         return torch.cat([dp_dt, dv_dt, dh_dt], dim=-1)
 
+    # For torchsde: define drift f and diffusion g
+    def f(self, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return self.forward(t, y)
+
+    def g(self, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # Apply isotropic noise only to [p, v]; keep h deterministic
+        B = y.shape[0]
+        E = self.emb_dim
+        H = self.context_dim
+        noise = y.new_zeros(y.shape)
+        # Use a scalar noise strength broadcasted across p and v
+        # Actual magnitude will be handled in the caller via config
+        # Here, set unit noise; scaled later by sde_noise_strength
+        noise[:, : 2 * E] = 1.0
+        return noise
+
 
 class ModeSepModel(nn.Module):
     def __init__(self, Z: int, config: ModeSepConfig):
@@ -95,7 +112,7 @@ class ModeSepModel(nn.Module):
         )
 
         # Drift ODE
-        self.odefunc = WrappedODE(
+        self.odefunc = WrappedSDE(
             ODEFunc(emb_dim=E, context_dim=H, hidden_dim=config.hidden_dim, num_blocks=config.num_res_blocks),
             emb_dim=E,
             context_dim=H,
@@ -138,14 +155,40 @@ class ModeSepModel(nn.Module):
         y0 = torch.cat([p0, v0, h], dim=-1)         # [B, 2E+H]
 
         # Solve ODE
-        y_path = odeint(
-            self.odefunc,
-            y0,
-            times_union,
-            method=self.config.ode_method,
-            rtol=self.config.rtol,
-            atol=self.config.atol,
-        )  # [T, B, 2E+H]
+        if self.config.enable_sde and self.config.sde_noise_strength > 0.0:
+            # Scale diffusion by noise strength by wrapping state
+            class ScaledSDE(nn.Module):
+                def __init__(self, base: WrappedSDE, scale: float):
+                    super().__init__()
+                    self.base = base
+                    self.scale = scale
+                    self.noise_type = 'diagonal'
+                    self.sde_type = 'ito'
+
+                def f(self, t, y):
+                    return self.base.f(t, y)
+
+                def g(self, t, y):
+                    g = self.base.g(t, y)
+                    return g * self.scale
+
+            sde = ScaledSDE(self.odefunc, self.config.sde_noise_strength)
+            y_path = sdeint(
+                sde,
+                y0,
+                times_union,
+                method=self.config.sde_method,
+                dt=self.config.sde_dt,
+            )
+        else:
+            y_path = odeint(
+                self.odefunc,
+                y0,
+                times_union,
+                method=self.config.ode_method,
+                rtol=self.config.rtol,
+                atol=self.config.atol,
+            )  # [T, B, 2E+H]
         y_path = y_path.permute(1, 0, 2)            # [B, T, 2E+H]
         p_t, v_t, _ = torch.split(y_path, [E, E, H], dim=-1)
 

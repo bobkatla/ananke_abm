@@ -28,6 +28,12 @@ class ModeSepConfig:
     atol: float = 1e-5
     time_match_tol: float = 1e-6        # tolerance to match union time to snap time
 
+    # SDE settings (set sde_noise_strength=0.0 to recover deterministic behavior)
+    enable_sde: bool = True
+    sde_noise_strength: float = 0.01
+    sde_method: str = "euler"
+    sde_dt: float = 0.01
+
     # Loss weights
     softmax_tau: float = 0.10
     w_ce: float = 1.0
@@ -36,7 +42,7 @@ class ModeSepConfig:
     w_stay_vel: float = 5.0
 
     # Training
-    max_epochs: int = 500
+    max_epochs: int = 10000
     lr: float = 1e-3
     weight_decay: float = 0.0
     grad_clip: float = 1.0
