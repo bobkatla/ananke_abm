@@ -68,7 +68,7 @@ def train(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
     dataset = PersonsDataset(persons)
     loader = DataLoader(dataset, batch_size=2, shuffle=True, collate_fn=lambda xs: xs)
 
-    best_acc = -1.0
+    best_loss = np.inf
     curves_path = Path(config.runs_dir) / "curves.csv"
     if not curves_path.exists():
         with open(curves_path, "w", encoding="utf-8") as f:
@@ -150,8 +150,8 @@ def train(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
             )
 
         # Checkpoint on best accuracy
-        if running["acc"] > best_acc:
-            best_acc = running["acc"]
+        if running["loss"] < best_loss:
+            best_loss = running["loss"]
             ckpt = {
                 "model_state": model.state_dict(),
                 "config": vars(config),
