@@ -6,8 +6,6 @@ dist/
 wheels/
 *.egg-info
 data/*
-!data/periods.csv
-!data/snaps.csv
 output/
 saved_models/
 
