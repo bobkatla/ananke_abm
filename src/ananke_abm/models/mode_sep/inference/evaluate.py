@@ -60,6 +60,12 @@ def evaluate(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
     all_abs_v: List[float] = []
     all_labels: List[int] = []
 
+    # Confusion accumulators for embedding-based stay detection on non-GT union points
+    cm_tp = 0
+    cm_fp = 0
+    cm_fn = 0
+    cm_tn = 0
+
     for p in persons:
         union = build_union_batch([p], config, device)
         times_u = union.times_union
@@ -69,6 +75,15 @@ def evaluate(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
 
         with torch.no_grad():
             pred_emb, logits, v = model(times_union=times_u, home_idx=home_idx, work_idx=work_idx, person_traits_raw=traits)
+            # nearest distance in embedding space
+            table = model.class_table
+            # [B,T,Z] distances — compute efficiently via (x - y)^2 = x^2 + y^2 - 2x·y
+            emb2 = (pred_emb**2).sum(dim=-1, keepdim=True)          # [B,T,1]
+            tab2 = (table**2).sum(dim=-1)[None, None, :]              # [1,1,Z]
+            xTy  = torch.einsum("bte,ze->btz", pred_emb, table)     # [B,T,Z]
+            dists = (emb2 + tab2 - 2*xTy).clamp_min(0.0).sqrt()       # [B,T,Z]
+            d_near, near_idx = dists.min(dim=-1)                      # [B,T]
+
             pred_idx = logits.argmax(dim=-1)[0]  # [T]
             # Evaluate at snaps
             mask = union.is_gt_union[0]
@@ -89,12 +104,30 @@ def evaluate(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
             stay_velocities.extend(v_abs[mask_stay].tolist())
             travel_velocities.extend(v_abs[~mask_stay].tolist())
 
+        # predicted stay via embedding threshold
+        pred_stay_embed = (d_near <= config.tau_stay_embed)           # [B,T] bool
+        # Compare on union points that are NOT GT snaps to avoid trivial zero-distance matches
+        non_gt_mask = (~union.is_gt_union[0]).cpu().numpy().astype(bool)
+        pred_stay_np = pred_stay_embed[0].cpu().numpy().astype(bool)  # [T]
+        y_true = mask_stay & non_gt_mask
+        y_pred = pred_stay_np & non_gt_mask
+        cm_tp += int(np.sum((y_pred == 1) & (y_true == 1)))
+        cm_fp += int(np.sum((y_pred == 1) & (y_true == 0)))
+        cm_fn += int(np.sum((y_pred == 0) & (y_true == 1)))
+        cm_tn += int(np.sum((y_pred == 0) & (y_true == 0)))
         # Per-person trajectory plot (dense grid prediction vs GT snaps)
         t_dense = torch.linspace(0.0, 24.0, config.dense_resolution, device=device)
         with torch.no_grad():
-            _, logits_d, v_d = model(times_union=t_dense, home_idx=home_idx, work_idx=work_idx, person_traits_raw=traits)
+            pred_emb_d, logits_d, v_d = model(times_union=t_dense, home_idx=home_idx, work_idx=work_idx, person_traits_raw=traits)
             pred_ids_dense = logits_d.argmax(dim=-1)[0].cpu().numpy()
             v_abs_dense = v_d.norm(dim=-1)[0].cpu().numpy()
+            # d_near on dense grid
+            table = model.class_table
+            emb2_d = (pred_emb_d**2).sum(dim=-1, keepdim=True)
+            tab2 = (table**2).sum(dim=-1)[None, None, :]
+            xTy_d = torch.einsum("bte,ze->btz", pred_emb_d, table)
+            dists_d = (emb2_d + tab2 - 2 * xTy_d).clamp_min(0.0).sqrt()
+            d_near_dense = dists_d.min(dim=-1).values[0].cpu().numpy()
 
         # Build stay intervals from union mask for shading
         tu = times_u.cpu().numpy()
@@ -127,7 +160,9 @@ def evaluate(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
                 'epsilon_v': getattr(config, 'epsilon_v', None),
                 'v_min_move': getattr(config, 'v_min_move', None),
                 'v_max_move': getattr(config, 'v_max_move', None),
+                'tau_stay_embed': getattr(config, 'tau_stay_embed', None),
             }
+            , d_near_dense=d_near_dense
         )
 
     snap_acc = (total_correct / total_snaps) if total_snaps > 0 else float("nan")
@@ -137,10 +172,6 @@ def evaluate(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
     scores = np.array(all_abs_v)
     labels = np.array(all_labels)
     auc = _roc_auc_binary(-scores, labels)  # Lower |v| => stay, so negate scores to rank stays higher
-
-    # Stay compliance
-    eps = config.epsilon_v
-    stay_comp = float(np.mean((scores[labels == 1] <= eps))) if np.any(labels == 1) else float("nan")
 
     # Transition sharpness: approximate using finite diffs around transitions
     # Here we compute mean delta |v| where labels change; within +/- window we take diffs
@@ -152,16 +183,27 @@ def evaluate(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
             transition_deltas.append(abs(scores[i] - scores[i - 1]))
     transition_sharpness = float(np.mean(transition_deltas)) if transition_deltas else float("nan")
 
+    # Precision/Recall/F1 from confusion matrix
+    precision = (cm_tp / (cm_tp + cm_fp)) if (cm_tp + cm_fp) > 0 else float("nan")
+    recall = (cm_tp / (cm_tp + cm_fn)) if (cm_tp + cm_fn) > 0 else float("nan")
+    f1 = (2 * precision * recall / (precision + recall)) if (isinstance(precision, float) and isinstance(recall, float) and not (np.isnan(precision) or np.isnan(recall)) and (precision + recall) > 0) else float("nan")
+
     metrics = {
         "snap_accuracy": snap_acc,
         "mean_expected_distance_km": mean_expected_dist,
         "roc_auc_abs_v_stay_vs_travel": auc,
-        "stay_compliance_fraction": stay_comp,
         "transition_sharpness_mean_delta_abs_v": transition_sharpness,
         "stay_vel_mean": float(np.mean(stay_velocities)) if stay_velocities else float("nan"),
         "stay_vel_median": float(np.median(stay_velocities)) if stay_velocities else float("nan"),
         "travel_vel_mean": float(np.mean(travel_velocities)) if travel_velocities else float("nan"),
         "travel_vel_median": float(np.median(travel_velocities)) if travel_velocities else float("nan"),
+        "embed_stay_tp": cm_tp,
+        "embed_stay_fp": cm_fp,
+        "embed_stay_fn": cm_fn,
+        "embed_stay_tn": cm_tn,
+        "embed_stay_precision": precision,
+        "embed_stay_recall": recall,
+        "embed_stay_f1": f1,
     }
 
     out_path = Path(config.figures_dir) / "metrics.json"
@@ -181,7 +223,6 @@ def evaluate(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
             plt.hist(stay_velocities, bins=40, alpha=0.6, label='Stay |v|', density=True)
         if travel_velocities:
             plt.hist(travel_velocities, bins=40, alpha=0.6, label='Travel |v|', density=True)
-        plt.axvline(config.epsilon_v, color='k', linestyle='--', alpha=0.8, label=f"epsilon_v={config.epsilon_v}")
         plt.xlabel('|v|')
         plt.ylabel('Density')
         plt.title('Velocity magnitude distributions: stay vs travel')

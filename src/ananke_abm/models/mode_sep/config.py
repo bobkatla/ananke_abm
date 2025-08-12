@@ -46,6 +46,15 @@ class ModeSepConfig:
     v_min_move = 0.2
     v_max_move = 1.0
 
+    # Travel supervision
+    w_travel_margin: float = 1.0
+    w_travel_mono: float = 0.5
+    m_travel: float = 0.10        # in embedding units
+    epsilon_mono: float = 0.01    # slack for monotonicity
+
+    # Stay detection (embedding distance rule for eval/inference)
+    tau_stay_embed: float = 0.10  # distance threshold to nearest zone embedding
+
     # Training
     max_epochs: int = 2000
     lr: float = 1e-3
@@ -54,7 +63,6 @@ class ModeSepConfig:
 
     # Evaluation / plots
     dense_resolution: int = 500
-    epsilon_v: float = 0.05             # stay compliance threshold on |v|
     transition_window_h: float = 0.25   # +/- window for transition sharpness (hours)
 
     # IO

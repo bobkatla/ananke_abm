@@ -75,11 +75,11 @@ def train(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
     curves_path = Path(config.runs_dir) / "curves.csv"
     if not curves_path.exists():
         with open(curves_path, "w", encoding="utf-8") as f:
-            f.write("epoch,loss,ce,mse,dist,stay_vel,move_vel,stay_aux,acc\n")
+            f.write("epoch,loss,ce,mse,dist,stay_vel,move_vel,stay_aux,travel_margin,travel_mono,acc\n")
 
     for epoch in range(1, config.max_epochs + 1):
         model.train()
-        running = {"loss": 0.0, "ce": 0.0, "mse": 0.0, "dist": 0.0, "stay_vel": 0.0, "move_vel": 0.0, "stay_aux": 0.0, "acc": 0.0}
+        running = {"loss": 0.0, "ce": 0.0, "mse": 0.0, "dist": 0.0, "stay_vel": 0.0, "move_vel": 0.0, "stay_aux": 0.0, "travel_margin": 0.0, "travel_mono": 0.0, "acc": 0.0}
         batches = 0
 
         for batch_persons in loader:
@@ -116,6 +116,9 @@ def train(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
                 is_gt_mask=union.is_gt_union,
                 dist_mat=shared.dist_mat,
                 class_table=model.class_table,
+                travel_mask=union.travel_mask,
+                prev_idx=union.prev_zone_idx,
+                dest_idx=union.dest_zone_idx,
             )
             # Targets: class ids inside stays (long, -1 elsewhere)
             y_stay = union.stay_loc_ids            # [B, T] long with -1 outside stays
@@ -184,6 +187,8 @@ def train(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
             running["stay_aux"] += float(aux_stay_loss.detach().item())
             running["stay_vel"] += float(stay_vel_pen.detach().item())
             running["move_vel"] += float(move_vel_pen.detach().item())
+            running["travel_margin"] += parts["travel_margin"]
+            running["travel_mono"] += parts["travel_mono"]
             running["acc"] += acc
             batches += 1
 
@@ -194,7 +199,7 @@ def train(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
         # Save curves
         with open(curves_path, "a", encoding="utf-8") as f:
             f.write(
-                f"{epoch},{running['loss']:.6f},{running['ce']:.6f},{running['mse']:.6f},{running['dist']:.6f},{running['stay_vel']:.6f},{running['move_vel']:.6f},{running['stay_aux']:.6f},{running['acc']:.6f}\n"
+                f"{epoch},{running['loss']:.6f},{running['ce']:.6f},{running['mse']:.6f},{running['dist']:.6f},{running['stay_vel']:.6f},{running['move_vel']:.6f},{running['stay_aux']:.6f},{running['travel_margin']:.6f},{running['travel_mono']:.6f},{running['acc']:.6f}\n"
             )
 
         # Checkpoint on best accuracy
@@ -210,7 +215,7 @@ def train(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
         if epoch % 20 == 0 or epoch == 1:
             print(
                 f"Epoch {epoch:4d} | loss={running['loss']:.4f} ce={running['ce']:.4f} mse={running['mse']:.4f} "
-                f"dist={running['dist']:.4f} stay_vel={running['stay_vel']:.4f} move_vel={running['move_vel']:.4f} stay_aux={running['stay_aux']:.4f} acc={running['acc']:.3f}",
+                f"dist={running['dist']:.4f} stay_vel={running['stay_vel']:.4f} move_vel={running['move_vel']:.4f} stay_aux={running['stay_aux']:.4f} travel_margin={running['travel_margin']:.4f} travel_mono={running['travel_mono']:.4f} acc={running['acc']:.3f}",
                 flush=True,
             )
 
