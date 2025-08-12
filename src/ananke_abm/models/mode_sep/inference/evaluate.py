@@ -92,8 +92,25 @@ def evaluate(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
         # Per-person trajectory plot (dense grid prediction vs GT snaps)
         t_dense = torch.linspace(0.0, 24.0, config.dense_resolution, device=device)
         with torch.no_grad():
-            _, logits_d, _ = model(times_union=t_dense, home_idx=home_idx, work_idx=work_idx, person_traits_raw=traits)
+            _, logits_d, v_d = model(times_union=t_dense, home_idx=home_idx, work_idx=work_idx, person_traits_raw=traits)
             pred_ids_dense = logits_d.argmax(dim=-1)[0].cpu().numpy()
+            v_abs_dense = v_d.norm(dim=-1)[0].cpu().numpy()
+
+        # Build stay intervals from union mask for shading
+        tu = times_u.cpu().numpy()
+        stay_mask_np = union.stay_mask[0].cpu().numpy().astype(bool)
+        intervals = []
+        if tu.size == stay_mask_np.size and tu.size > 0:
+            start = None
+            for idx in range(len(tu)):
+                if stay_mask_np[idx] and start is None:
+                    start = tu[idx]
+                if (not stay_mask_np[idx] and start is not None) or (idx == len(tu) - 1 and start is not None):
+                    end = tu[idx] if not stay_mask_np[idx] else tu[idx]
+                    if end < start:
+                        end = start
+                    intervals.append((start, end))
+                    start = None
 
         fig_path = Path(config.figures_dir) / f"evaluation_trajectory_{p.person_id}.png"
         fig_path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,6 +121,13 @@ def evaluate(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
             gt_ids=p.loc_ids.cpu().numpy(),
             zone_names=shared.zone_names,
             out_path=str(fig_path),
+            v_abs_dense=v_abs_dense,
+            stay_intervals=intervals,
+            thresholds={
+                'epsilon_v': getattr(config, 'epsilon_v', None),
+                'v_min_move': getattr(config, 'v_min_move', None),
+                'v_max_move': getattr(config, 'v_max_move', None),
+            }
         )
 
     snap_acc = (total_correct / total_snaps) if total_snaps > 0 else float("nan")
