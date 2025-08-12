@@ -17,7 +17,6 @@ class DataPaths:
     zones_csv: Path
     dist_mat_csv: Path
     persons_csv: Path
-    id_maps: Path
 
 
 REQUIRED_KEYS = [
@@ -26,7 +25,6 @@ REQUIRED_KEYS = [
     "zones_csv",
     "dist_mat_csv",
     "persons_csv",
-    "id_maps",
 ]
 
 
@@ -51,13 +49,12 @@ def _normalize_and_validate_paths(raw: Dict[str, str], base_dir: Path) -> DataPa
         zones_csv=norm(raw["zones_csv"]),
         dist_mat_csv=norm(raw["dist_mat_csv"]),
         persons_csv=norm(raw["persons_csv"]),
-        id_maps=norm(raw["id_maps"]),
     )
 
     # Verify all files exist
     errors = [str(p) for p in [
         dp.snaps_csv, dp.periods_csv, dp.zones_csv,
-        dp.dist_mat_csv, dp.persons_csv, dp.id_maps
+        dp.dist_mat_csv, dp.persons_csv
     ] if not p.exists()]
     if errors:
         raise FileNotFoundError(
