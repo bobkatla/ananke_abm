@@ -20,6 +20,7 @@ class UnionBatch:
     stay_mask: torch.Tensor                   # (B, T) bool
     gt_interior_mask: torch.Tensor     # (B, T) bool — GT snaps excluding first/last
     stay_non_gt_mask: torch.Tensor     # (B, T) bool — inside stays but not at snaps
+    stay_loc_ids: torch.Tensor
     min_dt: float
 
 
@@ -86,12 +87,19 @@ def build_union_batch(persons: List[PersonData], config: ModeSepConfig, device: 
     stay_mask = torch.zeros((B, T), dtype=torch.bool, device=device)
     gt_interior_mask = torch.zeros((B, T), dtype=torch.bool, device=device)
     stay_non_gt_mask = torch.zeros((B, T), dtype=torch.bool, device=device)
+    stay_loc_ids = torch.full((B, T), -1, dtype=torch.long, device=device)
 
     for i, p in enumerate(persons):
         is_gt, sidx = _times_to_union_mapping(times_union, p.times_snap, config.time_match_tol)
         is_gt_union[i] = is_gt
         snap_indices[i] = sidx
         stay_mask[i] = _stay_mask_for_union(times_union, p.stay_intervals)
+
+        for (t0, t1, loc_idx) in p.stay_segments:
+            t0_t = torch.tensor(float(t0), dtype=times_union.dtype, device=times_union.device)
+            t1_t = torch.tensor(float(t1), dtype=times_union.dtype, device=times_union.device)
+            in_seg = (times_union >= t0_t) & (times_union <= t1_t)
+            stay_loc_ids[i, in_seg] = loc_idx
         # Compute interior GT-snap mask (exclude first/last)
         gt_interior = torch.zeros_like(is_gt)
         if is_gt.any():
@@ -112,6 +120,7 @@ def build_union_batch(persons: List[PersonData], config: ModeSepConfig, device: 
         stay_mask=stay_mask,
         gt_interior_mask=gt_interior_mask,
         stay_non_gt_mask=stay_non_gt_mask,
+        stay_loc_ids=stay_loc_ids,
         min_dt=min_dt,
     )
 

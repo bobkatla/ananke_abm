@@ -21,6 +21,7 @@ class PersonData:
     times_snap: torch.Tensor          # (S,) float32
     loc_ids: torch.Tensor             # (S,) long
     stay_intervals: List[Tuple[float, float]]
+    stay_segments: List[Tuple[float, float, int]]
     home_zone_idx: int
     work_zone_idx: int
     person_traits_raw: torch.Tensor   # (2,) [age_norm, income_norm]
@@ -52,6 +53,7 @@ def build_person_and_shared(loaded: LoadedCSVs, device: torch.device) -> Tuple[L
         # stay intervals
         p_df = periods[(periods["person_id"] == pid) & (periods["type"].str.lower() == "stay")]
         stays = [(float(r["start_time"]), float(r["end_time"])) for _, r in p_df.iterrows()]
+        stay_segments = [(float(r["start_time"]), float(r["end_time"]), int(r["loc_idx"])) for _, r in p_df.iterrows()]
 
         # home/work indices
         home_zone_id = int(prow["home_zone_id"])
@@ -74,6 +76,7 @@ def build_person_and_shared(loaded: LoadedCSVs, device: torch.device) -> Tuple[L
             times_snap=times,
             loc_ids=locs,
             stay_intervals=stays,
+            stay_segments=stay_segments,
             home_zone_idx=home_idx,
             work_zone_idx=work_idx,
             person_traits_raw=traits,

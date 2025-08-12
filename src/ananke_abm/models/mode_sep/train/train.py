@@ -16,7 +16,13 @@ from ananke_abm.models.mode_sep.data_process.io_csv import load_csvs
 from ananke_abm.models.mode_sep.data_process.data import build_person_and_shared, PersonData
 from ananke_abm.models.mode_sep.data_process.batching import build_union_batch
 from ananke_abm.models.mode_sep.architecture.model import ModeSepModel
-from ananke_abm.models.mode_sep.architecture.losses import total_loss
+from ananke_abm.models.mode_sep.architecture.losses import (
+    total_loss,
+    ce_at_snaps,
+    mse_at_snaps,
+    expected_distance_at_snaps,
+)
+
 
 
 class PersonsDataset(Dataset):
@@ -69,11 +75,11 @@ def train(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
     curves_path = Path(config.runs_dir) / "curves.csv"
     if not curves_path.exists():
         with open(curves_path, "w", encoding="utf-8") as f:
-            f.write("epoch,loss,ce,mse,dist,stay_vel,move_vel,acc\n")
+            f.write("epoch,loss,ce,mse,dist,stay_vel,move_vel,stay_aux,acc\n")
 
     for epoch in range(1, config.max_epochs + 1):
         model.train()
-        running = {"loss": 0.0, "ce": 0.0, "mse": 0.0, "dist": 0.0, "stay_vel": 0.0, "move_vel": 0.0, "acc": 0.0}
+        running = {"loss": 0.0, "ce": 0.0, "mse": 0.0, "dist": 0.0, "stay_vel": 0.0, "move_vel": 0.0, "stay_aux": 0.0, "acc": 0.0}
         batches = 0
 
         for batch_persons in loader:
@@ -111,6 +117,19 @@ def train(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
                 dist_mat=shared.dist_mat,
                 class_table=model.class_table,
             )
+            # Targets: class ids inside stays (long, -1 elsewhere)
+            y_stay = union.stay_loc_ids            # [B, T] long with -1 outside stays
+            mask_stay_aux = union.stay_non_gt_mask # inside stays but not at snaps
+
+            aux_ce = torch.zeros((), device=device)
+            aux_mse = torch.zeros((), device=device)
+            aux_dist = torch.zeros((), device=device)
+            if mask_stay_aux.any():
+                aux_ce   = ce_at_snaps(logits, y_stay, mask_stay_aux)
+                aux_mse  = mse_at_snaps(pred_emb, y_stay, model.class_table, mask_stay_aux)
+                aux_dist = expected_distance_at_snaps(logits, y_stay, shared.dist_mat, mask_stay_aux)
+
+            aux_stay_loss = config.w_stay_aux * (aux_ce + aux_mse + aux_dist)
 
             # Velocity regularization
             v_abs = v.norm(dim=-1)  # [B, T]
@@ -132,6 +151,7 @@ def train(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
 
             # total loss
             total = ce_mse_dist_loss \
+                    + aux_stay_loss \
                     + config.w_stay_vel_core * stay_vel_pen \
                     + config.w_move_vel_hinge * move_vel_pen
 
@@ -161,6 +181,7 @@ def train(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
             running["ce"] += parts["ce"]
             running["mse"] += parts["mse"]
             running["dist"] += parts["dist"]
+            running["stay_aux"] += float(aux_stay_loss.detach().item())
             running["stay_vel"] += float(stay_vel_pen.detach().item())
             running["move_vel"] += float(move_vel_pen.detach().item())
             running["acc"] += acc
@@ -173,7 +194,7 @@ def train(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
         # Save curves
         with open(curves_path, "a", encoding="utf-8") as f:
             f.write(
-                f"{epoch},{running['loss']:.6f},{running['ce']:.6f},{running['mse']:.6f},{running['dist']:.6f},{running['stay_vel']:.6f},{running['move_vel']:.6f},{running['acc']:.6f}\n"
+                f"{epoch},{running['loss']:.6f},{running['ce']:.6f},{running['mse']:.6f},{running['dist']:.6f},{running['stay_vel']:.6f},{running['move_vel']:.6f},{running['stay_aux']:.6f},{running['acc']:.6f}\n"
             )
 
         # Checkpoint on best accuracy
@@ -189,7 +210,7 @@ def train(yaml_path: str = "src/ananke_abm/models/mode_sep/data_paths.yml"):
         if epoch % 20 == 0 or epoch == 1:
             print(
                 f"Epoch {epoch:4d} | loss={running['loss']:.4f} ce={running['ce']:.4f} mse={running['mse']:.4f} "
-                f"dist={running['dist']:.4f} stay_vel={running['stay_vel']:.4f} move_vel={running['move_vel']:.4f} acc={running['acc']:.3f}",
+                f"dist={running['dist']:.4f} stay_vel={running['stay_vel']:.4f} move_vel={running['move_vel']:.4f} stay_aux={running['stay_aux']:.4f} acc={running['acc']:.3f}",
                 flush=True,
             )
 
