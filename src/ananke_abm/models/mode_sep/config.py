@@ -39,7 +39,11 @@ class ModeSepConfig:
     w_ce: float = 1.0
     w_mse: float = 0.5
     w_dist: float = 0.5
-    w_stay_vel: float = 3.0
+    # Velocity regularization
+    w_stay_vel_core: float = 5.0     # penalty weight for |v|^2 inside stays (non-GT points)
+    w_move_vel_hinge: float = 1.0    # weight for encouraging movement at interior GT snaps
+    v_min_move = 0.2
+    v_max_move = 1.0
 
     # Training
     max_epochs: int = 2000

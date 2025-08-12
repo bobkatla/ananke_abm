@@ -18,6 +18,8 @@ class UnionBatch:
     is_gt_union: torch.Tensor                 # (B, T) bool
     snap_indices: torch.Tensor                # (B, T) long (index into person loc_ids) or -1
     stay_mask: torch.Tensor                   # (B, T) bool
+    gt_interior_mask: torch.Tensor     # (B, T) bool — GT snaps excluding first/last
+    stay_non_gt_mask: torch.Tensor     # (B, T) bool — inside stays but not at snaps
     min_dt: float
 
 
@@ -82,12 +84,23 @@ def build_union_batch(persons: List[PersonData], config: ModeSepConfig, device: 
     is_gt_union = torch.zeros((B, T), dtype=torch.bool, device=device)
     snap_indices = torch.full((B, T), -1, dtype=torch.long, device=device)
     stay_mask = torch.zeros((B, T), dtype=torch.bool, device=device)
+    gt_interior_mask = torch.zeros((B, T), dtype=torch.bool, device=device)
+    stay_non_gt_mask = torch.zeros((B, T), dtype=torch.bool, device=device)
 
     for i, p in enumerate(persons):
         is_gt, sidx = _times_to_union_mapping(times_union, p.times_snap, config.time_match_tol)
         is_gt_union[i] = is_gt
         snap_indices[i] = sidx
         stay_mask[i] = _stay_mask_for_union(times_union, p.stay_intervals)
+        # Compute interior GT-snap mask (exclude first/last)
+        gt_interior = torch.zeros_like(is_gt)
+        if is_gt.any():
+            gt_idx = torch.nonzero(is_gt, as_tuple=False).squeeze(-1)  # indices in union
+            if gt_idx.numel() >= 3:
+                interior_idx = gt_idx[1:-1]   # drop first and last
+                gt_interior[interior_idx] = True
+        gt_interior_mask[i] = gt_interior
+        stay_non_gt_mask[i] = stay_mask[i] & (~is_gt) # stay points that are not snaps
 
     diffs = times_union[1:] - times_union[:-1]
     min_dt = float(diffs.min().item()) if diffs.numel() > 0 else 1.0
@@ -97,7 +110,8 @@ def build_union_batch(persons: List[PersonData], config: ModeSepConfig, device: 
         is_gt_union=is_gt_union,
         snap_indices=snap_indices,
         stay_mask=stay_mask,
+        gt_interior_mask=gt_interior_mask,
+        stay_non_gt_mask=stay_non_gt_mask,
         min_dt=min_dt,
     )
-
 
