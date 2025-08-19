@@ -8,6 +8,8 @@ wheels/
 data/*
 output/
 saved_models/
+data/
+artifacts/
 
 # Virtual environments
 .venv
