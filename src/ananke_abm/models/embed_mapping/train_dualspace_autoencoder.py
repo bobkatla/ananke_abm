@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
+import torch.nn.functional as F  # <-- needed for class_weighted_ce
 
 # ---- Model pieces (must exist in your repo) ----
 from ananke_abm.models.embed_mapping.models.dualspace import (
@@ -29,6 +30,44 @@ from ananke_abm.models.embed_mapping.models.dualspace import (
 # ----------------------------
 # Utilities
 # ----------------------------
+
+def class_weighted_ce(
+    logits: torch.Tensor, targets: torch.Tensor, ignore_index: int, class_weights: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """
+    logits: [B,K,C], targets: [B,K] int64
+    """
+    B, K, C = logits.shape
+    logits = logits.view(B*K, C)
+    targets = targets.view(B*K)
+    loss = F.cross_entropy(
+        logits, targets,
+        weight=class_weights, ignore_index=ignore_index, reduction="mean"
+    )
+    return loss
+
+def wasserstein_cdf_loss(w_pred: torch.Tensor, w_gt: torch.Tensor) -> torch.Tensor:
+    """
+    Discrete W1 via CDF L1 on the K-simplex.
+    w_pred, w_gt: [B,K], each row sums to ~1 (clipped inside)
+    """
+    eps = 1e-8
+    w_pred = w_pred.clamp_min(eps)
+    w_pred = w_pred / w_pred.sum(dim=-1, keepdim=True).clamp_min(eps)
+    w_gt = w_gt.clamp_min(eps)
+    w_gt = w_gt / w_gt.sum(dim=-1, keepdim=True).clamp_min(eps)
+    cdf_pred = w_pred.cumsum(dim=-1)
+    cdf_gt = w_gt.cumsum(dim=-1)
+    return (cdf_pred - cdf_gt).abs().sum(dim=-1).mean()
+
+def duration_entropy(w_pred: torch.Tensor) -> torch.Tensor:
+    """
+    H(w) = -sum w log w averaged over batch.
+    """
+    eps = 1e-8
+    w = w_pred.clamp_min(eps)
+    H = -(w * w.log()).sum(dim=-1).mean()
+    return H
 
 def set_seed(seed: int):
     import random
@@ -326,7 +365,14 @@ def train_one_epoch(
     lambda_lap: float,
     lap_L: Optional[torch.Tensor],
     label_smoothing: float,
+    class_weights: Optional[torch.Tensor],        # NEW
+    tf_prob: float,                                # NEW
+    time_jitter_mins: float,                       # NEW
+    wass_weight: float,                            # NEW
+    startl1_weight: float,                         # NEW
+    duration_entropy_weight: float,                # NEW
 ):
+
     model.train()
     total = 0.0
     n = 0
@@ -334,30 +380,56 @@ def train_one_epoch(
         for k in batch:
             batch[k] = batch[k].to(device)
 
-        out = model(batch)
-        logits = out["purpose_logits"]      # [B,K,V]
-        pred_dur_h = out["durations"]       # [B,K]
-        pred_start_h = out["starts"]        # [B,K]
+        # coin flip per batch for teacher forcing
+        teacher_forced = (torch.rand((), device=device).item() < tf_prob)
+
+        # forward (requires updated DualSpaceAE.forward to accept these kwargs)
+        out = model(
+            batch,
+            teacher_forced=teacher_forced,
+            time_jitter_minutes=(time_jitter_mins if teacher_forced else 0.0),
+        )
+
+        logits       = out["purpose_logits"]      # [B,K,V]
+        pred_dur_h   = out["durations"]           # [B,K]
+        pred_start_h = out["starts"]              # [B,K]
+        w_pred       = out["w_pred"]              # [B,K] simplex over K
 
         # masks
         mask = (~batch["pad_mask"]).float()  # [B,K]
 
-        # purpose loss with label smoothing
-        loss_ce = label_smoothing_ce(logits, batch["purpose_idx"], ignore_index=pad_idx, smoothing=label_smoothing)
+        # ---- PURPOSE: class-weighted CE (uses your precomputed weights) ----
+        cw = class_weights.to(device) if class_weights is not None else None
+        loss_ce = class_weighted_ce(
+            logits, batch["purpose_idx"], ignore_index=pad_idx, class_weights=cw
+        )
 
-        # durations L1 (hours)
-        loss_dur = ((pred_dur_h - batch["duration"]).abs() * mask).sum() / (mask.sum() + 1e-8)
+        # ---- DURATION: Wasserstein/CDF between predicted and GT simplex ----
+        w_gt = batch["duration"] / (batch["duration"].sum(dim=-1, keepdim=True) + 1e-8)
+        loss_wass = wasserstein_cdf_loss(w_pred, w_gt)
 
-        # starts L1 (hours)
+        # ---- STARTS: L1 in hours (keep, but lower weight via startl1_weight) ----
         loss_start = ((pred_start_h - batch["start"]).abs() * mask).sum() / (mask.sum() + 1e-8)
 
-        # kl (if VAE)
+        # ---- Optional VAE KL ----
         kl = torch.tensor(0.0, device=device)
         if "mu" in out and "logvar" in out:
             mu, logvar = out["mu"], out["logvar"]
             kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1).mean()
 
-        loss = loss_ce + w_dur * loss_dur + w_start * loss_start + kl_beta * kl
+        # ---- Entropy penalty to encourage decisive slot allocations (- H) ----
+        H_w = duration_entropy(w_pred)
+        loss = (
+            loss_ce
+            + wass_weight * loss_wass
+            + startl1_weight * loss_start
+            - duration_entropy_weight * H_w
+            + kl_beta * kl
+        )
+
+        # Laplacian reg
+        if lambda_lap > 0.0 and lap_L is not None:
+            loss = loss + laplacian_regularizer(model.encoder.purpose_embed.embed, lap_L, lambda_lap)
 
         # Laplacian reg on embedding table if provided
         if lambda_lap > 0.0 and lap_L is not None:
@@ -382,7 +454,12 @@ def eval_one_epoch(
     w_start: float,
     kl_beta: float,
     label_smoothing: float,
+    class_weights: Optional[torch.Tensor],     # NEW
+    wass_weight: float,                         # NEW
+    startl1_weight: float,                      # NEW
+    duration_entropy_weight: float,             # NEW
 ):
+
     model.eval()
     total = 0.0
     n = 0
@@ -390,15 +467,21 @@ def eval_one_epoch(
         for k in batch:
             batch[k] = batch[k].to(device)
 
-        out = model(batch)
-        logits = out["purpose_logits"]
-        pred_dur_h = out["durations"]
+        out = model(batch, teacher_forced=True, time_jitter_minutes=0.0)
+        logits       = out["purpose_logits"]
+        pred_dur_h   = out["durations"]
         pred_start_h = out["starts"]
+        w_pred       = out["w_pred"]
 
         mask = (~batch["pad_mask"]).float()
 
-        loss_ce = label_smoothing_ce(logits, batch["purpose_idx"], ignore_index=pad_idx, smoothing=label_smoothing)
-        loss_dur = ((pred_dur_h - batch["duration"]).abs() * mask).sum() / (mask.sum() + 1e-8)
+        cw = class_weights.to(device) if class_weights is not None else None
+        loss_ce = class_weighted_ce(
+            logits, batch["purpose_idx"], ignore_index=pad_idx, class_weights=cw
+        )
+
+        w_gt = batch["duration"] / (batch["duration"].sum(dim=-1, keepdim=True) + 1e-8)
+        loss_wass = wasserstein_cdf_loss(w_pred, w_gt)
         loss_start = ((pred_start_h - batch["start"]).abs() * mask).sum() / (mask.sum() + 1e-8)
 
         kl = torch.tensor(0.0, device=device)
@@ -406,7 +489,15 @@ def eval_one_epoch(
             mu, logvar = out["mu"], out["logvar"]
             kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1).mean()
 
-        loss = loss_ce + w_dur * loss_dur + w_start * loss_start + kl_beta * kl
+        H_w = duration_entropy(w_pred)
+        loss = (
+            loss_ce
+            + wass_weight * loss_wass
+            + startl1_weight * loss_start
+            - duration_entropy_weight * H_w
+            + kl_beta * kl
+        )
+
         total += float(loss.detach().cpu())
         n += 1
     return total / max(n, 1)
@@ -461,6 +552,26 @@ def main(args):
     if val_ds is not None and len(val_ds) > 0:
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
                                 collate_fn=collate, drop_last=False)
+        
+    # Estimate class frequencies from the training data
+    from collections import Counter
+    purpose_counts = Counter()
+    for batch in train_loader:
+        # batch["purpose_idx"]: [B,K]
+        ids = batch["purpose_idx"].view(-1).tolist()
+        for t in ids:
+            if t != pad_idx:
+                purpose_counts[t] += 1
+
+    # Build weight vector (C,) on device later
+    C = len(vocab)
+    weights = torch.ones(C, dtype=torch.float32)
+    # inverse sqrt frequency (clip to avoid inf for rare classes)
+    for cls_id, cnt in purpose_counts.items():
+        weights[cls_id] = 1.0 / (cnt ** 0.5)
+    # set PAD weight to 0 explicitly if pad_idx exists
+    weights[pad_idx] = 0.0
+    class_weights = weights / (weights.max().clamp(min=1e-8))  # normalize for stability
 
     # --- Purpose meta (FiLM) ---
     meta_tensor = None
@@ -533,19 +644,39 @@ def main(args):
     best_val = float("inf")
     os.makedirs(args.out_dir, exist_ok=True)
     for epoch in range(1, args.epochs + 1):
+        # --- scheduled teacher forcing prob for this epoch ---
+        E = args.epochs
+        anneal_steps = max(1, int(args.tf_anneal_frac * E))
+        if epoch >= anneal_steps:
+            tf_prob = args.tf_prob_end
+        else:
+            tf_prob = args.tf_prob_start + (args.tf_prob_end - args.tf_prob_start) * ((epoch - 1) / max(1, anneal_steps - 1))
+
         tr_loss = train_one_epoch(
             model, train_loader, optimizer, device, pad_idx,
             w_dur=args.w_dur, w_start=args.w_start,
             kl_beta=args.kl_beta, lambda_lap=args.lambda_lap, lap_L=lap_L,
             label_smoothing=args.label_smoothing,
+            class_weights=class_weights,                 # NEW
+            tf_prob=tf_prob,                             # NEW
+            time_jitter_mins=args.time_jitter_mins,      # NEW
+            wass_weight=args.wass_weight,                # NEW
+            startl1_weight=args.startl1_weight,          # NEW
+            duration_entropy_weight=args.duration_entropy_weight,  # NEW
         )
+
         log = {"epoch": epoch, "train_loss": tr_loss}
         if val_loader is not None:
             val_loss = eval_one_epoch(
                 model, val_loader, device, pad_idx,
                 w_dur=args.w_dur, w_start=args.w_start, kl_beta=args.kl_beta,
                 label_smoothing=args.label_smoothing,
+                class_weights=class_weights,                 # NEW
+                wass_weight=args.wass_weight,                # NEW
+                startl1_weight=args.startl1_weight,          # NEW
+                duration_entropy_weight=args.duration_entropy_weight,  # NEW
             )
+
             log["val_loss"] = val_loss
             print(f"[epoch {epoch}] train={tr_loss:.4f}  val={val_loss:.4f}")
             if val_loss < best_val:
@@ -643,6 +774,14 @@ def cli():
     p.add_argument("--out-dir", type=str, default="checkpoints_dualspace")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--cuda", action="store_true")
+
+    p.add_argument("--wass-weight", type=float, default=1.0)
+    p.add_argument("--startl1-weight", type=float, default=0.25)
+    p.add_argument("--duration-entropy-weight", type=float, default=0.01)
+    p.add_argument("--tf-prob-start", type=float, default=1.0)
+    p.add_argument("--tf-prob-end", type=float, default=0.3)
+    p.add_argument("--tf-anneal-frac", type=float, default=0.7, help="fraction of total epochs to reach end prob")
+    p.add_argument("--time-jitter-mins", type=float, default=15.0)
 
     args = p.parse_args()
     main(args)

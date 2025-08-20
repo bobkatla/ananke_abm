@@ -103,6 +103,8 @@ class DualSpaceConfig:
     kl_beta: float = 0.0  # only used if use_vae
     lambda_lap: float = 0.0
     lambda_meta_probe: float = 0.0
+    duration_entropy_weight: float = 0.01  # coeff for -sum w log w
+    use_time_head: bool = True            # allow decoder to propose times from z when not teacher-forced
 
 
 class DualSpaceEncoder(nn.Module):
@@ -171,8 +173,7 @@ class DualSpaceDecoder(nn.Module):
         self.cfg = cfg
         self.z_proj = nn.Linear(cfg.d_z, cfg.d_model)
 
-        # Build per-slot queries from (start, duration, z)
-        # q_in = Fourier(start) [2*H] + dur/24 [1] + log1p(dur) [1] + z_proj [D]
+        # Query MLP: Fourier(start) [2H] + dur/24 [1] + log1p(dur) [1] + z_proj [D]
         q_in = (2 * cfg.n_time_harmonics) + 2 + cfg.d_model
         self.q_mlp = nn.Sequential(
             nn.Linear(q_in, cfg.d_model),
@@ -180,9 +181,13 @@ class DualSpaceDecoder(nn.Module):
             nn.Linear(cfg.d_model, cfg.d_model),
         )
 
+        # Optional head to propose durations (weights over K) directly from z
+        if cfg.use_time_head:
+            self.time_head = nn.Linear(cfg.d_z, cfg.k_max)
+
         dec_layer = nn.TransformerDecoderLayer(
             d_model=cfg.d_model, nhead=cfg.n_heads,
-            dim_feedforward=cfg.d_model * 4, dropout=cfg.dropout,
+            dim_feedforward=cfg.d_model * 4, dropout=self.cfg.dropout,
             batch_first=True, activation="gelu"
         )
         self.decoder = nn.TransformerDecoder(dec_layer, num_layers=cfg.n_layers)
@@ -190,12 +195,25 @@ class DualSpaceDecoder(nn.Module):
         self.out_purpose = nn.Linear(cfg.d_model, n_purposes)  # logits per slot
         self.dur_slot = nn.Linear(cfg.d_model, 1)              # one logit per slot
 
-    def _fourier(self, x_hours: torch.Tensor) -> torch.Tensor:
+    def _fourier_hours(self, x_hours: torch.Tensor) -> torch.Tensor:
         # x_hours: [B,K] in hours; return [B,K,2H] with period=24
         ks = torch.arange(1, self.cfg.n_time_harmonics + 1, device=x_hours.device, dtype=x_hours.dtype)
         x = x_hours.unsqueeze(-1)  # [B,K,1]
         ang = 2.0 * math.pi * x * ks / 24.0
         return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)  # [B,K,2H]
+
+    def _build_queries(self, z: torch.Tensor, start_h: torch.Tensor, dur_h: torch.Tensor) -> torch.Tensor:
+        """
+        Build decoder queries from (start,duration) and z.
+        start_h, dur_h: [B,K] in hours
+        """
+        B, K = start_h.shape
+        z_ctx = self.z_proj(z).unsqueeze(1).expand(B, K, -1)  # [B,K,D]
+        f_start = self._fourier_hours(start_h)                 # [B,K,2H]
+        dur_days = (dur_h / 24.0).unsqueeze(-1)                # [B,K,1]
+        dur_log  = torch.log1p(dur_h).unsqueeze(-1)            # [B,K,1]
+        q_in = torch.cat([f_start, dur_days, dur_log, z_ctx], dim=-1)  # [B,K,2H+2+D]
+        return self.q_mlp(q_in)  # [B,K,D]
 
     def forward(
         self,
@@ -203,37 +221,58 @@ class DualSpaceDecoder(nn.Module):
         memory: torch.Tensor,
         start_hours: torch.Tensor,
         dur_hours: torch.Tensor,
-        memory_key_padding_mask: Optional[torch.Tensor] = None
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+        teacher_forced: bool = True,
+        time_jitter_minutes: float = 0.0,
     ):
         """
         z: [B, d_z]
         memory: [B, L, D] (encoder tokens)
-        start_hours, dur_hours: [B, K] ground-truth times (teacher-forced queries)
+        start_hours, dur_hours: [B, K] (GT times in hours) used only if teacher_forced=True
         memory_key_padding_mask: [B, L] True for PAD
+        teacher_forced: if False, decoder proposes its own times from z via time_head
+        time_jitter_minutes: add U(-j,+j) minutes to start & dur for building queries (TF only)
         """
+        device = z.device
         B, K = start_hours.shape
-        z_ctx = self.z_proj(z).unsqueeze(1).expand(B, K, -1)  # [B,K,D]
 
-        # Teacher-forced time features for queries
-        f_start = self._fourier(start_hours)                  # [B,K,2H]
-        dur_days = (dur_hours / 24.0).unsqueeze(-1)           # [B,K,1]
-        dur_log  = torch.log1p(dur_hours).unsqueeze(-1)       # [B,K,1]
+        if teacher_forced:
+            if time_jitter_minutes > 0.0:
+                # Jitter for queries only; clamp to keep valid hours
+                j = (time_jitter_minutes / 60.0)
+                start_h = (start_hours + (2*j)*torch.rand_like(start_hours) - j).clamp(min=0.0, max=24.0)
+                dur_h   = (dur_hours   + (2*j)*torch.rand_like(dur_hours)   - j).clamp(min=0.0)
+                # Re-normalize durations to sum 24h per sample to keep validity by construction
+                dur_sum = dur_h.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+                dur_h = 24.0 * dur_h / dur_sum
+                # Recompute starts as cumulative
+                start_h = dur_h.cumsum(dim=-1) - dur_h
+            else:
+                start_h, dur_h = start_hours, dur_hours
+        else:
+            # Predict a duration weight vector from z (softmax over K), build starts from it
+            assert self.cfg.use_time_head, "use_time_head=False but teacher_forced=False path requested."
+            logits_w = self.time_head(z)                 # [B,K]
+            if self.cfg.duration_temp != 1.0:
+                logits_w = logits_w / self.cfg.duration_temp
+            w = F.softmax(logits_w, dim=-1)              # [B,K]
+            dur_h = 24.0 * w
+            start_h = dur_h.cumsum(dim=-1) - dur_h       # [B,K]
 
-        q_in = torch.cat([f_start, dur_days, dur_log, z_ctx], dim=-1)  # [B,K,2H+2+D]
-        q = self.q_mlp(q_in)  # [B,K,D]
-
-        # Decode
+        # Build queries and decode
+        q = self._build_queries(z, start_h, dur_h)       # [B,K,D]
         dec = self.decoder(tgt=q, memory=memory, memory_key_padding_mask=memory_key_padding_mask)  # [B,K,D]
 
         # Heads
-        purpose_logits = self.out_purpose(dec)       # [B,K,V]
-        slot_logits = self.dur_slot(dec).squeeze(-1) # [B,K]
+        purpose_logits = self.out_purpose(dec)           # [B,K,V]
+        slot_logits = self.dur_slot(dec).squeeze(-1)     # [B,K]
         if self.cfg.duration_temp != 1.0:
             slot_logits = slot_logits / self.cfg.duration_temp
-        w = F.softmax(slot_logits, dim=-1)           # [B,K]
-        durations = 24.0 * w
+        w_pred = F.softmax(slot_logits, dim=-1)          # [B,K], sum=1
+        durations = 24.0 * w_pred
         starts = durations.cumsum(dim=-1) - durations
-        return purpose_logits, durations, starts
+
+        return purpose_logits, durations, starts, w_pred
 
 
 class DualSpaceAE(nn.Module):
@@ -244,20 +283,23 @@ class DualSpaceAE(nn.Module):
         self.encoder = DualSpaceEncoder(cfg, purpose_embed)
         self.decoder = DualSpaceDecoder(cfg, n_purposes=n_purposes)
 
-    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def forward(self, batch: Dict[str, torch.Tensor], teacher_forced: bool = True, time_jitter_minutes: float = 0.0) -> Dict[str, torch.Tensor]:
         z, extra, enc_tokens = self.encoder(
             batch["purpose_idx"], batch["start"], batch["duration"], batch["pad_mask"]
         )
-        purpose_logits, durations, starts = self.decoder(
+        purpose_logits, durations, starts, w_pred = self.decoder(
             z, memory=enc_tokens,
             start_hours=batch["start"], dur_hours=batch["duration"],
-            memory_key_padding_mask=batch["pad_mask"]
+            memory_key_padding_mask=batch["pad_mask"],
+            teacher_forced=teacher_forced,
+            time_jitter_minutes=time_jitter_minutes,
         )
         return {
             "z": z,
             "purpose_logits": purpose_logits,
             "durations": durations,
             "starts": starts,
+            "w_pred": w_pred,   # simplex weights for losses
             **extra
         }
 
