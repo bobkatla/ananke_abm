@@ -152,60 +152,87 @@ class DualSpaceEncoder(nn.Module):
         denom = mask.sum(dim=1).clamp(min=1.0)
         pooled = x_masked.sum(dim=1) / denom  # (B,D)
 
+        # x is the encoder output (B, L, D) with PAD positions present (masked via pad_mask during encoding)
         if self.cfg.use_vae:
             mu = self.to_mu(pooled)
             logvar = self.to_logvar(pooled)
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
             z = mu + eps * std
-            return z, {"mu": mu, "logvar": logvar}
+            return z, {"mu": mu, "logvar": logvar}, x
         else:
             z = self.pool(pooled)
-            return z, {}
+            return z, {}, x
 
 
 class DualSpaceDecoder(nn.Module):
     def __init__(self, cfg: DualSpaceConfig, n_purposes: int):
         super().__init__()
         self.cfg = cfg
-        self.query = nn.Parameter(torch.randn(cfg.k_max, cfg.d_model))
         self.z_proj = nn.Linear(cfg.d_z, cfg.d_model)
-        # Transformer decoder (optional memory can be zeros; we mostly condition on z)
-        dec_layer = nn.TransformerDecoderLayer(d_model=cfg.d_model, nhead=cfg.n_heads,
-                                               dim_feedforward=cfg.d_model*4, dropout=cfg.dropout,
-                                               batch_first=True, activation="gelu")
-        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=cfg.n_layers)
-        self.out_purpose = nn.Linear(cfg.d_model, n_purposes)  # logits per slot
-        # Shared duration head across slots
-        self.dur_head = nn.Sequential(
-            nn.Linear(cfg.d_model + cfg.d_z, cfg.d_model),
+
+        # Build per-slot queries from (start, duration, z)
+        # q_in = Fourier(start) [2*H] + dur/24 [1] + log1p(dur) [1] + z_proj [D]
+        q_in = (2 * cfg.n_time_harmonics) + 2 + cfg.d_model
+        self.q_mlp = nn.Sequential(
+            nn.Linear(q_in, cfg.d_model),
             nn.GELU(),
-            nn.Linear(cfg.d_model, cfg.k_max)
+            nn.Linear(cfg.d_model, cfg.d_model),
         )
 
-    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=cfg.d_model, nhead=cfg.n_heads,
+            dim_feedforward=cfg.d_model * 4, dropout=cfg.dropout,
+            batch_first=True, activation="gelu"
+        )
+        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=cfg.n_layers)
+
+        self.out_purpose = nn.Linear(cfg.d_model, n_purposes)  # logits per slot
+        self.dur_slot = nn.Linear(cfg.d_model, 1)              # one logit per slot
+
+    def _fourier(self, x_hours: torch.Tensor) -> torch.Tensor:
+        # x_hours: [B,K] in hours; return [B,K,2H] with period=24
+        ks = torch.arange(1, self.cfg.n_time_harmonics + 1, device=x_hours.device, dtype=x_hours.dtype)
+        x = x_hours.unsqueeze(-1)  # [B,K,1]
+        ang = 2.0 * math.pi * x * ks / 24.0
+        return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)  # [B,K,2H]
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        memory: torch.Tensor,
+        start_hours: torch.Tensor,
+        dur_hours: torch.Tensor,
+        memory_key_padding_mask: Optional[torch.Tensor] = None
+    ):
         """
-        z: (B, d_z)
-        returns:
-          purpose_logits: (B, K, n_purposes)
-          durations: (B, K) in HOURS summing to 24
-          starts: (B, K) cumulative starts
+        z: [B, d_z]
+        memory: [B, L, D] (encoder tokens)
+        start_hours, dur_hours: [B, K] ground-truth times (teacher-forced queries)
+        memory_key_padding_mask: [B, L] True for PAD
         """
-        B = z.size(0)
-        z_ctx = self.z_proj(z).unsqueeze(1)  # (B,1,D)
-        q = self.query.unsqueeze(0).expand(B, -1, -1)  # (B,K,D)
-        # use z_ctx as memory
-        dec = self.decoder(tgt=q, memory=z_ctx)  # (B,K,D)
-        purpose_logits = self.out_purpose(dec)  # (B,K,n_purposes)
-        # durations
-        # Use both pooled dec features (mean over K) and z to predict shared logits
-        dec_pool = dec.mean(dim=1)  # (B,D)
-        dur_logits = self.dur_head(torch.cat([dec_pool, z], dim=-1))  # (B,K)
+        B, K = start_hours.shape
+        z_ctx = self.z_proj(z).unsqueeze(1).expand(B, K, -1)  # [B,K,D]
+
+        # Teacher-forced time features for queries
+        f_start = self._fourier(start_hours)                  # [B,K,2H]
+        dur_days = (dur_hours / 24.0).unsqueeze(-1)           # [B,K,1]
+        dur_log  = torch.log1p(dur_hours).unsqueeze(-1)       # [B,K,1]
+
+        q_in = torch.cat([f_start, dur_days, dur_log, z_ctx], dim=-1)  # [B,K,2H+2+D]
+        q = self.q_mlp(q_in)  # [B,K,D]
+
+        # Decode
+        dec = self.decoder(tgt=q, memory=memory, memory_key_padding_mask=memory_key_padding_mask)  # [B,K,D]
+
+        # Heads
+        purpose_logits = self.out_purpose(dec)       # [B,K,V]
+        slot_logits = self.dur_slot(dec).squeeze(-1) # [B,K]
         if self.cfg.duration_temp != 1.0:
-            dur_logits = dur_logits / self.cfg.duration_temp
-        w = F.softmax(dur_logits, dim=-1)  # (B,K), sum=1
+            slot_logits = slot_logits / self.cfg.duration_temp
+        w = F.softmax(slot_logits, dim=-1)           # [B,K]
         durations = 24.0 * w
-        starts = durations.cumsum(dim=-1) - durations  # (B,K), start of each slot
+        starts = durations.cumsum(dim=-1) - durations
         return purpose_logits, durations, starts
 
 
@@ -218,8 +245,14 @@ class DualSpaceAE(nn.Module):
         self.decoder = DualSpaceDecoder(cfg, n_purposes=n_purposes)
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        z, extra = self.encoder(batch["purpose_idx"], batch["start"], batch["duration"], batch["pad_mask"])
-        purpose_logits, durations, starts = self.decoder(z)
+        z, extra, enc_tokens = self.encoder(
+            batch["purpose_idx"], batch["start"], batch["duration"], batch["pad_mask"]
+        )
+        purpose_logits, durations, starts = self.decoder(
+            z, memory=enc_tokens,
+            start_hours=batch["start"], dur_hours=batch["duration"],
+            memory_key_padding_mask=batch["pad_mask"]
+        )
         return {
             "z": z,
             "purpose_logits": purpose_logits,
