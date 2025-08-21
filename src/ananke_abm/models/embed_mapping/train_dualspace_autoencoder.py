@@ -304,22 +304,24 @@ def auto_build_meta_matrix(
                 if 2 <= nunique <= 20:
                     cat_cols.append(c)
         if cat_cols:
-            X_cat = pd.get_dummies(df[cat_cols].astype("category"), dummy_na=False)
+            X_cat = pd.get_dummies(df[cat_cols].astype("category"), dummy_na=False).astype("float32")
         else:
             X_cat = pd.DataFrame(index=df.index)
     else:
         X_cat = pd.DataFrame(index=df.index)
 
-    X = pd.concat([X_num, X_cat], axis=1)
+    X = pd.concat([X_num.astype("float32"), X_cat], axis=1)
     if X.shape[1] == 0:
         print("[FiLM] No usable meta features found; FiLM disabled.")
         return None, {}
 
     # Standardize numeric columns only (cat one-hots are already 0/1)
+    if X_num.shape[1] > 0:
+        X_num = X_num.astype("float32")
     means = X_num.mean() if X_num.shape[1] > 0 else pd.Series(dtype=float)
     stds = X_num.std().replace(0, 1.0) if X_num.shape[1] > 0 else pd.Series(dtype=float)
     if X_num.shape[1] > 0:
-        X.loc[:, X_num.columns] = (X_num - means) / stds
+        X.loc[:, X_num.columns] = ((X_num - means) / stds).astype("float32")
 
     # Build [V, D] aligned to vocab index
     V = len(vocab)
