@@ -243,7 +243,7 @@ def sequences_from_csv(schedules_csv: str, k_max: int, purpose_to_idx: Dict[str,
 
 
 # --- in decode_and_validate, ensure tensors live on the same device as the model ---
-def decode_and_validate(model, cfg, seqs, idx_to_purpose, out_csv_path: str, n_examples: int = 20):
+def decode_and_validate(model, cfg, seqs, idx_to_purpose, out_csv_path: str, n_examples: int = 20, day_hours: int = 24):
     rows = []
     valid_count = 0
     device = next(model.parameters()).device  # infer device from model
@@ -267,7 +267,7 @@ def decode_and_validate(model, cfg, seqs, idx_to_purpose, out_csv_path: str, n_e
 
             # Post-process: merge adjacent identical purposes
             pred_purposes, pred_s, pred_d = merge_adjacent(pred_purposes, pred_s, pred_d)
-            is_valid = valid_schedule_check(pred_s, pred_d, day_hours=cfg.day_hours)
+            is_valid = valid_schedule_check(pred_s, pred_d, day_hours=day_hours)
             valid_count += int(is_valid)
 
             # Ground truth (trim to L)
@@ -328,7 +328,7 @@ def main():
 
     model, cfg, p2i, i2p = load_checkpoint(args.ckpt, args.purposes_csv, use_film=args.use_film, device=device)
     seqs = sequences_from_csv(args.schedules_csv, cfg.k_max, p2i)
-    valid_count, total, path = decode_and_validate(model, cfg, seqs, i2p, args.out_csv, n_examples=args.n_examples)
+    valid_count, total, path = decode_and_validate(model, cfg, seqs, i2p, args.out_csv, n_examples=args.n_examples, day_hours=args.day_hours)
 
     print(f"Decoded {total} examples. Valid full-day schedules: {valid_count}/{total}.")
     print(f"Wrote sample reconstructions to: {path}")
