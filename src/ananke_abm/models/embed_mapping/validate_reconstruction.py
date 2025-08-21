@@ -267,7 +267,7 @@ def decode_and_validate(model, cfg, seqs, idx_to_purpose, out_csv_path: str, n_e
 
             # Post-process: merge adjacent identical purposes
             pred_purposes, pred_s, pred_d = merge_adjacent(pred_purposes, pred_s, pred_d)
-            is_valid = valid_schedule_check(pred_s, pred_d)
+            is_valid = valid_schedule_check(pred_s, pred_d, day_hours=cfg.day_hours)
             valid_count += int(is_valid)
 
             # Ground truth (trim to L)
@@ -292,13 +292,13 @@ def decode_and_validate(model, cfg, seqs, idx_to_purpose, out_csv_path: str, n_e
     return valid_count, len(rows), out_csv_path
 
 
-def valid_schedule_check(starts: np.ndarray, durations: np.ndarray, atol=1e-4) -> bool:
+def valid_schedule_check(starts: np.ndarray, durations: np.ndarray, atol=1e-4, day_hours=24) -> bool:
     # start[0] == 0, sum durations == 24, non-overlap
     if not (abs(starts[0]) < atol): return False
-    if not (abs(durations.sum() - 24.0) < 1e-3): return False
+    if not (abs(durations.sum() - day_hours) < 1e-3): return False
     ends = starts + durations
     if np.any(starts[1:] < ends[:-1] - 1e-4): return False
-    if ends[-1] > 24.0 + 1e-3: return False
+    if ends[-1] > day_hours + 1e-3: return False
     return True
 
 
@@ -322,6 +322,7 @@ def main():
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--n_examples", type=int, default=20)
     ap.add_argument("--out_csv", type=str, default="/mnt/data/dualspace_project/out/reconstruction_samples.csv")
+    ap.add_argument("--day_hours", type=int, default=24)
     args = ap.parse_args()
     device = "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
 
