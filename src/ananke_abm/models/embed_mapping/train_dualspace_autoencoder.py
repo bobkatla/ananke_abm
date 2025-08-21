@@ -615,6 +615,7 @@ def main(args):
         kl_beta=args.kl_beta,
         lambda_lap=args.lambda_lap,
         lambda_meta_probe=0.0,
+        day_hours=args.day_hours,
     )
 
     purpose_embed = PurposeEmbeddingWithFiLM(
@@ -751,6 +752,7 @@ def cli():
     p.add_argument("--fourier-harmonics", type=int, default=4)
     p.add_argument("--duration-temp", type=float, default=1.0)
     p.add_argument("--label-smoothing", type=float, default=0.05)
+    p.add_argument("--day-hours", type=float, default=24.0)
 
     # VAE / regularizers
     p.add_argument("--use-vae", action="store_true")

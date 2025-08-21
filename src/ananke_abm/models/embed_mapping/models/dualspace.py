@@ -6,7 +6,7 @@
 # - Transformer encoder -> latent z
 # - Decoder predicts:
 #     (i) per-slot purpose logits (K_max slots)
-#     (ii) a SINGLE shared duration simplex over K_max slots (sum to 24h)
+#     (ii) a SINGLE shared duration simplex over K_max slots (sum to T hours)
 # - Starts are cumulative sums of durations => validity by construction
 
 from dataclasses import dataclass
@@ -17,9 +17,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def fourier_time_feats(x: torch.Tensor, n_harmonics: int = 4, period: float = 24.0) -> torch.Tensor:
+def fourier_time_feats(x: torch.Tensor, period: float, n_harmonics: int = 4) -> torch.Tensor:
     """
-    x: (...,) hours in [0, 24]
+    x: (...,) hours in [0, T]
     returns: (..., 2*n_harmonics) [sin(2πkx/T), cos(2πkx/T)]
     """
     ks = torch.arange(1, n_harmonics + 1, device=x.device, dtype=x.dtype)
@@ -105,6 +105,7 @@ class DualSpaceConfig:
     lambda_meta_probe: float = 0.0
     duration_entropy_weight: float = 0.01  # coeff for -sum w log w
     use_time_head: bool = True            # allow decoder to propose times from z when not teacher-forced
+    day_hours: float = 24.0
 
 
 class DualSpaceEncoder(nn.Module):
@@ -112,7 +113,7 @@ class DualSpaceEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.purpose_embed = purpose_embed
-        # time features: start Fourier + (duration/24) + log1p(duration)
+        # time features: start Fourier + (duration/self.cfg.day_hours) + log1p(duration)
         time_dim = 2 * cfg.n_time_harmonics + 2
         self.time_proj = nn.Linear(time_dim, cfg.d_time)
         self.in_proj = nn.Linear(cfg.d_purpose + cfg.d_time, cfg.d_model)
@@ -137,7 +138,7 @@ class DualSpaceEncoder(nn.Module):
         cfg = self.cfg
         # Build time features
         start_feats = fourier_time_feats(start, cfg.n_time_harmonics)  # (B,L,2H)
-        dur_norm = duration / 24.0
+        dur_norm = duration / self.cfg.day_hours
         dur_log = torch.log1p(duration)
         t_feats = torch.cat([start_feats, dur_norm.unsqueeze(-1), dur_log.unsqueeze(-1)], dim=-1)  # (B,L,Td)
         t_enc = self.time_proj(t_feats)  # (B,L,d_time)
@@ -173,7 +174,7 @@ class DualSpaceDecoder(nn.Module):
         self.cfg = cfg
         self.z_proj = nn.Linear(cfg.d_z, cfg.d_model)
 
-        # Query MLP: Fourier(start) [2H] + dur/24 [1] + log1p(dur) [1] + z_proj [D]
+        # Query MLP: Fourier(start) [2H] + dur/self.cfg.day_hours [1] + log1p(dur) [1] + z_proj [D]
         q_in = (2 * cfg.n_time_harmonics) + 2 + cfg.d_model
         self.q_mlp = nn.Sequential(
             nn.Linear(q_in, cfg.d_model),
@@ -196,10 +197,10 @@ class DualSpaceDecoder(nn.Module):
         self.dur_slot = nn.Linear(cfg.d_model, 1)              # one logit per slot
 
     def _fourier_hours(self, x_hours: torch.Tensor) -> torch.Tensor:
-        # x_hours: [B,K] in hours; return [B,K,2H] with period=24
+        # x_hours: [B,K] in hours; return [B,K,2H] with period=T
         ks = torch.arange(1, self.cfg.n_time_harmonics + 1, device=x_hours.device, dtype=x_hours.dtype)
         x = x_hours.unsqueeze(-1)  # [B,K,1]
-        ang = 2.0 * math.pi * x * ks / 24.0
+        ang = 2.0 * math.pi * x * ks / self.cfg.day_hours
         return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)  # [B,K,2H]
 
     def _build_queries(self, z: torch.Tensor, start_h: torch.Tensor, dur_h: torch.Tensor) -> torch.Tensor:
@@ -210,7 +211,7 @@ class DualSpaceDecoder(nn.Module):
         B, K = start_h.shape
         z_ctx = self.z_proj(z).unsqueeze(1).expand(B, K, -1)  # [B,K,D]
         f_start = self._fourier_hours(start_h)                 # [B,K,2H]
-        dur_days = (dur_h / 24.0).unsqueeze(-1)                # [B,K,1]
+        dur_days = (dur_h / self.cfg.day_hours).unsqueeze(-1)                # [B,K,1]
         dur_log  = torch.log1p(dur_h).unsqueeze(-1)            # [B,K,1]
         q_in = torch.cat([f_start, dur_days, dur_log, z_ctx], dim=-1)  # [B,K,2H+2+D]
         return self.q_mlp(q_in)  # [B,K,D]
@@ -240,11 +241,11 @@ class DualSpaceDecoder(nn.Module):
             if time_jitter_minutes > 0.0:
                 # Jitter for queries only; clamp to keep valid hours
                 j = (time_jitter_minutes / 60.0)
-                start_h = (start_hours + (2*j)*torch.rand_like(start_hours) - j).clamp(min=0.0, max=24.0)
+                start_h = (start_hours + (2*j)*torch.rand_like(start_hours) - j).clamp(min=0.0, max=self.cfg.day_hours)
                 dur_h   = (dur_hours   + (2*j)*torch.rand_like(dur_hours)   - j).clamp(min=0.0)
-                # Re-normalize durations to sum 24h per sample to keep validity by construction
+                # Re-normalize durations to sum T hour per sample to keep validity by construction
                 dur_sum = dur_h.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-                dur_h = 24.0 * dur_h / dur_sum
+                dur_h = self.cfg.day_hours * dur_h / dur_sum
                 # Recompute starts as cumulative
                 start_h = dur_h.cumsum(dim=-1) - dur_h
             else:
@@ -256,7 +257,7 @@ class DualSpaceDecoder(nn.Module):
             if self.cfg.duration_temp != 1.0:
                 logits_w = logits_w / self.cfg.duration_temp
             w = F.softmax(logits_w, dim=-1)              # [B,K]
-            dur_h = 24.0 * w
+            dur_h = self.cfg.day_hours * w
             start_h = dur_h.cumsum(dim=-1) - dur_h       # [B,K]
 
         # Build queries and decode
@@ -269,7 +270,7 @@ class DualSpaceDecoder(nn.Module):
         if self.cfg.duration_temp != 1.0:
             slot_logits = slot_logits / self.cfg.duration_temp
         w_pred = F.softmax(slot_logits, dim=-1)          # [B,K], sum=1
-        durations = 24.0 * w_pred
+        durations = self.cfg.day_hours * w_pred
         starts = durations.cumsum(dim=-1) - durations
 
         return purpose_logits, durations, starts, w_pred
