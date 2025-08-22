@@ -152,10 +152,7 @@ def load_checkpoint(ckpt_path: str, purposes_csv: str, use_film: bool = True, de
         purpose_to_idx = {p: i for i, p in enumerate(vocab_list)} if isinstance(vocab_list, list) else ck["vocab"]
         meta_info = ck.get("meta_info", None)
     else:
-        # Older format (your first trainer): cfg and purpose_to_idx separately
-        cfg_dict = ck["cfg"]
-        purpose_to_idx = ck["purpose_to_idx"]
-        meta_info = None
+        raise ValueError("Invalid checkpoint format")
 
     cfg = DualSpaceConfig(**cfg_dict)
 
@@ -205,28 +202,28 @@ def sequences_from_csv(schedules_csv: str, k_max: int, purpose_to_idx: Dict[str,
     df = pd.read_csv(schedules_csv)
 
     # Normalize column names
-    colmap = {}
-    if "seq" not in df.columns and "seq_id" in df.columns:
-        colmap["seq_id"] = "seq"
-    if "start" not in df.columns and "start_time" in df.columns:
-        colmap["start_time"] = "start"
-    if colmap:
-        df = df.rename(columns=colmap)
+    if "day" not in df.columns:
+        df["day"] = 1
+    persid_col = [x for x in ["persid", "person_id"] if x in df.columns][0]
+    day_col = "day"
+    seq_col = [x for x in ["stopno", "seq", "seq_id"] if x in df.columns][0]
+    start_col = [x for x in ["startime", "start", "start_time"] if x in df.columns][0]
+    duration_col = [x for x in ["total_duration", "duration", "duration_hours"] if x in df.columns][0]
+    purpose_col = [x for x in ["purpose", "purpose_id"] if x in df.columns][0]
 
-    # Hard checks
-    required = {"person_id", "day", "seq", "start", "duration", "purpose"}
+    required = {persid_col, day_col, seq_col, start_col, duration_col, purpose_col}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns in schedules_csv: {missing}")
 
-    df = df.sort_values(["person_id","day","seq"])
+    df = df.sort_values([persid_col, day_col, seq_col])
     seqs = []
-    for (pid, day), g in df.groupby(["person_id","day"], sort=False):
-        g = g.sort_values("start")
+    for (pid, day), g in df.groupby([persid_col, day_col], sort=False):
+        g = g.sort_values(start_col)
         L = len(g)
-        p = [purpose_to_idx.get(x, 0) for x in g["purpose"].tolist()]
-        s = g["start"].astype(float).tolist()
-        d = g["duration"].astype(float).tolist()
+        p = [purpose_to_idx.get(x, 0) for x in g[purpose_col].tolist()]
+        s = g[start_col].astype(float).tolist()
+        d = g[duration_col].astype(float).tolist()
         if L > k_max:
             # merge tail durations into the last slot
             extra = sum(d[k_max-1:])
