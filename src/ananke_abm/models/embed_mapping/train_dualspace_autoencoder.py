@@ -32,7 +32,11 @@ from ananke_abm.models.embed_mapping.models.dualspace import (
 # ----------------------------
 
 def class_weighted_ce(
-    logits: torch.Tensor, targets: torch.Tensor, ignore_index: int, class_weights: Optional[torch.Tensor] = None
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    ignore_index: int,
+    class_weights: Optional[torch.Tensor] = None,
+    label_smoothing: float = 0.0,
 ) -> torch.Tensor:
     """
     logits: [B,K,C], targets: [B,K] int64
@@ -41,8 +45,12 @@ def class_weighted_ce(
     logits = logits.view(B*K, C)
     targets = targets.view(B*K)
     loss = F.cross_entropy(
-        logits, targets,
-        weight=class_weights, ignore_index=ignore_index, reduction="mean"
+        logits,
+        targets,
+        weight=class_weights,
+        ignore_index=ignore_index,
+        reduction="mean",
+        label_smoothing=label_smoothing,
     )
     return loss
 
@@ -147,11 +155,6 @@ def build_sequences(
 
     # sort within group
     df_long = df_long.sort_values(key_cols + sort_cols)
-
-    # Build per-schedule lists
-    purpose_idx = encode_purpose_column(df_long, purpose_col, vocab)
-    start_hours = to_hours(df_long[start_col].to_numpy(), time_unit)
-    dur_hours = to_hours(df_long[dur_col].to_numpy(), time_unit)
 
     # group pointers
     groups = df_long.groupby(key_cols, sort=False)
@@ -361,8 +364,6 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     pad_idx: int,
-    w_dur: float,
-    w_start: float,
     kl_beta: float,
     lambda_lap: float,
     lap_L: Optional[torch.Tensor],
@@ -403,7 +404,11 @@ def train_one_epoch(
         # ---- PURPOSE: class-weighted CE (uses your precomputed weights) ----
         cw = class_weights.to(device) if class_weights is not None else None
         loss_ce = class_weighted_ce(
-            logits, batch["purpose_idx"], ignore_index=pad_idx, class_weights=cw
+            logits,
+            batch["purpose_idx"],
+            ignore_index=pad_idx,
+            class_weights=cw,
+            label_smoothing=label_smoothing,
         )
 
         # ---- DURATION: Wasserstein/CDF between predicted and GT simplex ----
@@ -425,13 +430,9 @@ def train_one_epoch(
             loss_ce
             + wass_weight * loss_wass
             + startl1_weight * loss_start
-            - duration_entropy_weight * H_w
+            + duration_entropy_weight * H_w
             + kl_beta * kl
         )
-
-        # Laplacian reg
-        if lambda_lap > 0.0 and lap_L is not None:
-            loss = loss + laplacian_regularizer(model.encoder.purpose_embed.embed, lap_L, lambda_lap)
 
         # Laplacian reg on embedding table if provided
         if lambda_lap > 0.0 and lap_L is not None:
@@ -452,8 +453,6 @@ def eval_one_epoch(
     loader: DataLoader,
     device: torch.device,
     pad_idx: int,
-    w_dur: float,
-    w_start: float,
     kl_beta: float,
     label_smoothing: float,
     class_weights: Optional[torch.Tensor],     # NEW
@@ -479,7 +478,11 @@ def eval_one_epoch(
 
         cw = class_weights.to(device) if class_weights is not None else None
         loss_ce = class_weighted_ce(
-            logits, batch["purpose_idx"], ignore_index=pad_idx, class_weights=cw
+            logits,
+            batch["purpose_idx"],
+            ignore_index=pad_idx,
+            class_weights=cw,
+            label_smoothing=label_smoothing,
         )
 
         w_gt = batch["duration"] / (batch["duration"].sum(dim=-1, keepdim=True) + 1e-8)
@@ -496,7 +499,7 @@ def eval_one_epoch(
             loss_ce
             + wass_weight * loss_wass
             + startl1_weight * loss_start
-            - duration_entropy_weight * H_w
+            + duration_entropy_weight * H_w
             + kl_beta * kl
         )
 
@@ -545,9 +548,10 @@ def main(args):
     else:
         n_val = 0
     n_train = len(full_ds) - n_val
-    train_ds, val_ds = random_split(full_ds, [n_train, n_val]) if n_val > 0 else (full_ds, None)
+    g = torch.Generator().manual_seed(args.seed)
+    train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=g) if n_val > 0 else (full_ds, None)
 
-    collate = lambda batch: collate_batch(batch, pad_idx)
+    collate = lambda batch: collate_batch(batch, pad_idx=pad_idx)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
                               collate_fn=collate, drop_last=False)
     val_loader = None
@@ -574,6 +578,7 @@ def main(args):
     # set PAD weight to 0 explicitly if pad_idx exists
     weights[pad_idx] = 0.0
     class_weights = weights / (weights.max().clamp(min=1e-8))  # normalize for stability
+    class_weights = class_weights.to(device)
 
     # --- Purpose meta (FiLM) ---
     meta_tensor = None
@@ -642,6 +647,17 @@ def main(args):
 
     # --- Optimizer ---
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # NEW: LR scheduler that reduces LR when val loss plateaus
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,    
+        patience=5,   # e.g., 5
+        threshold=1e-3, # e.g., 1e-3
+        cooldown=0,   # e.g., 0
+        min_lr=1e-6,          # e.g., 1e-6
+    )
 
     # --- Training loop ---
     best_val = float("inf")
@@ -657,7 +673,6 @@ def main(args):
 
         tr_loss = train_one_epoch(
             model, train_loader, optimizer, device, pad_idx,
-            w_dur=args.w_dur, w_start=args.w_start,
             kl_beta=args.kl_beta, lambda_lap=args.lambda_lap, lap_L=lap_L,
             label_smoothing=args.label_smoothing,
             class_weights=class_weights,                 # NEW
@@ -672,7 +687,7 @@ def main(args):
         if val_loader is not None:
             val_loss = eval_one_epoch(
                 model, val_loader, device, pad_idx,
-                w_dur=args.w_dur, w_start=args.w_start, kl_beta=args.kl_beta,
+                kl_beta=args.kl_beta,
                 label_smoothing=args.label_smoothing,
                 class_weights=class_weights,                 # NEW
                 wass_weight=args.wass_weight,                # NEW
@@ -682,9 +697,13 @@ def main(args):
 
             log["val_loss"] = val_loss
             print(f"[epoch {epoch}] train={tr_loss:.4f}  val={val_loss:.4f}")
+            # after printing and any checkpointing for best model
+            scheduler.step(val_loss)   # NEW: drive LR drops off validation loss
+
             if val_loss < best_val:
                 best_val = val_loss
                 save_path = os.path.join(args.out_dir, "best.pt")
+                print("Saving best model to ", save_path)
                 torch.save({
                     "model_state": model.state_dict(),
                     "cfg": vars(cfg),
