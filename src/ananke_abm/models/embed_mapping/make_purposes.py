@@ -318,10 +318,10 @@ def main():
     # Sort by participation descending then by purpose
     out = out.sort_values(["person_day_participation_rate","purpose"], ascending=[False, True]).reset_index(drop=True)
 
-    # Cast booleans to Y/N
+    # Cast booleans to 1/0
     for c in ["is_primary","can_open_close_day"]:
         if c in out.columns:
-            out[c] = out[c].map({True: "Y", False: "N"}).fillna("")
+            out[c] = out[c].map({True: 1, False: 0}).fillna(np.nan)
 
     # Write
     out_path = Path(args.out_csv)
