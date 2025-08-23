@@ -9,6 +9,45 @@ from ananke_abm.models.traj_embed.model.decoder_timefield import TimeFieldDecode
 from ananke_abm.models.traj_embed.model.utils_bases import gauss_legendre_nodes
 from ananke_abm.models.traj_embed.train import ScheduleDataset, TrajEncoderGRU, build_masks, collate_fn
 from ananke_abm.models.traj_embed.model.rasterize import rasterize_batch
+# --- put near imports ---
+from torch.distributions import MultivariateNormal
+from torch.utils.data import DataLoader
+
+def sample_and_decode(enc, pds, dec, ds, purposes, masks_t, device, num_samples=5, L=360):
+    # 1) embed the dataset
+    purpose_to_idx = {p:i for i,p in enumerate(purposes)}
+    def collate_fn_local(batch):
+        return collate_fn(batch, purpose_to_idx)
+
+    dl = DataLoader(ds, batch_size=64, shuffle=False, collate_fn=collate_fn_local)
+    Z = []
+    with torch.no_grad():
+        e_p = pds()
+        t_q, _ = gauss_legendre_nodes(64, dtype=torch.float32, device=device)  # cheap nodes
+        loglam = pds.lambda_log(t_q)
+        for p_pad, t_pad, d_pad, lengths in dl:
+            p_pad = p_pad.to(device); t_pad = t_pad.to(device); d_pad = d_pad.to(device)
+            z = enc(p_pad, t_pad, d_pad, lengths, e_p)  # (B,m)
+            Z.append(z.cpu())
+    Z = torch.cat(Z, 0)  # (N,m)
+
+    # 2) fit Gaussian N(mu, Sigma) with shrinkage
+    mu = Z.mean(0)
+    X = Z - mu
+    Sigma = (X.T @ X) / max(len(Z)-1, 1)
+    Sigma = Sigma + 1e-3 * torch.eye(Sigma.shape[0])  # PD jitter
+
+    dist = MultivariateNormal(loc=mu, covariance_matrix=Sigma)
+    z_samp = dist.sample((num_samples,)).to(device)   # (num_samples, m)
+
+    # 3) decode deterministically on a dense grid
+    t_dense = torch.linspace(0, 1, L, device=device)
+    with torch.no_grad():
+        e_p = pds()
+        loglam_dense = pds.lambda_log(t_dense)
+        u_dense = dec.utilities(z_samp, e_p, t_dense, loglam_dense, masks=masks_t)
+        decoded = dec.argmax_decode(u_dense, t_dense)
+    return decoded
 
 def main():
     ap = argparse.ArgumentParser()
@@ -103,6 +142,14 @@ def main():
         for b, segs in enumerate(decoded[:3]):
             print(f"Decoded sample {b}:")
             print(" | ".join(seg_to_str(s) for s in segs))
+
+    gen = sample_and_decode(enc, pds, dec, ds, purposes, masks_t, args.device, num_samples=5, L=L)
+    print("=== Generated samples (from latent Gaussian) ===")
+    Tm = time_cfg.T_minutes
+    for i, segs in enumerate(gen):
+        pretty = " | ".join(f"{purposes[p]} @ {int(t0*Tm)}m for {int(d*Tm)}m" for (p,t0,d) in segs)
+        print(f"Gen {i}: {pretty}")
+
 
 if __name__ == "__main__":
     main()
