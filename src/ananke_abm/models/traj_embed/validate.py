@@ -13,113 +13,66 @@ from ananke_abm.models.traj_embed.model.rasterize import rasterize_batch
 from torch.distributions import MultivariateNormal
 from torch.utils.data import DataLoader
 
-def _spd_cov(Z: torch.Tensor, shrink: float = 0.1, eps: float = 1e-5) -> torch.Tensor:
-    """
-    Robust covariance with shrinkage and eigenvalue flooring.
-    Z: (N, m) on CPU
-    """
+def _spd_cov(Z: torch.Tensor, shrink: float = 0.1, eps: float = 1e-5):
     N, m = Z.shape
     mu = Z.mean(0, keepdim=True) if N > 0 else torch.zeros(1, m)
     X = Z - mu
-    # Sample covariance (Bessel)
-    if N > 1:
-        S = (X.T @ X) / (N - 1)
-    else:
-        S = torch.zeros(m, m)
-    # Shrinkage toward spherical
+    S = (X.T @ X) / max(N-1, 1) if N > 1 else torch.zeros(m, m)
+    # shrinkage toward spherical
     trace = torch.trace(S)
     avg_var = (trace / m) if m > 0 else torch.tensor(1.0)
     S = (1.0 - shrink) * S + shrink * avg_var * torch.eye(m)
-    # Eigen floor to ensure PD
     try:
         evals, evecs = torch.linalg.eigh(S)
         evals = torch.clamp(evals, min=eps)
         S_pd = (evecs * evals) @ evecs.T
     except Exception:
-        # Fallback: diagonal covariance
         var = torch.clamp(torch.var(Z, dim=0, unbiased=True) if N > 1 else torch.ones(m), min=eps)
         S_pd = torch.diag(var)
     return S_pd, mu.squeeze(0)
 
-def _merge_micro_segments(decoded, min_minutes: int, Tm: int):
-    """
-    Post-process: merge segments shorter than min_minutes into neighbors.
-    decoded: list[list[(p_idx, t0, d)]], t0,d in [0,1]
-    """
-    out_all = []
-    thr = min_minutes / float(Tm)
-    for segs in decoded:
-        if not segs:
-            out_all.append(segs); continue
-        out = [segs[0]]
-        for p, t0, d in segs[1:]:
-            if out and out[-1][2] < thr and out[-1][0] == p:
-                # extend previous if same purpose
-                prev_p, prev_t0, prev_d = out[-1]
-                out[-1] = (prev_p, prev_t0, prev_d + d)
-            elif d < thr and out:
-                # absorb tiny segment into previous
-                prev_p, prev_t0, prev_d = out[-1]
-                out[-1] = (prev_p, prev_t0, prev_d + d)
-            else:
-                out.append((p, t0, d))
-        out_all.append(out)
-    return out_all
-
 def sample_and_decode(enc, pds, dec, ds, purposes, masks_t, device,
-                      num_samples: int = 5, L: int = 360, seed: int = 0,
-                      shrink: float = 0.1, renorm_samples: bool = True,
-                      min_minutes_merge: int = 0):
-    """
-    Post-hoc generator:
-      1) embed whole dataset -> Z (unit-norm),
-      2) fit robust Gaussian on Z (with shrinkage),
-      3) sample z, optionally renorm to unit sphere,
-      4) decode deterministically (argmax on dense grid),
-      5) optional micro-segment merge.
-    """
+                      num_samples: int = 5, L: int = 360, seed: int = 0, shrink: float = 0.1):
     torch.manual_seed(seed)
-    purpose_to_idx = {p: i for i, p in enumerate(purposes)}
+    purpose_to_idx = {p:i for i,p in enumerate(purposes)}
 
-    # --- Embed dataset ---
-    def _collate(batch):
-        return collate_fn(batch, purpose_to_idx)
-
+    # --- embed whole dataset -> collect R (unnormalized latents) ---
+    def _collate(batch): return collate_fn(batch, purpose_to_idx)
     dl = DataLoader(ds, batch_size=64, shuffle=False, collate_fn=_collate)
-    Z = []
+
+    R = []
     with torch.no_grad():
         e_p = pds()
-        for p_pad, t_pad, d_pad, lengths in dl:
+        for p_pad, t_pad, d_pad, lengths, *_ in dl:
             p_pad = p_pad.to(device); t_pad = t_pad.to(device); d_pad = d_pad.to(device)
-            z = enc(p_pad, t_pad, d_pad, lengths, e_p)  # (B, m) unit-norm from your encoder
-            Z.append(z.cpu())
-    if not Z:
+            z, r = enc(p_pad, t_pad, d_pad, lengths, e_p)
+            R.append(r.cpu())
+    if not R:
         return []
+    R = torch.cat(R, dim=0)  # (N, d_r) on CPU
 
-    Z = torch.cat(Z, dim=0)  # (N, m) on CPU
-
-    # --- Fit robust covariance ---
-    Sigma, mu = _spd_cov(Z, shrink=shrink, eps=1e-5)
-
-    # --- Sample and (optionally) re-normalize onto sphere ---
+    # --- fit Gaussian on R ---
+    Sigma, mu = _spd_cov(R, shrink=shrink)
     dist = MultivariateNormal(loc=mu, covariance_matrix=Sigma)
-    z_samp = dist.sample((num_samples,))  # CPU
-    if renorm_samples:
-        z_samp = F.normalize(z_samp, p=2, dim=-1)
-    z_samp = z_samp.to(device)
+    r_samp = dist.sample((num_samples,))  # CPU, shape (S, d_r)
 
-    # --- Decode deterministically on dense grid ---
+    # --- map r* to z* correctly before decoding ---
+    # dec.m is the expected latent dim; enc.proj maps pre-proj features -> latent
+    need_projection = R.shape[1] != dec.m
+    if need_projection:
+        if not hasattr(enc, "proj"):
+            raise RuntimeError(f"Sampled r has dim {R.shape[1]} but decoder expects {dec.m}, and enc.proj is missing.")
+        z_samp = F.normalize(enc.proj(r_samp.to(device)), p=2, dim=-1)
+    else:
+        z_samp = F.normalize(r_samp.to(device), p=2, dim=-1)
+
+    # --- decode deterministically on a dense grid ---
     t_dense = torch.linspace(0, 1, L, device=device)
     with torch.no_grad():
         e_p = pds()
         loglam_dense = pds.lambda_log(t_dense)
         u_dense = dec.utilities(z_samp, e_p, t_dense, loglam_dense, masks=masks_t)
         decoded = dec.argmax_decode(u_dense, t_dense)
-
-    # --- Optional post-process to reduce micro fragments ---
-    if min_minutes_merge > 0:
-        decoded = _merge_micro_segments(decoded, min_minutes=min_minutes_merge, Tm=TimeConfig().T_minutes)
-
     return decoded
 
 
@@ -180,8 +133,10 @@ def main():
         e_p = pds()
         for p_pad, t_pad, d_pad, lengths in dl:
             p_pad = p_pad.to(args.device); t_pad = t_pad.to(args.device); d_pad = d_pad.to(args.device)
-            z = enc(p_pad, t_pad, d_pad, lengths, e_p); last_z = z
-            u = dec.utilities(z, e_p, t_q, loglam, masks=masks_t); q = dec.soft_assign(u)
+            z, r = enc(p_pad, t_pad, d_pad, lengths, e_p)
+            last_z = z
+            u = dec.utilities(z, e_p, t_q, loglam, masks=masks_t)
+            q = dec.soft_assign(u)
 
             # rasterize GT
             B, Lmax = p_pad.shape
@@ -217,11 +172,7 @@ def main():
             print(f"Decoded sample {b}:")
             print(" | ".join(seg_to_str(s) for s in segs))
 
-    gen = sample_and_decode(
-        enc, pds, dec, ds, purposes, masks_t, args.device,
-        num_samples=5, L=L, seed=0, shrink=0.1, renorm_samples=True,
-        min_minutes_merge=5   # e.g., merge <5-minute slivers; set 0 to disable
-    )
+    gen = sample_and_decode(enc, pds, dec, ds, purposes, masks_t, args.device, num_samples=20, L=L, seed=0)
     print("=== Generated samples (from latent Gaussian on z) ===")
     
     for i, segs in enumerate(gen):

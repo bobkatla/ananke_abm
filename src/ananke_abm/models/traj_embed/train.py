@@ -74,7 +74,7 @@ class TrajEncoderGRU(nn.Module):
         r = torch.cat([last, mean], dim=-1)
         z = self.proj(r)
         z = torch.nn.functional.normalize(z, p=2, dim=-1)
-        return z
+        return z, r
 
 def collate_fn(batch, purpose_to_idx):
     p_lists, t_lists, d_lists, lens = [], [], [], []
@@ -192,7 +192,9 @@ def main():
     sd_d = torch.tensor([priors[p].sigma_d for p in purposes], dtype=torch.float32, device=args.device)
 
     for epoch in range(1, args.epochs+1):
-        enc.train(); dec.train(); pds.train()
+        enc.train()
+        dec.train()
+        pds.train()
         total_tr = 0.0
         for p_pad, t_pad, d_pad, lengths in dl_tr:
             e_p = pds()
@@ -200,8 +202,9 @@ def main():
             with torch.no_grad():
                 loglam = pds.lambda_log(t_q)         # (P, Q)
             p_pad = p_pad.to(args.device); t_pad = t_pad.to(args.device); d_pad = d_pad.to(args.device)
-            z = enc(p_pad, t_pad, d_pad, lengths, e_p)
-            u = dec.utilities(z, e_p, t_q, loglam, masks=masks_t); q = dec.soft_assign(u)
+            z, r = enc(p_pad, t_pad, d_pad, lengths, e_p)
+            u = dec.utilities(z, e_p, t_q, loglam, masks=masks_t)
+            q = dec.soft_assign(u)
             segs = []
             B, Lmax = p_pad.shape
             for b in range(B):
@@ -240,7 +243,7 @@ def main():
                 p_pad = p_pad.to(args.device)
                 t_pad = t_pad.to(args.device)
                 d_pad = d_pad.to(args.device)
-                z = enc(p_pad, t_pad, d_pad, lengths, e_p)
+                z, r = enc(p_pad, t_pad, d_pad, lengths, e_p)
                 u = dec.utilities(z, e_p, t_q, loglam, masks=masks_t)
                 q = dec.soft_assign(u)
                 segs = []
