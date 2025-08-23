@@ -145,6 +145,8 @@ def main():
     dl_tr = loader(tr_subset, True); dl_va = loader(va_subset, False)
 
     history = {"epoch": [], "train_total": [], "val_total": [], "ce": [], "emd": [], "tv": []}
+    Path(args.outdir).mkdir(parents=True, exist_ok=True)
+    best_val_total = float('inf')
 
     for epoch in range(1, args.epochs+1):
         enc.train(); dec.train(); pds.train()
@@ -217,8 +219,14 @@ def main():
             "priors": priors, "purposes": purposes, "purpose_to_idx": purpose_to_idx,
             "configs": {"time": vars(time_cfg:=TimeConfig()), "basis": vars(BasisConfig()), "quad": vars(QuadratureConfig()), "pep": vars(PurposeEmbeddingConfig()), "dec": vars(DecoderConfig())},
         }
-        Path(args.outdir).mkdir(parents=True, exist_ok=True)
-        torch.save(ckpt, Path(args.outdir)/"ckpt_latest.pt")
+        if avg_va < best_val_total:
+            best_val_total = avg_va
+            torch.save(ckpt, Path(args.outdir)/"ckpt_best.pt")
+            if epoch > 500:
+                print(f"Best validation total: {best_val_total:.4f} at epoch {epoch}")
+        if epoch == args.epochs:
+            torch.save(ckpt, Path(args.outdir)/"ckpt_final.pt")
+            print(f"Final validation total: {avg_va:.4f} at epoch {epoch}")
 
     # Save history to CSV
     history_df = pd.DataFrame(history)
