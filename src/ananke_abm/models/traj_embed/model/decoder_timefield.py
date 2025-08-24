@@ -13,11 +13,11 @@ class TimeFieldDecoder(nn.Module):
     """
     def __init__(self, P:int, m_latent:int, d_p:int, K_decoder_time:int, alpha_prior:float=1.0):
         super().__init__()
+        self.alpha_per_p = nn.Parameter(torch.ones(P) * alpha_prior)
         self.P = P
         self.m = m_latent
         self.d_p = d_p
         self.K = K_decoder_time
-        self.alpha = alpha_prior
         in_dim = m_latent + d_p
         out_dim = 1 + 2*K_decoder_time  # number of Fourier features
         self.coeff_mlp = nn.Sequential(
@@ -64,7 +64,7 @@ class TimeFieldDecoder(nn.Module):
             Phi = Phi.to(t.device)
         C = self.time_coeff(z, e_p)             # (B,P,2K+1)
         u = torch.matmul(C, Phi.T)              # (B,P,Q)
-        u = u + self.alpha * log_lambda_p_t.unsqueeze(0)  # (1,P,Q) -> (B,P,Q)
+        u = u + self.alpha_per_p.view(1,-1,1) * log_lambda_p_t.unsqueeze(0)
 
         if masks is not None:
             big_neg = -1e9
@@ -102,12 +102,21 @@ class TimeFieldDecoder(nn.Module):
         return tv.mean()
 
     @staticmethod
-    def ce_loss(q: torch.Tensor, y: torch.Tensor, w: torch.Tensor):
-        """Time-integrated cross-entropy with quadrature weights."""
+    def ce_loss(
+        q: torch.Tensor,           # (B,P,Q)
+        y: torch.Tensor,           # (B,P,Q)
+        w: torch.Tensor,           # (Q,)
+        class_weights: torch.Tensor | None = None,   # (P,)
+    ):
+        """Time-integrated cross-entropy with quadrature weights.
+        Optionally weight each purpose with inverse-frequency class_weights."""
         eps = 1e-8
-        logq = torch.log(q + eps)          # (B,P,Q)
-        ce = -(y * logq)                   # (B,P,Q)
-        ce_w = ce * w.view(1,1,-1)
+        logq = torch.log(q + eps)             # (B,P,Q)
+        ce   = -(y * logq)                    # (B,P,Q)
+        if class_weights is not None:
+            # broadcast (P,) -> (1,P,1)
+            ce = ce * class_weights.view(1, -1, 1)
+        ce_w = ce * w.view(1, 1, -1)          # time quadrature weights
         return ce_w.sum(dim=(1,2)).mean()
 
     @staticmethod

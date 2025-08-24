@@ -13,6 +13,63 @@ from torch.distributions import MultivariateNormal
 from torch.utils.data import DataLoader
 
 
+def fit_vmf(z: torch.Tensor, eps: float = 1e-6):
+    # z: (N,m), unit-norm
+    mu = F.normalize(z.mean(0), dim=0)                    # mean direction
+    R  = z.mean(0).norm()                                 # resultant length in [0,1]
+    m  = z.shape[1]
+    # estimate kappa via approximation (Banerjee 2005)
+    if R < eps: kappa = z.new_tensor(0.0)
+    else:
+        kappa = R*(m - R**2) / (1 - R**2 + eps)
+        kappa = torch.clamp(kappa, min=0.0)
+    return mu, kappa
+
+def sample_vmf(mu: torch.Tensor, kappa: torch.Tensor, n: int, rng=None):
+    # Ulrich 1984 algorithm for vMF on S^{m-1}
+    m = mu.numel()
+    if float(kappa) < 1e-6:
+        x = torch.randn(n, m, device=mu.device)
+        return F.normalize(x, dim=-1)
+    b = (-2*kappa + torch.sqrt(4*kappa**2 + (m-1)**2.0)).div(m-1)
+    x0 = (1 - b) / (1 + b)
+    c = kappa*x0 + (m-1)*torch.log1p(-x0**2)
+    out = []
+    while len(out) < n:
+        u = torch.rand(2, device=mu.device)
+        w = 1 - (1 + b) * u[0] / (1 + b * u[0])
+        t = kappa*w + (m-1)*torch.log1p(-x0*w) - c
+        if t >= torch.log(u[1]):
+            v = torch.randn(m-1, device=mu.device)
+            v = F.normalize(v, dim=0)
+            x = torch.cat((torch.sqrt(1 - w*w).unsqueeze(0)*v, w.unsqueeze(0)))
+            # rotate from north pole to mu
+            # Householder transform
+            e = torch.zeros_like(mu); e[-1] = 1.0
+            if torch.allclose(mu, e):
+                rot = x
+            else:
+                u_vec = F.normalize(e - mu, dim=0)
+                rot = x - 2 * (u_vec @ x) * u_vec
+            out.append(rot)
+    return torch.stack(out, dim=0)
+
+def nudge_for_nonhome(z, dec, pds, masks_t, t_nodes, min_frac=0.08, step=0.1):
+    z = z.clone().requires_grad_(True)
+    with torch.enable_grad():
+        e_p = pds()
+        loglam = pds.lambda_log(t_nodes)
+        u = dec.utilities(z, e_p, t_nodes, loglam, masks=masks_t)
+        q = dec.soft_assign(u)
+        w = (t_nodes[1:] - t_nodes[:-1]).mean().expand_as(t_nodes)  # approx uniform
+        nh = 1.0 - q[:, masks_t["home_idx"], :]                      # (B,Q)
+        nonhome_mass = (nh * w.view(1,-1)).sum(-1).mean()            # scalar
+        loss = torch.relu(min_frac - nonhome_mass)
+    if loss.item() > 0:
+        g = torch.autograd.grad(loss, z)[0]
+        z = F.normalize(z - step * g, dim=-1)
+    return z.detach()
+
 def decoded_to_activities_df(decoded, purposes, T_minutes: int,
                              start_persid: int = 0, prefix: str = "gen") -> pd.DataFrame:
     """
@@ -145,48 +202,80 @@ def _spd_cov(Z: torch.Tensor, shrink: float = 0.1, eps: float = 1e-5):
     return S_pd, mu.squeeze(0)
 
 def sample_and_decode(enc, pds, dec, ds, purposes, masks_t, device,
-                      num_samples: int = 5, L: int = 360, seed: int = 0, shrink: float = 0.1, C_t=None):
-    torch.manual_seed(seed)
-    purpose_to_idx = {p:i for i,p in enumerate(purposes)}
+                      num_samples: int = 5,
+                      L: int = 360,
+                      seed: int = 0,
+                      shrink: float = 0.1,
+                      C_t=None,
+                      sampler: str = "vmf",            # "vmf" | "gauss_r"
+                      nudge_min_frac: float | None = None,  # e.g., 0.08 to enable; None to disable
+                      nudge_step: float = 0.1):
+    """
+    Samples latents and decodes.
+    - sampler="vmf": fit vMF on Z and sample directions on the unit sphere (recommended).
+    - sampler="gauss_r": your original Gaussian on R -> project/normalize to z.
 
-    # --- embed whole dataset -> collect R (unnormalized latents) ---
+    If nudge_min_frac is not None, applies one gradient step to increase non-Home mass
+    before decoding (helps eliminate "all-day Home" outliers).
+    """
+    torch.manual_seed(seed)
+    purpose_to_idx = {p: i for i, p in enumerate(purposes)}
+
+    # --- embed whole dataset -> collect Z (unit latents) and R (pre-norm) ---
     def _collate(batch): return collate_fn(batch, purpose_to_idx)
     dl = DataLoader(ds, batch_size=64, shuffle=False, collate_fn=_collate)
 
-    R = []
+    Z_list, R_list = [], []
     with torch.no_grad():
         e_p = pds()
         for p_pad, t_pad, d_pad, lengths, *_ in dl:
             p_pad = p_pad.to(device); t_pad = t_pad.to(device); d_pad = d_pad.to(device)
             z, r = enc(p_pad, t_pad, d_pad, lengths, e_p)
-            R.append(r.cpu())
-    if not R:
+            Z_list.append(z.detach().cpu())
+            R_list.append(r.detach().cpu())
+
+    if not Z_list:
         return []
-    R = torch.cat(R, dim=0)  # (N, d_r) on CPU
 
-    # --- fit Gaussian on R ---
-    Sigma, mu = _spd_cov(R, shrink=shrink)
-    dist = MultivariateNormal(loc=mu, covariance_matrix=Sigma)
-    r_samp = dist.sample((num_samples,))  # CPU, shape (S, d_r)
+    # stack
+    Z = torch.cat(Z_list, dim=0).to(device)  # (N, m), unit vectors
+    R = torch.cat(R_list, dim=0)             # (N, d_r), CPU
 
-    # --- map r* to z* correctly before decoding ---
-    # dec.m is the expected latent dim; enc.proj maps pre-proj features -> latent
-    need_projection = R.shape[1] != dec.m
-    if need_projection:
-        if not hasattr(enc, "proj"):
-            raise RuntimeError(f"Sampled r has dim {R.shape[1]} but decoder expects {dec.m}, and enc.proj is missing.")
-        z_samp = F.normalize(enc.proj(r_samp.to(device)), p=2, dim=-1)
+    # --- sample z_samp according to chosen sampler ---
+    if sampler == "vmf":
+        mu, kappa = fit_vmf(Z)                               # (m,), scalar
+        z_samp = sample_vmf(mu, kappa, num_samples).to(device)   # (S, m)
+    elif sampler == "gauss_r":
+        # Fit Gaussian on R, sample r*, project -> normalize to z*
+        Sigma, mu_r = _spd_cov(R, shrink=shrink)             # CPU
+        dist = MultivariateNormal(loc=mu_r, covariance_matrix=Sigma)
+        r_samp = dist.sample((num_samples,))                 # (S, d_r), CPU
+        need_projection = R.shape[1] != dec.m
+        if need_projection:
+            if not hasattr(enc, "proj"):
+                raise RuntimeError(f"Sampled r has dim {R.shape[1]} but decoder expects {dec.m}, and enc.proj is missing.")
+            z_samp = F.normalize(enc.proj(r_samp.to(device)), p=2, dim=-1)
+        else:
+            z_samp = F.normalize(r_samp.to(device), p=2, dim=-1)
     else:
-        z_samp = F.normalize(r_samp.to(device), p=2, dim=-1)
+        raise ValueError(f"Unknown sampler: {sampler}")
+
+    # --- optional: nudge z to ensure some non-Home mass (one small step) ---
+    t_dense = torch.linspace(0, 1, L, device=device)
+    if nudge_min_frac is not None and nudge_min_frac > 0:
+        z_samp = nudge_for_nonhome(z_samp, dec, pds, masks_t, t_dense,
+                                   min_frac=nudge_min_frac, step=nudge_step)
 
     # --- decode deterministically on a dense grid ---
-    t_dense = torch.linspace(0, 1, L, device=device)
     with torch.no_grad():
         e_p = pds()
         loglam_dense = pds.lambda_log(t_dense)
-        u_dense = dec.utilities(z_samp, e_p, t_dense, loglam_dense, masks=masks_t)
-        # decoded = dec.argmax_decode(u_dense, t_dense)
-        decoded = viterbi_timecost_decode(u_dense, t_dense, C_t, switch_cost=0.02)
+        u_dense = dec.utilities(z_samp, e_p, t_dense, loglam_dense, masks=masks_t)  # (S,P,L)
+        if C_t is not None:
+            decoded = viterbi_timecost_decode(u_dense, t_dense, C_t, switch_cost=0.02)
+        else:
+            decoded = dec.argmax_decode(u_dense, t_dense)
+
     return decoded
 
 
@@ -232,7 +321,7 @@ def main():
 
     pds.load_state_dict(ck["model_state"]["pds"])
     enc.load_state_dict(ck["model_state"]["enc"])
-    dec.load_state_dict(ck["model_state"]["dec"])
+    dec.load_state_dict(ck["model_state"]["dec"], strict=False)
     pds.eval(); enc.eval(); dec.eval()
 
     purp_df = pd.read_csv(args.purposes_csv)
@@ -246,6 +335,10 @@ def main():
 
     masks = build_masks(purp_df, purposes)  # includes home_idx for "Home" if present
     masks_t = {k: (v.to(args.device) if isinstance(v, torch.Tensor) else v) for k, v in masks.items()}
+    home_idx = masks.get("home_idx", None)
+    if home_idx is not None:
+        with torch.no_grad():
+            dec.alpha_per_p.data[home_idx] *= dec_cfg.alpha_home_factor
 
     C_t = build_time_binned_transition_costs(args.activities_csv, purposes, nbins=24, device=args.device)
 
@@ -287,9 +380,19 @@ def main():
     # loglam_dense = pds.lambda_log(t_dense)
 
     with torch.no_grad():
-        # Generate from latent Gaussian p(r) -> project -> normalize -> decode (your routine)
-        decoded_gen = sample_and_decode(enc, pds, dec, ds, purposes, masks_t,
-                                        args.device, num_samples=args.num_gen, L=L, seed=0, C_t=C_t)
+        # vMF + one-step nudge (recommended)
+        # decoded_gen = sample_and_decode(
+        #     enc, pds, dec, ds, purposes, masks_t, args.device,
+        #     num_samples=args.num_gen,
+        #     L=L,
+        #     seed=0,
+        #     C_t=C_t,                 # if you computed time-binned costs; else None
+        #     sampler="vmf",
+        #     nudge_min_frac=0.08,     # set None to disable
+        #     nudge_step=0.1
+        # )
+        decoded_gen = sample_and_decode(enc, pds, dec, ds, purposes, masks_t, args.device,
+                            num_samples=args.num_gen, L=L, sampler="gauss_r", nudge_min_frac=None)
     gen_df = decoded_to_activities_df(decoded_gen, purposes, Tm, start_persid=0, prefix=args.gen_prefix)
 
     # Optional save

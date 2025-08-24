@@ -31,4 +31,6 @@ class DecoderConfig:
     durlen_weight: float = 0.1
     lap_weight: float = 0.0         # optional if you later add Laplacian reg
     home_weight: float = 0.05        # weight of terminal home loss
+    nonhome_mse_weight: float = 0.01 # weight of non-home mass MSE loss
     bigram_prior_weight: float = 0.08 # weight of bigram prior loss
+    alpha_home_factor: float = 0.7    # factor for Home's alpha_per_p

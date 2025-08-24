@@ -15,7 +15,30 @@ from ananke_abm.models.traj_embed.model.utils_bases import gauss_legendre_nodes,
 from ananke_abm.models.traj_embed.model.rasterize import rasterize_batch, rasterize_from_padded
 from ananke_abm.models.traj_embed.model.decoder_timefield import TimeFieldDecoder
 
-# === training-time helpers (put near your loss utils) ===
+def purpose_ce_weights_from_seed_by_time(activities_csv: str, purposes: list[str], eps: float = 1e-6):
+    df = pd.read_csv(activities_csv)
+    mp = {p:i for i,p in enumerate(purposes)}
+    P = len(purposes)
+    dur = np.zeros(P, dtype=np.float64)
+    for p, g in df.groupby("purpose"):
+        if p in mp:
+            dur[mp[p]] = g["total_duration"].sum()
+    freq = dur / max(1.0, dur.sum())      # time share for each purpose
+    w = 1.0 / np.maximum(freq, eps)       # inverse frequency
+    w = w / w.mean()                      # normalize around 1.0 (keeps loss scale stable)
+    return torch.tensor(w, dtype=torch.float32)
+
+# q: (B,P,Q), y: (B,P,Q), w_q: (Q,), home_idx: int
+def nonhome_mass(x, w_q, home_idx):
+    # x may be q or y
+    xh = x[:, home_idx, :]                             # (B,Q)
+    return ((1.0 - xh) * w_q.view(1, -1)).sum(-1)      # (B,)
+
+def nonhome_mass_mse(q, y, w_q, home_idx):
+    pred = nonhome_mass(q, w_q, home_idx)
+    gt   = nonhome_mass(y, w_q, home_idx)
+    return torch.mean((pred - gt)**2)
+
 def last_home_start_times(p_pad, t_pad, lengths, home_idx):
     B, Lmax = p_pad.shape
     tau = t_pad.new_full((B,), 1.0)  # default: end of day (safety)
@@ -198,6 +221,11 @@ def main():
 
     masks = build_masks(purp, purposes)
     masks_t = {k: (v.to(args.device) if isinstance(v, torch.Tensor) else v) for k,v in masks.items()}
+    home_idx = masks.get("home_idx", None)
+    if home_idx is not None:
+        with torch.no_grad():
+            dec.alpha_per_p.data.fill_(dec_cfg.alpha_prior)
+            dec.alpha_per_p.data[home_idx] *= dec_cfg.alpha_home_factor
 
     ds = ScheduleDataset(args.activities_csv, time_cfg.T_minutes)
     tr_idx, va_idx = split_indices(len(ds), val_ratio=args.val_ratio, seed=42)
@@ -221,6 +249,7 @@ def main():
     mu_d = torch.tensor([priors[p].mu_d for p in purposes], dtype=torch.float32, device=args.device)
     sd_d = torch.tensor([priors[p].sigma_d for p in purposes], dtype=torch.float32, device=args.device)
     C_t = build_time_binned_transition_costs(args.activities_csv, purposes, nbins=24, device=args.device)
+    ce_w = purpose_ce_weights_from_seed_by_time(args.activities_csv, purposes).to(args.device)
 
     for epoch in range(1, args.epochs+1):
         enc.train()
@@ -250,19 +279,21 @@ def main():
             # y = rasterize_batch(segs, purpose_to_idx, t_q).to(args.device)
             y = rasterize_from_padded(p_pad, t_pad, d_pad, lengths, P, t_q).to(args.device)
 
-            ce = dec.ce_loss(q, y, w_q)
+            ce = dec.ce_loss(q, y, w_q, class_weights=ce_w)
             emd = dec.emd1d_loss(q, y, w_q)
             tv = dec.tv_loss(q, w_q)
             durlen = dec.durlen_loss(q, mu_d, sd_d, w_q)
             home_loss = terminal_home_loss(q, t_q, w_q, tau, masks_t["home_idx"])
             bigram_prior_loss = bigram_prior_loss_time(q, t_q, C_t)
+            nonhome_mse = nonhome_mass_mse(q, y, w_q, masks_t["home_idx"])
 
             total = dec_cfg.ce_weight*ce \
                 + dec_cfg.emd_weight*emd \
                 + dec_cfg.tv_weight*tv \
                 + dec_cfg.durlen_weight*durlen \
                 + dec_cfg.home_weight*home_loss \
-                + dec_cfg.bigram_prior_weight*bigram_prior_loss
+                + dec_cfg.bigram_prior_weight*bigram_prior_loss \
+                + dec_cfg.nonhome_mse_weight*nonhome_mse
             # Update model parameters
             opt.zero_grad()
             total.backward()
@@ -306,12 +337,14 @@ def main():
                 durlen_l = dec.durlen_loss(q, mu_d, sd_d, w_q)
                 home_l = terminal_home_loss(q, t_q, w_q, tau, masks_t["home_idx"])
                 bigram_prior_l = bigram_prior_loss_time(q, t_q, C_t)
+                nonhome_mse_l = nonhome_mass_mse(q, y, w_q, masks_t["home_idx"])
                 total_l = dec_cfg.ce_weight*ce_l \
                     + dec_cfg.emd_weight*emd_l \
                     + dec_cfg.tv_weight*tv_l \
                     + dec_cfg.durlen_weight*durlen_l \
                     + dec_cfg.home_weight*home_l \
-                    + dec_cfg.bigram_prior_weight*bigram_prior_l
+                    + dec_cfg.bigram_prior_weight*bigram_prior_l \
+                    + dec_cfg.nonhome_mse_weight*nonhome_mse_l
                 total_va += float(total_l.item())
                 ce_v += float(ce_l.item())
                 emd_v += float(emd_l.item())
