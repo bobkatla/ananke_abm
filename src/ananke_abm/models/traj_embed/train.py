@@ -12,7 +12,7 @@ from ananke_abm.models.traj_embed.configs import TimeConfig, BasisConfig, Quadra
 from ananke_abm.models.traj_embed.model.pds_loader import derive_priors_from_activities
 from ananke_abm.models.traj_embed.model.purpose_space import PurposeDistributionSpace
 from ananke_abm.models.traj_embed.model.utils_bases import gauss_legendre_nodes, fourier_time_features
-from ananke_abm.models.traj_embed.model.rasterize import rasterize_batch
+from ananke_abm.models.traj_embed.model.rasterize import rasterize_batch, rasterize_from_padded
 from ananke_abm.models.traj_embed.model.decoder_timefield import TimeFieldDecoder
 
 def set_seed(seed: int):
@@ -21,14 +21,6 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-# helper
-def build_y_cache(subset, purpose_to_idx, t_q, device):
-    cache = []
-    for seq in subset:   # seq is list[(p,t0,d), ...]
-        y = rasterize_batch([seq], purpose_to_idx, t_q)[0]  # (P,Q)
-        cache.append(y)
-    return [torch.tensor(y, device=device) if not torch.is_tensor(y) else y.to(device) for y in cache]
 
 class ScheduleDataset(torch.utils.data.Dataset):
     def __init__(self, activities_csv: str, T_minutes: int):
@@ -164,7 +156,9 @@ def main():
     params = list(pds.parameters()) + list(enc.parameters()) + list(dec.parameters())
     opt = optim.Adam(params, lr=args.lr)
 
-    t_q, w_q = gauss_legendre_nodes(quad_cfg.Q_nodes, dtype=torch.float32, device=args.device)
+    t_q, w_q = gauss_legendre_nodes(quad_cfg.Q_nodes_train, dtype=torch.float32, device=args.device)
+    Phi_q = fourier_time_features(t_q, basis_cfg.K_decoder_time)  # keep on device
+    loglam_q = pds.lambda_log(t_q)  # constant; uses only buffers in PDS
 
     masks = build_masks(purp, purposes)
     masks_t = {k: (v.to(args.device) if isinstance(v, torch.Tensor) else v) for k,v in masks.items()}
@@ -199,11 +193,11 @@ def main():
         for p_pad, t_pad, d_pad, lengths in dl_tr:
             e_p = pds()
             # lambda_log uses only buffers; detach to be explicit that it’s constant
-            with torch.no_grad():
-                loglam = pds.lambda_log(t_q)         # (P, Q)
+            # with torch.no_grad():
+            #     loglam = pds.lambda_log(t_q)         # (P, Q)
             p_pad = p_pad.to(args.device); t_pad = t_pad.to(args.device); d_pad = d_pad.to(args.device)
             z, r = enc(p_pad, t_pad, d_pad, lengths, e_p)
-            u = dec.utilities(z, e_p, t_q, loglam, masks=masks_t)
+            u = dec.utilities(z, e_p, t_q, loglam_q, masks=masks_t, Phi=Phi_q)
             q = dec.soft_assign(u)
             segs = []
             B, Lmax = p_pad.shape
@@ -215,7 +209,8 @@ def main():
                     pstr = purposes[pid]
                     seq.append((pstr, float(t_pad[b,i].item()), float(d_pad[b,i].item())))
                 segs.append(seq)
-            y = rasterize_batch(segs, purpose_to_idx, t_q).to(args.device)
+            # y = rasterize_batch(segs, purpose_to_idx, t_q).to(args.device)
+            y = rasterize_from_padded(p_pad, t_pad, d_pad, lengths, P, t_q).to(args.device)
 
             ce = dec.ce_loss(q, y, w_q)
             emd = dec.emd1d_loss(q, y, w_q)
@@ -235,7 +230,7 @@ def main():
         pds.eval()
         with torch.no_grad():
             e_p = pds()
-            loglam = pds.lambda_log(t_q)
+            # loglam = pds.lambda_log(t_q)
             total_va = 0.0
             ce_v = emd_v = tv_v = 0.0
             n_batches=0
@@ -244,7 +239,7 @@ def main():
                 t_pad = t_pad.to(args.device)
                 d_pad = d_pad.to(args.device)
                 z, r = enc(p_pad, t_pad, d_pad, lengths, e_p)
-                u = dec.utilities(z, e_p, t_q, loglam, masks=masks_t)
+                u = dec.utilities(z, e_p, t_q, loglam_q, masks=masks_t, Phi=Phi_q)
                 q = dec.soft_assign(u)
                 segs = []
                 B, Lmax = p_pad.shape
@@ -256,7 +251,8 @@ def main():
                         pstr = purposes[pid]
                         seq.append((pstr, float(t_pad[b,i].item()), float(d_pad[b,i].item())))
                     segs.append(seq)
-                y = rasterize_batch(segs, purpose_to_idx, t_q).to(args.device)
+                # y = rasterize_batch(segs, purpose_to_idx, t_q).to(args.device)
+                y = rasterize_from_padded(p_pad, t_pad, d_pad, lengths, P, t_q).to(args.device)
                 ce_l = dec.ce_loss(q, y, w_q)
                 emd_l = dec.emd1d_loss(q, y, w_q)
                 tv_l = dec.tv_loss(q, w_q)
@@ -288,7 +284,7 @@ def main():
         if avg_va < best_val_total:
             best_val_total = avg_va
             torch.save(ckpt, Path(args.outdir)/"ckpt_best.pt")
-            if epoch > 500:
+            if epoch > 0:
                 print(f"Best validation total: {best_val_total:.4f} at epoch {epoch}")
         if epoch == args.epochs:
             torch.save(ckpt, Path(args.outdir)/"ckpt_final.pt")

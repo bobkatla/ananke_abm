@@ -42,7 +42,7 @@ class TimeFieldDecoder(nn.Module):
         return C
 
     def utilities(self, z: torch.Tensor, e_p: torch.Tensor, t: torch.Tensor, log_lambda_p_t: torch.Tensor,
-                  masks: Optional[Dict[str, torch.Tensor]]=None):
+                  masks: Optional[Dict[str, torch.Tensor]]=None, Phi: Optional[torch.Tensor]=None):
         """
         Compute utilities u_p(t; z).
         Args:
@@ -58,8 +58,10 @@ class TimeFieldDecoder(nn.Module):
         Returns:
             u: (B,P,Q)
         """
-        B = z.shape[0]
-        Phi = fourier_time_features(t, self.K)  # (Q, 2K+1)
+        if Phi is None:
+            Phi = fourier_time_features(t, self.K)    # (Q, 2K+1)
+        else:
+            Phi = Phi.to(t.device)
         C = self.time_coeff(z, e_p)             # (B,P,2K+1)
         u = torch.matmul(C, Phi.T)              # (B,P,Q)
         u = u + self.alpha * log_lambda_p_t.unsqueeze(0)  # (1,P,Q) -> (B,P,Q)

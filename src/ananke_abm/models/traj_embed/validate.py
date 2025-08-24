@@ -7,9 +7,9 @@ import torch.nn.functional as F
 from ananke_abm.models.traj_embed.configs import TimeConfig, BasisConfig, QuadratureConfig, PurposeEmbeddingConfig, DecoderConfig
 from ananke_abm.models.traj_embed.model.purpose_space import PurposeDistributionSpace
 from ananke_abm.models.traj_embed.model.decoder_timefield import TimeFieldDecoder
-from ananke_abm.models.traj_embed.model.utils_bases import gauss_legendre_nodes
+from ananke_abm.models.traj_embed.model.utils_bases import gauss_legendre_nodes, fourier_time_features
 from ananke_abm.models.traj_embed.train import ScheduleDataset, TrajEncoderGRU, build_masks, collate_fn
-from ananke_abm.models.traj_embed.model.rasterize import rasterize_batch
+from ananke_abm.models.traj_embed.model.rasterize import rasterize_batch, rasterize_from_padded
 from torch.distributions import MultivariateNormal
 from torch.utils.data import DataLoader
 
@@ -121,7 +121,8 @@ def main():
     ds = ScheduleDataset(args.activities_csv, time_cfg.T_minutes)
     dl = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, shuffle=False, collate_fn=lambda batch: collate_fn(batch, purpose_to_idx))
 
-    t_q, w_q = gauss_legendre_nodes(quad_cfg.Q_nodes, dtype=torch.float32, device=args.device)
+    t_q, w_q = gauss_legendre_nodes(quad_cfg.Q_nodes_val, dtype=torch.float32, device=args.device)
+    Phi_q = fourier_time_features(t_q, basis_cfg.K_decoder_time)  # keep on device
     loglam = pds.lambda_log(t_q)
 
     masks = build_masks(purp, purposes)
@@ -135,7 +136,7 @@ def main():
             p_pad = p_pad.to(args.device); t_pad = t_pad.to(args.device); d_pad = d_pad.to(args.device)
             z, r = enc(p_pad, t_pad, d_pad, lengths, e_p)
             last_z = z
-            u = dec.utilities(z, e_p, t_q, loglam, masks=masks_t)
+            u = dec.utilities(z, e_p, t_q, loglam, masks=masks_t, Phi=Phi_q)
             q = dec.soft_assign(u)
 
             # rasterize GT
@@ -149,7 +150,8 @@ def main():
                     pstr = purposes[pid]
                     seq.append((pstr, float(t_pad[b,i].item()), float(d_pad[b,i].item())))
                 segs.append(seq)
-            y = rasterize_batch(segs, purpose_to_idx, t_q).to(args.device)
+            # y = rasterize_batch(segs, purpose_to_idx, t_q).to(args.device)
+            y = rasterize_from_padded(p_pad, t_pad, d_pad, lengths, len(purposes), t_q).to(args.device)
 
             ce = dec.ce_loss(q, y, w_q); emd = dec.emd1d_loss(q, y, w_q); tv = dec.tv_loss(q, w_q)
             total = DecoderConfig.ce_weight*ce + DecoderConfig.emd_weight*emd + DecoderConfig.tv_weight*tv + DecoderConfig.durlen_weight*dec.durlen_loss(q, torch.tensor([priors[p].mu_d for p in purposes], dtype=torch.float32, device=args.device), torch.tensor([priors[p].sigma_d for p in purposes], dtype=torch.float32, device=args.device), w_q)

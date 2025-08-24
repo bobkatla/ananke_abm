@@ -13,7 +13,8 @@ class BasisConfig:
 
 @dataclass
 class QuadratureConfig:
-    Q_nodes: int = 96               # Gauss-Legendre nodes for integrals
+    Q_nodes_train: int = 48
+    Q_nodes_val: int = 96
 
 @dataclass
 class PurposeEmbeddingConfig:

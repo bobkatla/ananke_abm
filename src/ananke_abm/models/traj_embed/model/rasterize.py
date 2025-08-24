@@ -1,4 +1,28 @@
 import torch
+import torch.nn.functional as F
+
+@torch.no_grad()
+def rasterize_from_padded(p_idx_pad: torch.Tensor, t0_pad: torch.Tensor, d_pad: torch.Tensor,
+                          lengths, P: int, t_nodes: torch.Tensor) -> torch.Tensor:
+    """
+    Vectorized rasterizer: (B,L), (B,L), (B,L), lengths, P, (Q,) -> (B,P,Q)
+    All tensors should already be on the same device as t_nodes.
+    """
+    device = t_nodes.device
+    B, L = p_idx_pad.shape
+    # mask valid segments
+    lengths_t = torch.as_tensor(lengths, device=p_idx_pad.device)
+    valid = (torch.arange(L, device=p_idx_pad.device).unsqueeze(0) < lengths_t.unsqueeze(1))  # (B,L)
+    # segment time spans
+    t1_pad = t0_pad + d_pad
+    tq = t_nodes.view(1, 1, -1)  # (1,1,Q)
+    seg_mask = (tq >= t0_pad.unsqueeze(-1)) & (tq < t1_pad.unsqueeze(-1))  # (B,L,Q)
+    seg_mask = seg_mask & valid.unsqueeze(-1)                               # (B,L,Q)
+    seg_mask = seg_mask.to(torch.float32)
+    # route by purpose with one‑hot and sum over segments
+    onehot = F.one_hot(p_idx_pad.clamp_min(0), num_classes=P).to(seg_mask.dtype)  # (B,L,P)
+    y = torch.einsum('blp,blq->bpq', onehot, seg_mask)
+    return y.clamp_(0, 1)
 
 def rasterize_batch(segments_batch, purpose_to_idx, t_nodes):
     """
