@@ -30,3 +30,5 @@ class DecoderConfig:
     emd_weight: float = 0.5
     durlen_weight: float = 0.1
     lap_weight: float = 0.0         # optional if you later add Laplacian reg
+    home_weight: float = 0.05        # weight of terminal home loss
+    bigram_prior_weight: float = 0.08 # weight of bigram prior loss

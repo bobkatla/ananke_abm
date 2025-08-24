@@ -7,9 +7,8 @@ import torch.nn.functional as F
 from ananke_abm.models.traj_embed.configs import TimeConfig, BasisConfig, QuadratureConfig, PurposeEmbeddingConfig, DecoderConfig
 from ananke_abm.models.traj_embed.model.purpose_space import PurposeDistributionSpace
 from ananke_abm.models.traj_embed.model.decoder_timefield import TimeFieldDecoder
-from ananke_abm.models.traj_embed.model.utils_bases import gauss_legendre_nodes, fourier_time_features
+from ananke_abm.models.traj_embed.model.utils_bases import gauss_legendre_nodes, build_time_binned_transition_costs, viterbi_timecost_decode
 from ananke_abm.models.traj_embed.train import ScheduleDataset, TrajEncoderGRU, build_masks, collate_fn
-from ananke_abm.models.traj_embed.model.rasterize import rasterize_batch, rasterize_from_padded
 from torch.distributions import MultivariateNormal
 from torch.utils.data import DataLoader
 
@@ -146,7 +145,7 @@ def _spd_cov(Z: torch.Tensor, shrink: float = 0.1, eps: float = 1e-5):
     return S_pd, mu.squeeze(0)
 
 def sample_and_decode(enc, pds, dec, ds, purposes, masks_t, device,
-                      num_samples: int = 5, L: int = 360, seed: int = 0, shrink: float = 0.1):
+                      num_samples: int = 5, L: int = 360, seed: int = 0, shrink: float = 0.1, C_t=None):
     torch.manual_seed(seed)
     purpose_to_idx = {p:i for i,p in enumerate(purposes)}
 
@@ -186,7 +185,8 @@ def sample_and_decode(enc, pds, dec, ds, purposes, masks_t, device,
         e_p = pds()
         loglam_dense = pds.lambda_log(t_dense)
         u_dense = dec.utilities(z_samp, e_p, t_dense, loglam_dense, masks=masks_t)
-        decoded = dec.argmax_decode(u_dense, t_dense)
+        # decoded = dec.argmax_decode(u_dense, t_dense)
+        decoded = viterbi_timecost_decode(u_dense, t_dense, C_t, switch_cost=0.02)
     return decoded
 
 
@@ -247,6 +247,8 @@ def main():
     masks = build_masks(purp_df, purposes)  # includes home_idx for "Home" if present
     masks_t = {k: (v.to(args.device) if isinstance(v, torch.Tensor) else v) for k, v in masks.items()}
 
+    C_t = build_time_binned_transition_costs(args.activities_csv, purposes, nbins=24, device=args.device)
+
     # --------- Validation metrics (unchanged) ----------
     totals = []; ces=[]; emds=[]; tvs=[]; last_z=None
     with torch.no_grad():
@@ -254,7 +256,7 @@ def main():
         for p_pad, t_pad, d_pad, lengths in dl:  # collate: p_pad,t_pad,d_pad,lengths
             p_pad = p_pad.to(args.device); t_pad = t_pad.to(args.device); d_pad = d_pad.to(args.device)
             z, r = enc(p_pad, t_pad, d_pad, lengths, e_p)
-            last_z = z
+            # last_z = z
             u = dec.utilities(z, e_p, t_q, loglam, masks=masks_t)
             q = dec.soft_assign(u)
 
@@ -265,10 +267,10 @@ def main():
             ce = dec.ce_loss(q, y, w_q)
             emd = dec.emd1d_loss(q, y, w_q)
             tv = dec.tv_loss(q, w_q)
-            total = (DecoderConfig.ce_weight*ce +
-                     DecoderConfig.emd_weight*emd +
-                     DecoderConfig.tv_weight*tv +
-                     DecoderConfig.durlen_weight*dec.durlen_loss(
+            total = (dec_cfg.ce_weight*ce +
+                     dec_cfg.emd_weight*emd +
+                     dec_cfg.tv_weight*tv +
+                     dec_cfg.durlen_weight*dec.durlen_loss(
                         q,
                         torch.tensor([priors[p].mu_d for p in purposes], dtype=torch.float32, device=args.device),
                         torch.tensor([priors[p].sigma_d for p in purposes], dtype=torch.float32, device=args.device),
@@ -281,13 +283,13 @@ def main():
     # --------- Generation -> CSV ----------
     Tm = time_cfg.T_minutes
     L = Tm // 5  # dense grid for decoding preview/generation
-    t_dense = torch.linspace(0, 1, L, device=args.device)
-    loglam_dense = pds.lambda_log(t_dense)
+    # t_dense = torch.linspace(0, 1, L, device=args.device)
+    # loglam_dense = pds.lambda_log(t_dense)
 
     with torch.no_grad():
         # Generate from latent Gaussian p(r) -> project -> normalize -> decode (your routine)
         decoded_gen = sample_and_decode(enc, pds, dec, ds, purposes, masks_t,
-                                        args.device, num_samples=args.num_gen, L=L, seed=0)
+                                        args.device, num_samples=args.num_gen, L=L, seed=0, C_t=C_t)
     gen_df = decoded_to_activities_df(decoded_gen, purposes, Tm, start_persid=0, prefix=args.gen_prefix)
 
     # Optional save

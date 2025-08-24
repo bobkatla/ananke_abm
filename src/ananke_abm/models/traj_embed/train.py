@@ -11,9 +11,45 @@ from pathlib import Path
 from ananke_abm.models.traj_embed.configs import TimeConfig, BasisConfig, QuadratureConfig, PurposeEmbeddingConfig, DecoderConfig
 from ananke_abm.models.traj_embed.model.pds_loader import derive_priors_from_activities
 from ananke_abm.models.traj_embed.model.purpose_space import PurposeDistributionSpace
-from ananke_abm.models.traj_embed.model.utils_bases import gauss_legendre_nodes, fourier_time_features
+from ananke_abm.models.traj_embed.model.utils_bases import gauss_legendre_nodes, fourier_time_features, build_time_binned_transition_costs
 from ananke_abm.models.traj_embed.model.rasterize import rasterize_batch, rasterize_from_padded
 from ananke_abm.models.traj_embed.model.decoder_timefield import TimeFieldDecoder
+
+# === training-time helpers (put near your loss utils) ===
+def last_home_start_times(p_pad, t_pad, lengths, home_idx):
+    B, Lmax = p_pad.shape
+    tau = t_pad.new_full((B,), 1.0)  # default: end of day (safety)
+    for b in range(B):
+        L = lengths[b]
+        idx = (p_pad[b, :L] == home_idx).nonzero(as_tuple=False)
+        if idx.numel():
+            tau[b] = t_pad[b, idx[-1, 0]]
+    return tau  # (B,)
+
+def terminal_home_loss(q, t_q, w_q, tau, home_idx):
+    # q: (B,P,Q); t_q,w_q: (Q,); tau:(B,)
+    qh = q[:, home_idx, :]                          # (B,Q)
+    after = (t_q.view(1, -1) >= tau.view(-1, 1)).float()
+    # Encourage "stay Home" after final-Home start => penalize (1 - q_home)
+    return ((1.0 - qh) * after * w_q.view(1,-1)).sum(dim=-1).mean()
+
+def bigram_prior_loss_time(q, t_q, C_t):  # q:(B,P,Q), t_q:(Q,), C_t:(Tbin,P,P)
+    nbins, P, _ = C_t.shape
+    Q = q.shape[-1]
+    if Q < 2: return q.new_tensor(0.0)
+    # time at midpoints between nodes
+    t_mid = 0.5 * (t_q[:-1] + t_q[1:])                 # (Q-1,)
+    bin_idx = torch.clamp((t_mid * nbins).long(), 0, nbins-1)  # (Q-1,)
+    C_stack = C_t.index_select(0, bin_idx)             # (Q-1,P,P)
+
+    # q at consecutive steps
+    qt = q[:, :, :-1].transpose(1, 2)                  # (B,Q-1,P)
+    qn = q[:, :,  1:].transpose(1, 2)                  # (B,Q-1,P)
+
+    # For each step s: (qt[b,s] @ C_stack[s]) · qn[b,s]
+    tmp = torch.einsum('bsp,spq->bsq', qt, C_stack)    # (B,Q-1,P)
+    expC = (tmp * qn).sum(dim=2)                       # (B,Q-1)
+    return expC.mean()
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -184,6 +220,7 @@ def main():
 
     mu_d = torch.tensor([priors[p].mu_d for p in purposes], dtype=torch.float32, device=args.device)
     sd_d = torch.tensor([priors[p].sigma_d for p in purposes], dtype=torch.float32, device=args.device)
+    C_t = build_time_binned_transition_costs(args.activities_csv, purposes, nbins=24, device=args.device)
 
     for epoch in range(1, args.epochs+1):
         enc.train()
@@ -199,6 +236,7 @@ def main():
             z, r = enc(p_pad, t_pad, d_pad, lengths, e_p)
             u = dec.utilities(z, e_p, t_q, loglam_q, masks=masks_t, Phi=Phi_q)
             q = dec.soft_assign(u)
+            tau = last_home_start_times(p_pad, t_pad, lengths, masks_t["home_idx"])
             segs = []
             B, Lmax = p_pad.shape
             for b in range(B):
@@ -216,8 +254,15 @@ def main():
             emd = dec.emd1d_loss(q, y, w_q)
             tv = dec.tv_loss(q, w_q)
             durlen = dec.durlen_loss(q, mu_d, sd_d, w_q)
+            home_loss = terminal_home_loss(q, t_q, w_q, tau, masks_t["home_idx"])
+            bigram_prior_loss = bigram_prior_loss_time(q, t_q, C_t)
 
-            total = dec_cfg.ce_weight*ce + dec_cfg.emd_weight*emd + dec_cfg.tv_weight*tv + dec_cfg.durlen_weight*durlen
+            total = dec_cfg.ce_weight*ce \
+                + dec_cfg.emd_weight*emd \
+                + dec_cfg.tv_weight*tv \
+                + dec_cfg.durlen_weight*durlen \
+                + dec_cfg.home_weight*home_loss \
+                + dec_cfg.bigram_prior_weight*bigram_prior_loss
             # Update model parameters
             opt.zero_grad()
             total.backward()
@@ -232,8 +277,9 @@ def main():
             e_p = pds()
             # loglam = pds.lambda_log(t_q)
             total_va = 0.0
-            ce_v = emd_v = tv_v = 0.0
+            ce_v = emd_v = tv_v = durlen_v = home_v = bigram_prior_v = 0.0
             n_batches=0
+            
             for p_pad, t_pad, d_pad, lengths in dl_va:
                 p_pad = p_pad.to(args.device)
                 t_pad = t_pad.to(args.device)
@@ -241,6 +287,7 @@ def main():
                 z, r = enc(p_pad, t_pad, d_pad, lengths, e_p)
                 u = dec.utilities(z, e_p, t_q, loglam_q, masks=masks_t, Phi=Phi_q)
                 q = dec.soft_assign(u)
+                tau = last_home_start_times(p_pad, t_pad, lengths, masks_t["home_idx"])
                 segs = []
                 B, Lmax = p_pad.shape
                 for b in range(B):
@@ -256,13 +303,22 @@ def main():
                 ce_l = dec.ce_loss(q, y, w_q)
                 emd_l = dec.emd1d_loss(q, y, w_q)
                 tv_l = dec.tv_loss(q, w_q)
-                mu_d = torch.tensor([priors[p].mu_d for p in purposes], dtype=torch.float32, device=args.device)
-                sd_d = torch.tensor([priors[p].sigma_d for p in purposes], dtype=torch.float32, device=args.device)
-                total_l = DecoderConfig.ce_weight*ce_l + DecoderConfig.emd_weight*emd_l + DecoderConfig.tv_weight*tv_l + DecoderConfig.durlen_weight*dec.durlen_loss(q, mu_d, sd_d, w_q)
+                durlen_l = dec.durlen_loss(q, mu_d, sd_d, w_q)
+                home_l = terminal_home_loss(q, t_q, w_q, tau, masks_t["home_idx"])
+                bigram_prior_l = bigram_prior_loss_time(q, t_q, C_t)
+                total_l = dec_cfg.ce_weight*ce_l \
+                    + dec_cfg.emd_weight*emd_l \
+                    + dec_cfg.tv_weight*tv_l \
+                    + dec_cfg.durlen_weight*durlen_l \
+                    + dec_cfg.home_weight*home_l \
+                    + dec_cfg.bigram_prior_weight*bigram_prior_l
                 total_va += float(total_l.item())
                 ce_v += float(ce_l.item())
                 emd_v += float(emd_l.item())
                 tv_v += float(tv_l.item())
+                durlen_v += float(durlen_l.item())
+                home_v += float(home_l.item())
+                bigram_prior_v += float(bigram_prior_l.item())
                 n_batches += 1
 
         avg_tr = total_tr / max(len(dl_tr),1); avg_va = total_va / max(n_batches,1)
