@@ -392,7 +392,7 @@ def main():
         #     nudge_step=0.1
         # )
         decoded_gen = sample_and_decode(enc, pds, dec, ds, purposes, masks_t, args.device,
-                            num_samples=args.num_gen, L=L, sampler="gauss_r", nudge_min_frac=None)
+                            num_samples=args.num_gen, L=L, sampler="gauss_r", nudge_min_frac=0.08)
     gen_df = decoded_to_activities_df(decoded_gen, purposes, Tm, start_persid=0, prefix=args.gen_prefix)
 
     # Optional save
