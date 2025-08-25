@@ -1,0 +1,72 @@
+from dataclasses import dataclass
+import warnings
+
+# ---- TIME & GRIDS ----
+@dataclass
+class TimeConfig:
+    # Allocation horizon (what we decode/optimize over) and circadian clock
+    T_alloc_minutes: int = 1800      # 30h window to allow spillovers
+    T_clock_minutes: int = 1440      # 24h periodic clock
+
+    # Grid step sizes
+    train_step_minutes: int = 5      # CRF training grid (fast)
+    eval_step_minutes: int = 1       # CRF/Viterbi decode grid (fidelity)
+
+    # (legacy) old normalized flag retained for back-compat; unused going forward
+    t_norm: bool = True
+
+
+# ---- BASES ----
+@dataclass
+class BasisConfig:
+    # Periodic prior is now explicitly 24h-clock-based
+    K_clock_prior: int = 6           # Fourier pairs for λ_p(clock); replaces K_time_prior
+    K_decoder_time: int = 8          # Fourier pairs for decoder utilities over allocation time
+
+
+# ---- PURPOSE EMBEDDINGS ----
+@dataclass
+class PurposeEmbeddingConfig:
+    d_p: int = 16
+    hidden: int = 64
+
+
+# ---- LATENT (β-VAE) ----
+@dataclass
+class VAEConfig:
+    latent_dim: int = 16             # dim(s); z = s / ||s||
+    beta: float = 0.2                # KL weight
+    kl_anneal_start: int = 0         # optional linear anneal (epoch)
+    kl_anneal_end:   int = 0
+
+
+# ---- CRF DECODER (resource allocation on a grid) ----
+@dataclass
+class CRFConfig:
+    eta: float = 4.0                 # Potts switching penalty (off-diagonal)
+    learn_eta: bool = False          # make eta learnable if True
+    force_home_ends: bool = True     # unified endpoint constraint (Home only at ends if True)
+    use_transition_mask: bool = False  # enable bigram feasibility masks
+
+
+# ---- DECODER MISC ----
+@dataclass
+class DecoderConfig:
+    # Keep m_latent for temporary back-compat with existing code; should match VAEConfig.latent_dim
+    m_latent: int = 16
+    alpha_prior: float = 1.0         # weight for log λ_p(clock(t)) bias in utilities
+
+
+# ---- (DEPRECATED) QUADRATURE CONFIG ----
+# We no longer train with CE/EMD/TV over Gauss–Legendre nodes; CRF NLL replaces them.
+# Keep this stub to avoid immediate import errors until other files are patched.
+@dataclass
+class QuadratureConfig:
+    Q_nodes_train: int = 48
+    Q_nodes_val: int = 96
+    def __post_init__(self):
+        warnings.warn(
+            "QuadratureConfig is deprecated in the CRF-VAE pipeline; "
+            "losses now use a CRF on a time grid. This class will be removed.",
+            DeprecationWarning,
+        )

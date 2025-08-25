@@ -1,0 +1,339 @@
+import argparse
+import random
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.nn.utils.rnn import pad_sequence
+
+# --- configs & model pieces ---
+from ananke_abm.models.traj_embed_updated.configs import (
+    TimeConfig,
+    BasisConfig,
+    PurposeEmbeddingConfig,
+    DecoderConfig,
+    VAEConfig,
+    CRFConfig,
+)
+from ananke_abm.models.traj_embed_updated.model.pds_loader import derive_priors_from_activities
+from ananke_abm.models.traj_embed_updated.model.purpose_space import PurposeDistributionSpace
+from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid, fourier_time_features
+from ananke_abm.models.traj_embed_updated.model.rasterize import rasterize_from_padded_to_grid
+from ananke_abm.models.traj_embed_updated.model.decoder_timefield import TimeFieldDecoder
+from ananke_abm.models.traj_embed_updated.model.encoder import TrajEncoderGRU, kl_gaussian_standard
+from ananke_abm.models.traj_embed_updated.model.crf_linear import LinearChainCRF
+from ananke_abm.models.traj_embed_updated.model.train_masks import build_endpoint_mask, endpoint_time_mask
+
+
+# -------------------
+# utils & dataset
+# -------------------
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+class ScheduleDataset(torch.utils.data.Dataset):
+    """
+    Reads activities and forms per-person sequences of (purpose, start_norm, dur_norm),
+    normalized by the ALLOCATION horizon (e.g., 30h).
+    """
+    def __init__(self, activities_csv: str, T_alloc_minutes: int):
+        acts = pd.read_csv(activities_csv)
+        self.T = float(T_alloc_minutes)
+        self.seqs = []
+        for _, g in acts.groupby("persid"):
+            g = g.sort_values(["startime", "stopno"])
+            day = [
+                (str(r["purpose"]), float(r["startime"] / self.T), float(r["total_duration"] / self.T))
+                for _, r in g.iterrows()
+            ]
+            self.seqs.append(day)
+
+    def __len__(self): return len(self.seqs)
+    def __getitem__(self, idx): return self.seqs[idx]
+
+
+def split_indices(n, val_ratio=0.2, seed=42):
+    idx = list(range(n))
+    rng = random.Random(seed)
+    rng.shuffle(idx)
+    n_val = int(round(n * val_ratio))
+    return idx[n_val:], idx[:n_val]
+
+
+def collate_fn(batch, purpose_to_idx):
+    """
+    Pack a batch of variable-length sequences into padded tensors.
+    Returns:
+        p_pad: [B, Lmax] long
+        t_pad: [B, Lmax] float in [0,1] (allocation-normalized start)
+        d_pad: [B, Lmax] float in [0,1] (allocation-normalized duration)
+        lengths: list[int] valid lengths
+    """
+    p_lists, t_lists, d_lists, lens = [], [], [], []
+    for seq in batch:
+        p_idx = [purpose_to_idx[p] for p, _, _ in seq]
+        t0 = [t for _, t, _ in seq]
+        dd = [d for _, _, d in seq]
+        p_lists.append(torch.tensor(p_idx, dtype=torch.long))
+        t_lists.append(torch.tensor(t0, dtype=torch.float32))
+        d_lists.append(torch.tensor(dd, dtype=torch.float32))
+        lens.append(len(seq))
+    p_pad = pad_sequence(p_lists, batch_first=True, padding_value=0)
+    t_pad = pad_sequence(t_lists, batch_first=True, padding_value=0.0)
+    d_pad = pad_sequence(d_lists, batch_first=True, padding_value=0.0)
+    return p_pad, t_pad, d_pad, lens
+
+
+# -------------------
+# training script
+# -------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--activities_csv", type=str, default="/mnt/data/small_activities_homebound_wd.csv")
+    ap.add_argument("--purposes_csv", type=str, default="/mnt/data/purposes.csv")
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--val_ratio", type=float, default=0.2)
+    ap.add_argument("--outdir", type=str, default="./runs")
+    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    args = ap.parse_args()
+    set_seed(42)
+
+    device = torch.device(args.device)
+    outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
+
+    # --- configs ---
+    time_cfg  = TimeConfig()
+    basis_cfg = BasisConfig()
+    pep_cfg   = PurposeEmbeddingConfig()
+    dec_cfg   = DecoderConfig()
+    vae_cfg   = VAEConfig()
+    crf_cfg   = CRFConfig()
+
+    # --- data & priors (24h clock prior; durations by allocation) ---
+    acts = pd.read_csv(args.activities_csv)
+    purp = pd.read_csv(args.purposes_csv)
+    priors, purposes = derive_priors_from_activities(
+        acts,
+        purp,
+        T_alloc_minutes=time_cfg.T_alloc_minutes,
+        K_clock_prior=basis_cfg.K_clock_prior,
+        T_clock_minutes=time_cfg.T_clock_minutes,
+    )
+
+    # feature matrix phi_p = [Fourier_clock | mu_t | sigma_t | mu_d | sigma_d], standardized
+    rows = []
+    for p in purposes:
+        pr = priors[p]
+        rows.append(np.concatenate([pr.time_fourier, [pr.mu_t, pr.sigma_t, pr.mu_d, pr.sigma_d]]).astype("float32"))
+    phi = np.stack(rows, axis=0)
+    phi = (phi - phi.mean(0, keepdims=True)) / (phi.std(0, keepdims=True) + 1e-6)
+    phi_t = torch.tensor(phi, dtype=torch.float32, device=device)
+
+    # --- PDS (embeddings + clock prior accessors) ---
+    pds = PurposeDistributionSpace(phi_t, d_p=pep_cfg.d_p, hidden=pep_cfg.hidden).to(device)
+    pds.set_clock_prior_K(basis_cfg.K_clock_prior)
+
+    # --- allocation grids (train/eval) ---
+    t_alloc_minutes_train, t_alloc01_train = make_alloc_grid(
+        T_alloc_minutes=time_cfg.T_alloc_minutes,
+        step_minutes=time_cfg.train_step_minutes,
+        device=device,
+        dtype=torch.float32,
+    )
+    L_train = t_alloc01_train.numel()
+    Phi_train = fourier_time_features(t_alloc01_train, basis_cfg.K_decoder_time)  # [L, 2K+1]
+
+    # 24h periodic clock prior evaluated on the allocation grid
+    with torch.no_grad():
+        loglam_train = pds.lambda_log_on_alloc_grid(t_alloc_minutes_train, T_clock_minutes=time_cfg.T_clock_minutes)  # [P,L]
+
+    # --- unified endpoint mask ---
+    ep_masks = build_endpoint_mask(purp, purposes, force_home_ends=crf_cfg.force_home_ends)
+    endpoint_mask_train = endpoint_time_mask(ep_masks.endpoint_allowed, L_train, device=device)  # [L,P]
+
+    # --- models ---
+    P = len(purposes)
+    dec = TimeFieldDecoder(
+        P=P,
+        m_latent=vae_cfg.latent_dim,
+        d_p=pep_cfg.d_p,
+        K_decoder_time=basis_cfg.K_decoder_time,
+        alpha_prior=dec_cfg.alpha_prior,
+    ).to(device)
+
+    enc = TrajEncoderGRU(
+        d_p=pep_cfg.d_p,
+        K_time_token_clock=4,
+        K_time_token_alloc=0,    # optional; set >0 to include alloc-position Fourier tokens
+        K_dur_token=4,
+        m_latent=vae_cfg.latent_dim,
+        gru_hidden=64,
+        num_layers=1,
+    ).to(device)
+
+    crf = LinearChainCRF(
+        P=P,
+        eta=crf_cfg.eta,
+        learn_eta=crf_cfg.learn_eta,
+        transition_mask=None,   # plug in a [P,P] Bool mask if you want to forbid transitions
+    ).to(device)
+
+    params = list(pds.parameters()) + list(enc.parameters()) + list(dec.parameters())
+    if crf_cfg.learn_eta:
+        params += list(crf.parameters())
+    opt = optim.Adam(params, lr=args.lr)
+
+    # --- dataset / loaders ---
+    ds = ScheduleDataset(args.activities_csv, T_alloc_minutes=time_cfg.T_alloc_minutes)
+    tr_idx, va_idx = split_indices(len(ds), val_ratio=args.val_ratio, seed=42)
+    tr_subset = torch.utils.data.Subset(ds, tr_idx)
+    va_subset = torch.utils.data.Subset(ds, va_idx)
+
+    purpose_to_idx = {p: i for i, p in enumerate(purposes)}
+
+    def loader(subset, shuffle):
+        return torch.utils.data.DataLoader(
+            subset,
+            batch_size=args.batch_size,
+            shuffle=shuffle,
+            collate_fn=lambda batch: collate_fn(batch, purpose_to_idx),
+            num_workers=0,   # tune on your machine
+            pin_memory=False,
+        )
+
+    dl_tr = loader(tr_subset, True)
+    dl_va = loader(va_subset, False)
+
+    # --- training loop ---
+    history = {"epoch": [], "train_total": [], "val_total": [], "nll": [], "kl": []}
+    best_val_total = float("inf")
+
+    def beta_at_epoch(ep: int) -> float:
+        if vae_cfg.kl_anneal_end and ep < vae_cfg.kl_anneal_end:
+            # optional linear warmup; start at beta * (ep / end)
+            return vae_cfg.beta * (ep / max(1, vae_cfg.kl_anneal_end))
+        return vae_cfg.beta
+
+    for epoch in range(1, args.epochs + 1):
+        enc.train(); dec.train(); pds.train(); crf.train()
+        total_tr = 0.0; nll_tr = 0.0; kl_tr = 0.0
+
+        beta_weight = beta_at_epoch(epoch)
+
+        for p_pad, t_pad, d_pad, lengths in dl_tr:
+            p_pad = p_pad.to(device); t_pad = t_pad.to(device); d_pad = d_pad.to(device)
+            e_p = pds()  # [P, d_p]
+
+            # encode (β-VAE)
+            z, s, mu, logvar = enc(
+                p_pad, t_pad, d_pad, lengths, e_p,
+                T_alloc_minutes=time_cfg.T_alloc_minutes,
+                T_clock_minutes=time_cfg.T_clock_minutes,
+                sample=True,
+            )
+
+            # unaries θ on train grid (no mask applied here; CRF will apply)
+            theta = dec.utilities_on_grid(
+                z, e_p, t_alloc01_train, loglam_train,
+                endpoint_mask=None,  # avoid double-application; CRF handles endpoints
+                Phi=Phi_train,
+            )  # [B,P,L]
+
+            # labels on train grid
+            fallback_idx = ep_masks.home_idx if ep_masks.home_idx is not None else 0
+            y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)  # [B,L]
+
+            # losses
+            nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train)   # scalar
+            kl  = kl_gaussian_standard(mu, logvar, reduction="mean")          # scalar
+            loss = nll + beta_weight * kl
+
+            # step
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step()
+
+            total_tr += float(loss.item()); nll_tr += float(nll.item()); kl_tr += float(kl.item())
+
+        # ---- validation ----
+        enc.eval(); dec.eval(); pds.eval(); crf.eval()
+        total_va = 0.0; nll_va = 0.0; kl_va = 0.0; n_batches = 0
+
+        with torch.no_grad():
+            e_p = pds()
+            for p_pad, t_pad, d_pad, lengths in dl_va:
+                p_pad = p_pad.to(device); t_pad = t_pad.to(device); d_pad = d_pad.to(device)
+
+                z, s, mu, logvar = enc(
+                    p_pad, t_pad, d_pad, lengths, e_p,
+                    T_alloc_minutes=time_cfg.T_alloc_minutes,
+                    T_clock_minutes=time_cfg.T_clock_minutes,
+                    sample=False,  # deterministic μ at val
+                )
+                theta = dec.utilities_on_grid(
+                    z, e_p, t_alloc01_train, loglam_train,
+                    endpoint_mask=None,
+                    Phi=Phi_train,
+                )
+                fallback_idx = ep_masks.home_idx if ep_masks.home_idx is not None else 0
+                y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)
+
+                nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train)
+                kl  = kl_gaussian_standard(mu, logvar, reduction="mean")
+                loss = nll + beta_weight * kl
+
+                total_va += float(loss.item()); nll_va += float(nll.item()); kl_va += float(kl.item()); n_batches += 1
+
+        avg_tr = total_tr / max(len(dl_tr), 1)
+        avg_va = total_va / max(n_batches, 1)
+        if epoch % 10 == 0 or epoch == args.epochs:
+            print(f"[{epoch:03d}] train={avg_tr:.4f}  val={avg_va:.4f}  (nll={nll_va/max(n_batches,1):.4f}, kl={kl_va/max(n_batches,1):.4f}, beta={beta_weight:.3f})")
+
+        history["epoch"].append(epoch)
+        history["train_total"].append(avg_tr)
+        history["val_total"].append(avg_va)
+        history["nll"].append(nll_va / max(n_batches, 1))
+        history["kl"].append(kl_va / max(n_batches, 1))
+
+        # --- checkpoint ---
+        ckpt = {
+            "epoch": epoch,
+            "model_state": {"pds": pds.state_dict(), "enc": enc.state_dict(), "dec": dec.state_dict(), "crf": crf.state_dict()},
+            "priors": priors,
+            "purposes": purposes,
+            "purpose_to_idx": {p: i for i, p in enumerate(purposes)},
+            "configs": {
+                "time": vars(TimeConfig()),
+                "basis": vars(BasisConfig()),
+                "pep": vars(PurposeEmbeddingConfig()),
+                "dec": vars(DecoderConfig()),
+                "vae": vars(VAEConfig()),
+                "crf": vars(CRFConfig()),
+            },
+        }
+        if avg_va < best_val_total:
+            best_val_total = avg_va
+            torch.save(ckpt, outdir / "ckpt_best.pt")
+            print(f"Best val so far: {best_val_total:.4f} at epoch {epoch}")
+
+        if epoch == args.epochs:
+            torch.save(ckpt, outdir / "ckpt_final.pt")
+            print(f"Final val: {avg_va:.4f} (best {best_val_total:.4f})")
+
+    # Save history to CSV
+    pd.DataFrame(history).to_csv(outdir / "history.csv", index=False)
+
+
+if __name__ == "__main__":
+    main()
