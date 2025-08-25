@@ -201,7 +201,7 @@ def main():
     ap.add_argument("--gen_prefix", type=str, default="gen", help="prefix for generated persid")
     ap.add_argument("--gen_csv", type=str, default=None, help="optional path to save generated activities CSV")
     ap.add_argument("--val_csv", type=str, default=None, help="optional path to save per-trajectory validation CSV")
-    ap.add_argument("--eval_step_minutes", type=int, default=1, help="grid step for eval (minutes); 1=1min over allocation window")
+    ap.add_argument("--eval_step_minutes", type=int, default=5, help="grid step for eval (minutes); 1=1min over allocation window")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
     set_seed(42)
