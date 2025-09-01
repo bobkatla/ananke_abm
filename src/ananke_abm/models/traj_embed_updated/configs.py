@@ -5,12 +5,12 @@ import warnings
 @dataclass
 class TimeConfig:
     # Allocation horizon (what we decode/optimize over) and circadian clock
-    T_alloc_minutes: int = 1800      # 30h window to allow spillovers
+    ALLOCATION_HORIZON_MINS: int = 1800      # 30h window to allow spillovers
     T_clock_minutes: int = 1440      # 24h periodic clock
 
     # Grid step sizes
-    train_step_minutes: int = 5      # CRF training grid (fast)
-    eval_step_minutes: int = 1       # CRF/Viterbi decode grid (fidelity)
+    TRAIN_GRID_MINS: int = 10      # CRF training grid (fast)
+    VALID_GRID_MINS: int = 2       # CRF/Viterbi decode grid (fidelity)
 
     # (legacy) old normalized flag retained for back-compat; unused going forward
     t_norm: bool = True

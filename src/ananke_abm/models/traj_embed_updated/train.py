@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.nn.utils.rnn import pad_sequence
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # --- configs & model pieces ---
 from ananke_abm.models.traj_embed_updated.configs import (
@@ -95,6 +96,12 @@ def collate_fn(batch, purpose_to_idx):
 # -------------------
 # training script
 # -------------------
+def sanitize_theta(theta: torch.Tensor) -> torch.Tensor:
+    """Numerically stabilizes CRF emissions."""
+    theta_max = torch.max(theta, dim=1, keepdim=True).values
+    theta_stable = theta - theta_max
+    return torch.clamp(theta_stable, min=-30.0)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--activities_csv", type=str, default="/mnt/data/small_activities_homebound_wd.csv")
@@ -125,7 +132,7 @@ def main():
     priors, purposes = derive_priors_from_activities(
         acts,
         purp,
-        T_alloc_minutes=time_cfg.T_alloc_minutes,
+        T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS,
         K_clock_prior=basis_cfg.K_clock_prior,
         T_clock_minutes=time_cfg.T_clock_minutes,
     )
@@ -143,22 +150,22 @@ def main():
     pds = PurposeDistributionSpace(phi_t, d_p=pep_cfg.d_p, hidden=pep_cfg.hidden).to(device)
     pds.set_clock_prior_K(basis_cfg.K_clock_prior)
 
-    # --- allocation grids (train/eval) ---
-    t_alloc_minutes_train, t_alloc01_train = make_alloc_grid(
-        T_alloc_minutes=time_cfg.T_alloc_minutes,
-        step_minutes=time_cfg.train_step_minutes,
-        device=device,
-        dtype=torch.float32,
-    )
-    L_train = t_alloc01_train.numel()
-    Phi_train = fourier_time_features(t_alloc01_train, basis_cfg.K_decoder_time)  # [L, 2K+1]
-
-    # 24h periodic clock prior evaluated on the allocation grid
-    with torch.no_grad():
-        loglam_train = pds.lambda_log_on_alloc_grid(t_alloc_minutes_train, T_clock_minutes=time_cfg.T_clock_minutes)  # [P,L]
+    # --- allocation grids & priors (train/eval) ---
+    loglam_grids = {}
+    for grid_type, step_mins in [("train", time_cfg.TRAIN_GRID_MINS), ("eval", time_cfg.VALID_GRID_MINS)]:
+        t_alloc_minutes, _ = make_alloc_grid(
+            T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS,
+            step_minutes=step_mins,
+            device=device,
+        )
+        with torch.no_grad():
+            loglam_grids[grid_type] = pds.lambda_log_on_alloc_grid(
+                t_alloc_minutes, T_clock_minutes=time_cfg.T_clock_minutes
+            ) # [P, L]
 
     # --- unified endpoint mask ---
     ep_masks = build_endpoint_mask(purp, purposes, force_home_ends=crf_cfg.force_home_ends)
+    L_train = loglam_grids["train"].shape[1]
     endpoint_mask_train = endpoint_time_mask(ep_masks.endpoint_allowed, L_train, device=device)  # [L,P]
 
     # --- models ---
@@ -169,6 +176,7 @@ def main():
         d_p=pep_cfg.d_p,
         K_decoder_time=basis_cfg.K_decoder_time,
         alpha_prior=dec_cfg.alpha_prior,
+        time_cfg=vars(time_cfg),
     ).to(device)
 
     enc = TrajEncoderGRU(
@@ -179,6 +187,7 @@ def main():
         m_latent=vae_cfg.latent_dim,
         gru_hidden=64,
         num_layers=1,
+        dropout=0.2
     ).to(device)
 
     crf = LinearChainCRF(
@@ -191,10 +200,10 @@ def main():
     params = list(pds.parameters()) + list(enc.parameters()) + list(dec.parameters())
     if crf_cfg.learn_eta:
         params += list(crf.parameters())
-    opt = optim.Adam(params, lr=args.lr)
+    opt = optim.Adam(params, lr=args.lr, weight_decay=1e-4)
 
     # --- dataset / loaders ---
-    ds = ScheduleDataset(args.activities_csv, T_alloc_minutes=time_cfg.T_alloc_minutes)
+    ds = ScheduleDataset(args.activities_csv, T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS)
     tr_idx, va_idx = split_indices(len(ds), val_ratio=args.val_ratio, seed=42)
     tr_subset = torch.utils.data.Subset(ds, tr_idx)
     va_subset = torch.utils.data.Subset(ds, va_idx)
@@ -230,24 +239,39 @@ def main():
 
         beta_weight = beta_at_epoch(epoch)
 
-        for p_pad, t_pad, d_pad, lengths in dl_tr:
+        for i, (p_pad, t_pad, d_pad, lengths) in enumerate(dl_tr):
             p_pad = p_pad.to(device); t_pad = t_pad.to(device); d_pad = d_pad.to(device)
             e_p = pds()  # [P, d_p]
 
             # encode (β-VAE)
             z, s, mu, logvar = enc(
                 p_pad, t_pad, d_pad, lengths, e_p,
-                T_alloc_minutes=time_cfg.T_alloc_minutes,
+                T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS,
                 T_clock_minutes=time_cfg.T_clock_minutes,
                 sample=True,
             )
 
+            if torch.isnan(z).any():
+                print(f"NaN detected in z at batch {i}. Norms: {torch.linalg.norm(s, dim=-1)}")
+                # Consider stopping or saving state here
+                break
+
             # unaries θ on train grid (no mask applied here; CRF will apply)
             theta = dec.utilities_on_grid(
-                z, e_p, t_alloc01_train, loglam_train,
+                z, e_p, loglam_grids["train"], grid_type="train",
                 endpoint_mask=None,  # avoid double-application; CRF handles endpoints
-                Phi=Phi_train,
             )  # [B,P,L]
+            
+            theta = sanitize_theta(theta)
+
+            if torch.isnan(theta).any():
+                print(f"NaN detected in theta at batch {i}.")
+                break
+
+            # Log stats periodically
+            if i % 50 == 0:
+                print(f"Theta stats: min={theta.min():.2f}, max={theta.max():.2f}")
+
 
             # labels on train grid
             fallback_idx = ep_masks.home_idx if ep_masks.home_idx is not None else 0
@@ -277,15 +301,15 @@ def main():
 
                 z, s, mu, logvar = enc(
                     p_pad, t_pad, d_pad, lengths, e_p,
-                    T_alloc_minutes=time_cfg.T_alloc_minutes,
+                    T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS,
                     T_clock_minutes=time_cfg.T_clock_minutes,
                     sample=False,  # deterministic μ at val
                 )
                 theta = dec.utilities_on_grid(
-                    z, e_p, t_alloc01_train, loglam_train,
+                    z, e_p, loglam_grids["train"], grid_type="train",
                     endpoint_mask=None,
-                    Phi=Phi_train,
                 )
+                theta = sanitize_theta(theta)
                 fallback_idx = ep_masks.home_idx if ep_masks.home_idx is not None else 0
                 y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)
 

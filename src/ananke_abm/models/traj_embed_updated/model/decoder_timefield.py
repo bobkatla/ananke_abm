@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict
 
-from ananke_abm.models.traj_embed_updated.model.utils_bases import fourier_time_features
+from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid, fourier_time_features
 
 
 class TimeFieldDecoder(nn.Module):
@@ -15,11 +15,10 @@ class TimeFieldDecoder(nn.Module):
 
     Two usage modes:
       1) Grid-based unaries for CRF (preferred in new pipeline):
-           theta = utilities_on_grid(z, e_p, t_alloc01, loglam_alloc, endpoint_mask)
+           theta = utilities_on_grid(z, e_p, loglam_alloc, grid_type="train")
          where:
-           - t_alloc01: allocation grid in [0,1] (e.g., 30h normalized)
-           - loglam_alloc: precomputed log λ_p(clock(t)) on that grid, shape [P, L]
-           - endpoint_mask: [L, P] bool (True=allowed) only constraining first/last steps
+           - loglam_alloc: precomputed log λ_p(clock(t)) on the specified grid, shape [P, L]
+           - grid_type: "train" or "eval" to select the precomputed basis
 
       2) Legacy continuous nodes (kept for back-compat and previews):
            u = utilities(z, e_p, t_nodes01, log_lambda_p_t, masks=None, Phi=None)
@@ -29,7 +28,15 @@ class TimeFieldDecoder(nn.Module):
       - The 24h periodicity is injected through log λ_p(clock(t)), supplied by PDS.
     """
 
-    def __init__(self, P: int, m_latent: int, d_p: int, K_decoder_time: int, alpha_prior: float = 1.0):
+    def __init__(
+        self,
+        P: int,
+        m_latent: int,
+        d_p: int,
+        K_decoder_time: int,
+        alpha_prior: float = 1.0,
+        time_cfg: Optional[Dict] = None,
+    ):
         super().__init__()
         self.P = P
         self.m = m_latent
@@ -46,6 +53,18 @@ class TimeFieldDecoder(nn.Module):
             nn.ReLU(),
             nn.Linear(128, out_dim),
         )
+
+        if time_cfg is not None:
+            # --- Caching Patch for Fourier Basis ---
+            for grid_type, step_mins in [("train", time_cfg["TRAIN_GRID_MINS"]), ("eval", time_cfg["VALID_GRID_MINS"])]:
+                _, t_alloc01 = make_alloc_grid(
+                    T_alloc_minutes=time_cfg["ALLOCATION_HORIZON_MINS"],
+                    step_minutes=step_mins,
+                    device="cpu", # store on cpu, move to device in forward
+                )
+                basis = fourier_time_features(t_alloc01, self.K)
+                self.register_buffer(f"Phi_{grid_type}", basis)
+            # --- End Caching Patch ---
 
     # ---- coefficient head ----
     def time_coeff(self, z: torch.Tensor, e_p: torch.Tensor) -> torch.Tensor:
@@ -64,26 +83,13 @@ class TimeFieldDecoder(nn.Module):
         return C
 
     # ---- NEW: grid-based unaries for CRF ----
-    @staticmethod
-    def _basis_from_alloc_t01(t_alloc01: torch.Tensor, K: int) -> torch.Tensor:
-        """
-        Build Fourier basis Φ on the ALLOCATION axis.
-        Args:
-            t_alloc01: [L] tensor in [0,1] (allocation-normalized time)
-            K: number of harmonic pairs
-        Returns:
-            Φ: [L, 2K+1]
-        """
-        return fourier_time_features(t_alloc01, K)  # [L, 2K+1]
-
     def utilities_on_grid(
         self,
         z: torch.Tensor,                 # [B, m]
         e_p: torch.Tensor,               # [P, d_p]
-        t_alloc01: torch.Tensor,         # [L] allocation-normalized grid (e.g., 30h / T_alloc)
         loglam_alloc: torch.Tensor,      # [P, L] log λ_p(clock(t)) evaluated on this grid
+        grid_type: str = "train",        # "train" or "eval"
         endpoint_mask: Optional[torch.Tensor] = None,  # [L, P] bool; only first/last rows matter
-        Phi: Optional[torch.Tensor] = None,            # [L, 2K+1] optional precomputed allocation basis
         neg_large: float = -1e4,
     ) -> torch.Tensor:
         """
@@ -92,11 +98,8 @@ class TimeFieldDecoder(nn.Module):
         Returns:
             theta: [B, P, L] log-unaries (no softmax)
         """
-        if Phi is None:
-            Phi = self._basis_from_alloc_t01(t_alloc01, self.K)    # [L, 2K+1]
-        else:
-            # ensure device match
-            Phi = Phi.to(t_alloc01.device)
+        Phi = getattr(self, f"Phi_{grid_type}").to(z.device)
+        L = Phi.shape[0]
 
         C = self.time_coeff(z, e_p)                                # [B,P,2K+1]
         # u = C · Φ^T
@@ -107,9 +110,8 @@ class TimeFieldDecoder(nn.Module):
 
         # unified endpoint constraint (apply only at first/last positions)
         if endpoint_mask is not None:
-            assert endpoint_mask.dim() == 2 and endpoint_mask.shape[0] == t_alloc01.shape[0], \
+            assert endpoint_mask.dim() == 2 and endpoint_mask.shape[0] == L, \
                 "endpoint_mask must be [L, P]"
-            L = t_alloc01.shape[0]
             forbid_first = ~endpoint_mask[0]    # [P]
             forbid_last  = ~endpoint_mask[-1]   # [P]
             if forbid_first.any():
