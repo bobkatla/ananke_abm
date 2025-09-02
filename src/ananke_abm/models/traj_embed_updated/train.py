@@ -269,8 +269,8 @@ def main():
                 break
 
             # Log stats periodically
-            if i % 50 == 0:
-                print(f"Theta stats: min={theta.min():.2f}, max={theta.max():.2f}")
+            # if i % 50 == 0:
+            #     print(f"Theta stats: min={theta.min():.2f}, max={theta.max():.2f}")
 
 
             # labels on train grid
