@@ -117,7 +117,7 @@ def plot_flipped(prop_wide: pd.DataFrame, out_png: str | None):
     plt.tight_layout()
 
     if out_png:
-        plt.savefig(out_png, bbox_inches="tight")
+        plt.savefig(out_png, bbox_inches="tight", dpi=300)
         print(f"Saved plot to: {out_png}")
         plt.close()
     else:
