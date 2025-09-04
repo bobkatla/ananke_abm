@@ -106,7 +106,7 @@ def main():
     ap.add_argument("--out-dir", type=str, default=None, help="If provided, save PNGs here; otherwise show the figures.")
     ap.add_argument("--eps-work", type=float, default=0.002, help="Y-zoom threshold for Work/Education")
     ap.add_argument("--eps-ssa", type=float, default=0.0015, help="Y-zoom threshold for Social/Shopping/Accompanying")
-    ap.add_argument("--dpi", type=int, default=160, help="Figure DPI")
+    ap.add_argument("--dpi", type=int, default=300, help="Figure DPI")
     args = ap.parse_args()
 
     df, tcols = load_buffer(args.buffer_csv)
