@@ -28,6 +28,15 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
 ORDERED_LABELS_TOPDOWN = ["Home", "Work", "Education", "Social", "Shopping", "Accompanying", "Other"]
+
+def swap_home_with(main: str) -> list[str]:
+    order = ORDERED_LABELS_TOPDOWN.copy()
+    if main in order:
+        i_home = order.index("Home")
+        i_main = order.index(main)
+        order[i_home], order[i_main] = order[i_main], order[i_home]
+    return order
+
 FIXED_COLORS = {
     "Home": "#9ecae1",
     "Work": "#3182bd",
@@ -60,7 +69,7 @@ def filter_main(df: pd.DataFrame, activity: str, t0: int, t1: int) -> pd.DataFra
     kept = df.loc[mask].copy()
     return kept
 
-def compute_props(df: pd.DataFrame, tcols: List[int]) -> pd.DataFrame:
+def compute_props(df: pd.DataFrame, tcols: List[int], main: str) -> pd.DataFrame:
     """Return wide proportion table indexed by time with columns ORDERED_LABELS_TOPDOWN."""
     records = []
     for t in tcols:
@@ -73,7 +82,7 @@ def compute_props(df: pd.DataFrame, tcols: List[int]) -> pd.DataFrame:
             records.append({"time": t, "purpose": lab, "proportion": prop})
     long = pd.DataFrame(records)
     wide = (long.pivot(index="time", columns="purpose", values="proportion")
-                 .reindex(columns=ORDERED_LABELS_TOPDOWN)
+                 .reindex(columns=swap_home_with(main))
                  .fillna(0.0)
                  .sort_index())
     return wide
@@ -85,7 +94,8 @@ def stacked_plot(props_wide: pd.DataFrame,
                  t0: int,
                  t1: int,
                  dpi: int = 200,
-                 show: bool = False):
+                 show: bool = False,
+                 main: str = "Work"):
     """Make polished stacked area with last bin included (right edge), top-down order, hours x-axis, Y zoom [0, y_max]."""
     x_min = props_wide.index.values
     steps = np.diff(x_min)
@@ -96,7 +106,7 @@ def stacked_plot(props_wide: pd.DataFrame,
     x_edges_hr = x_edges_min / 60.0
 
     # bottom-up arrays for stackplot; extend with last column
-    bottom_up_labels = list(reversed(ORDERED_LABELS_TOPDOWN))
+    bottom_up_labels = list(reversed(swap_home_with(main)))
     y_bottom_up = props_wide[bottom_up_labels].to_numpy().T
     y_bottom_up_ext = np.hstack([y_bottom_up, y_bottom_up[:, -1][:, None]])
     colors_bottom_up = [FIXED_COLORS[l] for l in bottom_up_labels]
@@ -125,7 +135,7 @@ def stacked_plot(props_wide: pd.DataFrame,
         plt.axvline(x=xline, color="#888888", linestyle="--", linewidth=0.8, alpha=0.6)
 
     # legend in requested top-down order
-    legend_handles = [Patch(facecolor=FIXED_COLORS[l], label=l) for l in ORDERED_LABELS_TOPDOWN]
+    legend_handles = [Patch(facecolor=FIXED_COLORS[l], label=l) for l in swap_home_with(main)]
     plt.legend(handles=legend_handles, loc="upper left", frameon=True, facecolor="white", edgecolor="black")
     plt.tight_layout()
 
@@ -157,22 +167,22 @@ def main():
     # --- Work cohort ---
     df_work = filter_main(df, "Work", args.t0, args.t1)
     n_work = len(df_work)
-    props_work = compute_props(df_work, tcols)
+    props_work = compute_props(df_work, tcols, "Work")
     out_work = None
     if args.out_dir:
         out_work = os.path.join(args.out_dir, "stacked_work_10to14_zoom_0_05.png")
-    title_work = f"Stacked Proportions (Y-zoom 0-0.05, includes last bin) — Work @ 10:00 & 14:00 — n={n_work:,}"
-    stacked_plot(props_work, title_work, y_max=0.04, out_png=out_work, t0=args.t0, t1=args.t1, dpi=args.dpi, show=args.show)
+    title_work = f"Stacked Proportions (Y-zoom 0-0.04, includes last bin) — Work @ 10:00 & 14:00 — n={n_work:,}"
+    stacked_plot(props_work, title_work, y_max=0.04, out_png=out_work, t0=args.t0, t1=args.t1, dpi=args.dpi, show=args.show, main="Work")
 
     # --- Education cohort ---
     df_edu = filter_main(df, "Education", args.t0, args.t1)
     n_edu = len(df_edu)
-    props_edu = compute_props(df_edu, tcols)
+    props_edu = compute_props(df_edu, tcols, "Education")
     out_edu = None
     if args.out_dir:
         out_edu = os.path.join(args.out_dir, "stacked_education_10to14_zoom_0_005.png")
-    title_edu = f"Stacked Proportions (Y-zoom 0-0.005, includes last bin) — Education @ 10:00 & 14:00 — n={n_edu:,}"
-    stacked_plot(props_edu, title_edu, y_max=0.004, out_png=out_edu, t0=args.t0, t1=args.t1, dpi=args.dpi, show=args.show)
+    title_edu = f"Stacked Proportions (Y-zoom 0-0.004, includes last bin) — Education @ 10:00 & 14:00 — n={n_edu:,}"
+    stacked_plot(props_edu, title_edu, y_max=0.004, out_png=out_edu, t0=args.t0, t1=args.t1, dpi=args.dpi, show=args.show, main="Education")
 
 if __name__ == "__main__":
     main()
