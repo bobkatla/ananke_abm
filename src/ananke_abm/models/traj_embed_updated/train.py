@@ -20,7 +20,7 @@ from ananke_abm.models.traj_embed_updated.configs import (
 )
 from ananke_abm.models.traj_embed_updated.model.pds_loader import derive_priors_from_activities
 from ananke_abm.models.traj_embed_updated.model.purpose_space import PurposeDistributionSpace
-from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid
+from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid, merge_primary_slivers
 from ananke_abm.models.traj_embed_updated.model.rasterize import rasterize_from_padded_to_grid
 from ananke_abm.models.traj_embed_updated.model.decoder_timefield import TimeFieldDecoder
 from ananke_abm.models.traj_embed_updated.model.encoder import TrajEncoderGRU, kl_gaussian_standard
@@ -137,6 +137,11 @@ def main():
         T_clock_minutes=time_cfg.T_clock_minutes,
     )
     assert len(priors) == len(purposes)
+    is_primary = torch.tensor(
+        purp["is_primary_ooh"].fillna(0).astype(int).to_numpy(),
+        dtype=torch.bool, device=device
+    )
+    tau_bins = max(1, int(round(60 / time_cfg.TRAIN_GRID_MINS)))
 
     # feature matrix phi_p = [Fourier_clock | mu_t | sigma_t | mu_d | sigma_d], standardized
     rows = []
@@ -277,6 +282,7 @@ def main():
             # labels on train grid
             fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
             y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)  # [B,L]
+            y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
 
             # losses
             nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train)   # scalar
@@ -313,7 +319,8 @@ def main():
                 theta = sanitize_theta(theta)
                 fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
                 y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)
-
+                y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
+                
                 nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train)
                 kl  = kl_gaussian_standard(mu, logvar, reduction="mean")
                 loss = nll + beta_weight * kl

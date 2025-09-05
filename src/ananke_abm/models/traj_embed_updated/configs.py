@@ -42,7 +42,7 @@ class VAEConfig:
 # ---- CRF DECODER (resource allocation on a grid) ----
 @dataclass
 class CRFConfig:
-    eta: float = 12.0                 # Potts switching penalty (off-diagonal)
+    eta: float = 8.0                 # Potts switching penalty (off-diagonal)
     learn_eta: bool = True          # make eta learnable if True
     use_transition_mask: bool = False  # enable bigram feasibility masks
 
