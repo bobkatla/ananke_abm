@@ -44,7 +44,7 @@ dev = [
 ]
 
 [project.scripts]
-ananke = "ananke_abm.cli.main:main"
+ananke = "ananke_abm.cli:main"
 
 [tool.uv.sources]
 torch = [
