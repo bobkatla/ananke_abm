@@ -172,7 +172,7 @@ def main():
     if args.out_dir:
         out_work = os.path.join(args.out_dir, "stacked_work_10to14_zoom_0_05.png")
     title_work = f"Stacked Proportions (Y-zoom 0-0.04, includes last bin) — Work @ 10:00 & 14:00 — n={n_work:,}"
-    stacked_plot(props_work, title_work, y_max=0.04, out_png=out_work, t0=args.t0, t1=args.t1, dpi=args.dpi, show=args.show, main="Work")
+    stacked_plot(props_work, title_work, y_max=0.05, out_png=out_work, t0=args.t0, t1=args.t1, dpi=args.dpi, show=args.show, main="Work")
 
     # --- Education cohort ---
     df_edu = filter_main(df, "Education", args.t0, args.t1)
@@ -182,7 +182,7 @@ def main():
     if args.out_dir:
         out_edu = os.path.join(args.out_dir, "stacked_education_10to14_zoom_0_005.png")
     title_edu = f"Stacked Proportions (Y-zoom 0-0.004, includes last bin) — Education @ 10:00 & 14:00 — n={n_edu:,}"
-    stacked_plot(props_edu, title_edu, y_max=0.004, out_png=out_edu, t0=args.t0, t1=args.t1, dpi=args.dpi, show=args.show, main="Education")
+    stacked_plot(props_edu, title_edu, y_max=0.005, out_png=out_edu, t0=args.t0, t1=args.t1, dpi=args.dpi, show=args.show, main="Education")
 
 if __name__ == "__main__":
     main()

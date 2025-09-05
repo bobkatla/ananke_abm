@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 # --- configs & model pieces ---
-from ananke_abm.models.traj_embed_updated.configs import DecoderConfig, TimeConfig
+from ananke_abm.models.traj_embed_updated.configs import DecoderConfig
 from ananke_abm.models.traj_embed_updated.model.purpose_space import PurposeDistributionSpace
 from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid
 from ananke_abm.models.traj_embed_updated.model.rasterize import rasterize_from_padded_to_grid

@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.nn.utils.rnn import pad_sequence
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # --- configs & model pieces ---
 from ananke_abm.models.traj_embed_updated.configs import (
@@ -21,7 +20,7 @@ from ananke_abm.models.traj_embed_updated.configs import (
 )
 from ananke_abm.models.traj_embed_updated.model.pds_loader import derive_priors_from_activities
 from ananke_abm.models.traj_embed_updated.model.purpose_space import PurposeDistributionSpace
-from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid, fourier_time_features
+from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid
 from ananke_abm.models.traj_embed_updated.model.rasterize import rasterize_from_padded_to_grid
 from ananke_abm.models.traj_embed_updated.model.decoder_timefield import TimeFieldDecoder
 from ananke_abm.models.traj_embed_updated.model.encoder import TrajEncoderGRU, kl_gaussian_standard

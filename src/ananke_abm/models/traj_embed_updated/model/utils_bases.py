@@ -4,7 +4,6 @@ from typing import Tuple, Optional
 import numpy as np
 import pandas as pd
 import torch
-import warnings
 
 
 # ---------------------------
@@ -26,25 +25,6 @@ def fourier_time_features(t: torch.Tensor, K: int) -> torch.Tensor:
     sin_part = torch.sin(angles)
     feat = torch.cat([base, cos_part, sin_part], dim=-1)             # (..., 1+K+K)
     return feat
-
-
-# -----------------------------------------
-# Quadrature nodes (deprecated in new CRF)
-# -----------------------------------------
-def gauss_legendre_nodes(Q: int, dtype=torch.float32, device: str | torch.device = "cpu"):
-    """
-    DEPRECATED for training. Kept for back-compat with legacy validation code.
-    Returns Gauss–Legendre nodes and weights on [0,1].
-    """
-    warnings.warn(
-        "gauss_legendre_nodes is deprecated in the CRF-VAE pipeline; "
-        "training now uses a CRF on a time grid.",
-        DeprecationWarning,
-    )
-    xs, ws = np.polynomial.legendre.leggauss(Q)  # nodes on [-1,1]
-    t = torch.as_tensor((xs + 1.0) / 2.0, dtype=dtype, device=device)  # (Q,)
-    w = torch.as_tensor(ws / 2.0, dtype=dtype, device=device)          # (Q,)
-    return t, w
 
 
 # ------------------------------------------------------
@@ -137,35 +117,6 @@ def build_clock_binned_transition_costs(
     prob = cnt / cnt.sum(axis=2, keepdims=True)   # normalize over destination b
     cost = -np.log(prob + 1e-12)                  # [nbins, P, P]
     return torch.tensor(cost, dtype=torch.float32, device=device)
-
-
-# -------------------------------------------------------
-# Back-compat wrapper (old per-day-normalized transition)
-# -------------------------------------------------------
-def build_time_binned_transition_costs(
-    activities_csv: str,
-    purposes: list[str],
-    nbins: int = 24,
-    eps: float = 1.0,
-    device: str | torch.device = "cpu",
-):
-    """
-    DEPRECATED: Use build_clock_binned_transition_costs. This version normalized
-    by a per-person 'day length'; it is not clock-aware.
-    """
-    warnings.warn(
-        "build_time_binned_transition_costs is deprecated. "
-        "Use build_clock_binned_transition_costs(..., T_clock_minutes=1440).",
-        DeprecationWarning,
-    )
-    return build_clock_binned_transition_costs(
-        activities_csv=activities_csv,
-        purposes=purposes,
-        nbins=nbins,
-        eps=eps,
-        T_clock_minutes=1440,
-        device=device,
-    )
 
 
 # -------------------------------------------------------
