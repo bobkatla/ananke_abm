@@ -6,6 +6,7 @@ This module provides the main entry point for the ananke command line tool.
 
 import click
 from ananke_abm import __version__
+from ananke_abm.cli.run_models.traj_embed import traj_embed
 
 
 @click.group()
@@ -13,7 +14,7 @@ from ananke_abm import __version__
 def main():
     """Ananke ABM - Agent-Based Model for synthetic population data and activity predictions."""
     pass
-
+main.add_command(traj_embed)
 
 @main.command()
 def info():

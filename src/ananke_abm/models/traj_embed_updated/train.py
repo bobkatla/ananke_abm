@@ -101,21 +101,21 @@ def sanitize_theta(theta: torch.Tensor) -> torch.Tensor:
     theta_stable = theta - theta_max
     return torch.clamp(theta_stable, min=-30.0)
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--activities_csv", type=str, default="/mnt/data/small_activities_homebound_wd.csv")
-    ap.add_argument("--purposes_csv", type=str, default="/mnt/data/purposes.csv")
-    ap.add_argument("--epochs", type=int, default=50)
-    ap.add_argument("--batch_size", type=int, default=32)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--val_ratio", type=float, default=0.2)
-    ap.add_argument("--outdir", type=str, default="./runs")
-    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    args = ap.parse_args()
+def train_traj_embed(
+    activities_csv: str,
+    purposes_csv: str,
+    epochs: int = 50,
+    batch_size: int = 32,
+    lr: float = 1e-3,
+    val_ratio: float = 0.2,
+    outdir: str = "./runs",
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+):
     set_seed(42)
 
-    device = torch.device(args.device)
-    outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
+    device = torch.device(device)
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
     # --- configs ---
     time_cfg  = TimeConfig()
@@ -126,8 +126,8 @@ def main():
     crf_cfg   = CRFConfig()
 
     # --- data & priors (24h clock prior; durations by allocation) ---
-    acts = pd.read_csv(args.activities_csv)
-    purp = pd.read_csv(args.purposes_csv)
+    acts = pd.read_csv(activities_csv)
+    purp = pd.read_csv(purposes_csv)
     purposes = purp["purpose"].tolist()
     priors = derive_priors_from_activities(
         acts,
@@ -206,11 +206,11 @@ def main():
     params = list(pds.parameters()) + list(enc.parameters()) + list(dec.parameters())
     if crf_cfg.learn_eta:
         params += list(crf.parameters())
-    opt = optim.Adam(params, lr=args.lr, weight_decay=1e-4)
+    opt = optim.Adam(params, lr=lr, weight_decay=1e-4)
 
     # --- dataset / loaders ---
-    ds = ScheduleDataset(args.activities_csv, T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS)
-    tr_idx, va_idx = split_indices(len(ds), val_ratio=args.val_ratio, seed=42)
+    ds = ScheduleDataset(activities_csv, T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS)
+    tr_idx, va_idx = split_indices(len(ds), val_ratio=val_ratio, seed=42)
     tr_subset = torch.utils.data.Subset(ds, tr_idx)
     va_subset = torch.utils.data.Subset(ds, va_idx)
 
@@ -219,7 +219,7 @@ def main():
     def loader(subset, shuffle):
         return torch.utils.data.DataLoader(
             subset,
-            batch_size=args.batch_size,
+            batch_size=batch_size,
             shuffle=shuffle,
             collate_fn=lambda batch: collate_fn(batch, purpose_to_idx),
             num_workers=0,   # tune on your machine
@@ -239,7 +239,7 @@ def main():
             return vae_cfg.beta * (ep / max(1, vae_cfg.kl_anneal_end))
         return vae_cfg.beta
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, epochs + 1):
         enc.train(); dec.train(); pds.train(); crf.train()
         total_tr = 0.0; nll_tr = 0.0; kl_tr = 0.0
 
@@ -320,7 +320,7 @@ def main():
                 fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
                 y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)
                 y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
-                
+
                 nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train)
                 kl  = kl_gaussian_standard(mu, logvar, reduction="mean")
                 loss = nll + beta_weight * kl
@@ -329,7 +329,7 @@ def main():
 
         avg_tr = total_tr / max(len(dl_tr), 1)
         avg_va = total_va / max(n_batches, 1)
-        if epoch % 10 == 0 or epoch == args.epochs:
+        if epoch % 10 == 0 or epoch == epochs:
             print(f"[{epoch:03d}] train={avg_tr:.4f}  val={avg_va:.4f}  (nll={nll_va/max(n_batches,1):.4f}, kl={kl_va/max(n_batches,1):.4f}, beta={beta_weight:.3f})")
 
         history["epoch"].append(epoch)
@@ -359,13 +359,9 @@ def main():
             torch.save(ckpt, outdir / "ckpt_best.pt")
             print(f"Best val so far: {best_val_total:.4f} at epoch {epoch}")
 
-        if epoch == args.epochs:
+        if epoch == epochs:
             torch.save(ckpt, outdir / "ckpt_final.pt")
             print(f"Final val: {avg_va:.4f} (best {best_val_total:.4f})")
 
     # Save history to CSV
     pd.DataFrame(history).to_csv(outdir / "history.csv", index=False)
-
-
-if __name__ == "__main__":
-    main()

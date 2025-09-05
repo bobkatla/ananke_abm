@@ -11,7 +11,6 @@ __email__ = "duc.la@monash.edu"
 
 # Import main modules for easy access
 from . import models
-from . import utils
 from . import data_generator
 
 __all__ = [
