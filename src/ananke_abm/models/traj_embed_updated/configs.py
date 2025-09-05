@@ -44,7 +44,6 @@ class VAEConfig:
 class CRFConfig:
     eta: float = 12.0                 # Potts switching penalty (off-diagonal)
     learn_eta: bool = True          # make eta learnable if True
-    force_home_ends: bool = True     # unified endpoint constraint (Home only at ends if True)
     use_transition_mask: bool = False  # enable bigram feasibility masks
 
 

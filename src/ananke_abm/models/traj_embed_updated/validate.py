@@ -290,8 +290,8 @@ def main():
 
     # --- endpoint masks ---
     purp_df = pd.read_csv(args.purposes_csv)
-    ep_masks = build_endpoint_mask(purp_df, purposes, force_home_ends=True)
-    endpoint_mask_eval = endpoint_time_mask(ep_masks.endpoint_allowed, L_eval, device=device)  # [L,P]
+    ep_masks = build_endpoint_mask(purp_df, purposes, can_open_col="can_open_day", can_close_col="can_close_day")
+    endpoint_mask_eval = endpoint_time_mask(ep_masks.open_allowed, ep_masks.close_allowed, L_eval, step_mins=args.eval_step_minutes, device=device)  # [L,P]
 
     # --- data loader ---
     ds = ScheduleDataset(args.activities_csv, T_alloc_minutes=T_alloc_minutes)
@@ -319,9 +319,9 @@ def main():
             theta = dec.utilities_on_grid(
                 z, e_p, loglam_eval,
                 grid_type="eval",
-                endpoint_mask=None
+                endpoint_mask=endpoint_mask_eval
             )
-            fallback_idx = ep_masks.home_idx if ep_masks.home_idx is not None else 0
+            fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
             y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_eval, fallback_idx=fallback_idx)
 
             # NLL on the grid
@@ -353,7 +353,7 @@ def main():
         theta_gen = dec.utilities_on_grid(
             z_samp, e_p, loglam_eval,
             grid_type="eval",
-            endpoint_mask=None
+            endpoint_mask=endpoint_mask_eval
         )
         y_hat_gen = crf.viterbi(theta_gen, endpoint_mask=endpoint_mask_eval)  # [S,L]
         decoded_gen = labels_to_segments(y_hat_gen, t_alloc01_eval)
@@ -366,7 +366,7 @@ def main():
 
     # --------- Per-trajectory validation on generated CSV ----------
     full_seqs, bigrams = build_truth_sets(args.activities_csv)
-    home_label = purposes[ep_masks.home_idx] if ep_masks.home_idx is not None else "Home"
+    home_label = "Home"
     val_df = validate_sequences(gen_df, full_seqs, bigrams, home_label=home_label)
     if args.val_csv:
         Path(args.val_csv).parent.mkdir(parents=True, exist_ok=True)

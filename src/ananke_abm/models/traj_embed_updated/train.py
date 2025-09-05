@@ -165,9 +165,9 @@ def main():
             ) # [P, L]
 
     # --- unified endpoint mask ---
-    ep_masks = build_endpoint_mask(purp, purposes, force_home_ends=crf_cfg.force_home_ends)
+    ep_masks = build_endpoint_mask(purp, purposes, can_open_col="can_open_day", can_close_col="can_close_day")
     L_train = loglam_grids["train"].shape[1]
-    endpoint_mask_train = endpoint_time_mask(ep_masks.endpoint_allowed, L_train, device=device)  # [L,P]
+    endpoint_mask_train = endpoint_time_mask(ep_masks.open_allowed, ep_masks.close_allowed, L_train, step_mins=time_cfg.TRAIN_GRID_MINS, device=device)  # [L,P]
 
     # --- models ---
     P = len(purposes)
@@ -260,7 +260,7 @@ def main():
             # unaries θ on train grid (no mask applied here; CRF will apply)
             theta = dec.utilities_on_grid(
                 z, e_p, loglam_grids["train"], grid_type="train",
-                endpoint_mask=None,  # avoid double-application; CRF handles endpoints
+                endpoint_mask=endpoint_mask_train,  # avoid double-application; CRF handles endpoints
             )  # [B,P,L]
             
             theta = sanitize_theta(theta)
@@ -275,7 +275,7 @@ def main():
 
 
             # labels on train grid
-            fallback_idx = ep_masks.home_idx if ep_masks.home_idx is not None else 0
+            fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
             y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)  # [B,L]
 
             # losses
@@ -308,10 +308,10 @@ def main():
                 )
                 theta = dec.utilities_on_grid(
                     z, e_p, loglam_grids["train"], grid_type="train",
-                    endpoint_mask=None,
+                    endpoint_mask=endpoint_mask_train,
                 )
                 theta = sanitize_theta(theta)
-                fallback_idx = ep_masks.home_idx if ep_masks.home_idx is not None else 0
+                fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
                 y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)
 
                 nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train)
