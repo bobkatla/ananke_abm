@@ -302,7 +302,8 @@ def main():
     )
 
     # --------- Validation: NLL on grid + a few μ-recon decodes ----------
-    totals = []; nlls = []; kls = []  # KL not computed here (μ decode), keep structure
+    totals = []
+    nlls = []
     decoded_preview = []
     with torch.no_grad():
         e_p = pds()
@@ -329,8 +330,14 @@ def main():
             nlls.append(float(nll.item()))
             totals.append(float(nll.item()))
 
+            assert endpoint_mask_eval.shape == (theta.shape[-1], theta.shape[1])
+
             # Viterbi for deterministic decode preview (take first few only)
             y_hat = crf.viterbi(theta, endpoint_mask=endpoint_mask_eval)  # [B,L]
+            tail_bins = int(round(60 / time_cfg["VALID_GRID_MINS"]))
+            bad = ~endpoint_mask_eval[-tail_bins:, :].gather(1, y_hat[:, -tail_bins:].T).T  # [B, tail_bins]
+            # print("Tail violations per batch:", bad.any(dim=1).float().mean().item())
+            assert bad.any(dim=1).float().mean().item() == 0, "Tail violations found"
             decoded_preview.extend(labels_to_segments(y_hat, t_alloc01_eval))
 
     print(f"Validation (grid NLL): nll={np.mean(nlls):.4f}")
