@@ -128,19 +128,21 @@ def main():
     # --- data & priors (24h clock prior; durations by allocation) ---
     acts = pd.read_csv(args.activities_csv)
     purp = pd.read_csv(args.purposes_csv)
-    priors, purposes = derive_priors_from_activities(
+    purposes = purp["purpose"].tolist()
+    priors = derive_priors_from_activities(
         acts,
         purp,
         T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS,
         K_clock_prior=basis_cfg.K_clock_prior,
         T_clock_minutes=time_cfg.T_clock_minutes,
     )
+    assert len(priors) == len(purposes)
 
     # feature matrix phi_p = [Fourier_clock | mu_t | sigma_t | mu_d | sigma_d], standardized
     rows = []
     for p in purposes:
         pr = priors[p]
-        rows.append(np.concatenate([pr.time_fourier, [pr.mu_t, pr.sigma_t, pr.mu_d, pr.sigma_d]]).astype("float32"))
+        rows.append(np.concatenate([pr.time_fourier, [pr.mu_t, pr.sigma_t, pr.mu_d, pr.sigma_d, pr.is_primary_ooh]]).astype("float32"))
     phi = np.stack(rows, axis=0)
     phi = (phi - phi.mean(0, keepdims=True)) / (phi.std(0, keepdims=True) + 1e-6)
     phi_t = torch.tensor(phi, dtype=torch.float32, device=device)

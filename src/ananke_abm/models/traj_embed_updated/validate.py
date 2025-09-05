@@ -5,7 +5,6 @@ from typing import List, Tuple
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 
 # --- configs & model pieces ---
 from ananke_abm.models.traj_embed_updated.configs import DecoderConfig
@@ -243,7 +242,7 @@ def main():
     rows = []
     for p in purposes:
         pr = priors[p]
-        rows.append(np.concatenate([pr.time_fourier, [pr.mu_t, pr.sigma_t, pr.mu_d, pr.sigma_d]]).astype("float32"))
+        rows.append(np.concatenate([pr.time_fourier, [pr.mu_t, pr.sigma_t, pr.mu_d, pr.sigma_d, pr.is_primary_ooh]]).astype("float32"))
     phi = np.stack(rows, axis=0)
     phi = (phi - phi.mean(0, keepdims=True)) / (phi.std(0, keepdims=True) + 1e-6)
     phi_t = torch.tensor(phi, dtype=torch.float32, device=device)
