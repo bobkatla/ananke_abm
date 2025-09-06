@@ -1,4 +1,3 @@
-import argparse
 from pathlib import Path
 from typing import List, Tuple
 
@@ -190,25 +189,29 @@ def validate_sequences(gen_df: pd.DataFrame,
 # -------------------
 # Validation script
 # -------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", type=str, required=True)
-    ap.add_argument("--activities_csv", type=str, default="/mnt/data/small_activities_homebound_wd.csv")
-    ap.add_argument("--purposes_csv", type=str, default="/mnt/data/purposes.csv")
-    ap.add_argument("--batch_size", type=int, default=16)
-    ap.add_argument("--num_gen", type=int, default=20, help="number of samples to generate from prior")
-    ap.add_argument("--gen_prefix", type=str, default="gen", help="prefix for generated persid")
-    ap.add_argument("--gen_csv", type=str, default=None, help="optional path to save generated activities CSV")
-    ap.add_argument("--val_csv", type=str, default=None, help="optional path to save per-trajectory validation CSV")
-    ap.add_argument("--eval_step_minutes", type=int, default=5, help="grid step for eval (minutes); 1=1min over allocation window")
-    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    args = ap.parse_args()
+def gen_n_val_traj(
+    ckpt: str,
+    activities_csv: str,
+    purposes_csv: str,
+    batch_size: int,
+    num_gen: int,
+    gen_prefix: str,
+    gen_csv: str,
+    val_csv: str,
+    eval_step_minutes: int,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"):
+    print(f"Validating {num_gen} trajectories...")
+    print(f"Using device: {device}")
+    print(f"Using eval step minutes: {eval_step_minutes}")
+    print(f"Using batch size: {batch_size}")
+    print(f"Output gen csv: {gen_csv}")
+    print(f"Output val csv: {val_csv}")
     set_seed(42)
 
-    device = torch.device(args.device)
+    device = torch.device(device)
 
     # --- load checkpoint & configs (with robust fallbacks) ---
-    ck = torch.load(args.ckpt, map_location=device, weights_only=False)
+    ck = torch.load(ckpt, map_location=device, weights_only=False)
     priors = ck["priors"]
     purposes = ck["purposes"]
     purpose_to_idx = ck["purpose_to_idx"]
@@ -225,7 +228,7 @@ def main():
     time_cfg = {
         "ALLOCATION_HORIZON_MINS": int(time_cfg_from_ckpt.get("ALLOCATION_HORIZON_MINS", 1800)),
         "TRAIN_GRID_MINS": int(time_cfg_from_ckpt.get("TRAIN_GRID_MINS", 10)),
-        "VALID_GRID_MINS": args.eval_step_minutes,
+        "VALID_GRID_MINS": eval_step_minutes,
     }
 
     T_alloc_minutes = time_cfg["ALLOCATION_HORIZON_MINS"]
@@ -280,7 +283,7 @@ def main():
     # --- grids & priors on grid ---
     t_alloc_minutes_eval, t_alloc01_eval = make_alloc_grid(
         T_alloc_minutes=T_alloc_minutes,
-        step_minutes=int(args.eval_step_minutes),
+        step_minutes=int(eval_step_minutes),
         device=device,
         dtype=torch.float32,
     )
@@ -289,14 +292,14 @@ def main():
         loglam_eval = pds.lambda_log_on_alloc_grid(t_alloc_minutes_eval, T_clock_minutes=T_clock_minutes)  # [P,L]
 
     # --- endpoint masks ---
-    purp_df = pd.read_csv(args.purposes_csv)
+    purp_df = pd.read_csv(purposes_csv)
     ep_masks = build_endpoint_mask(purp_df, purposes, can_open_col="can_open_day", can_close_col="can_close_day")
-    endpoint_mask_eval = endpoint_time_mask(ep_masks.open_allowed, ep_masks.close_allowed, L_eval, step_mins=args.eval_step_minutes, device=device)  # [L,P]
+    endpoint_mask_eval = endpoint_time_mask(ep_masks.open_allowed, ep_masks.close_allowed, L_eval, step_mins=eval_step_minutes, device=device)  # [L,P]
 
     # --- data loader ---
-    ds = ScheduleDataset(args.activities_csv, T_alloc_minutes=T_alloc_minutes)
+    ds = ScheduleDataset(activities_csv, T_alloc_minutes=T_alloc_minutes)
     dl = torch.utils.data.DataLoader(
-        ds, batch_size=args.batch_size, shuffle=False,
+        ds, batch_size=batch_size, shuffle=False,
         collate_fn=lambda batch: collate_fn(batch, purpose_to_idx),
         num_workers=0, pin_memory=False
     )
@@ -344,15 +347,15 @@ def main():
 
     # Show a few reconstructed samples (first 3)
     Tm = T_alloc_minutes
-    print("=== Reconstructions (μ → Viterbi) ===")
-    for b, segs in enumerate(decoded_preview[:3]):
-        pretty = " | ".join(f"{purposes[p]} @ {int(t0*Tm)}m for {int(d*Tm)}m" for (p,t0,d) in segs)
-        print(f"Rec {b}: {pretty}")
+    # print("=== Reconstructions (μ → Viterbi) ===")
+    # for b, segs in enumerate(decoded_preview[:3]):
+    #     pretty = " | ".join(f"{purposes[p]} @ {int(t0*Tm)}m for {int(d*Tm)}m" for (p,t0,d) in segs)
+    #     print(f"Rec {b}: {pretty}")
 
     # --------- Generation from prior ----------
     # Sample s ~ N(0, I), then z = normalize(s), decode with Viterbi.
     with torch.no_grad():
-        S = int(args.num_gen)
+        S = int(num_gen)
         s = torch.randn(S, latent_dim, device=device)
         z_samp = s / (s.norm(dim=-1, keepdim=True) + 1e-8)
 
@@ -365,25 +368,22 @@ def main():
         y_hat_gen = crf.viterbi(theta_gen, endpoint_mask=endpoint_mask_eval)  # [S,L]
         decoded_gen = labels_to_segments(y_hat_gen, t_alloc01_eval)
 
-    gen_df = decoded_to_activities_df(decoded_gen, purposes, Tm, start_persid=0, prefix=args.gen_prefix)
-    if args.gen_csv:
-        Path(args.gen_csv).parent.mkdir(parents=True, exist_ok=True)
-        gen_df.to_csv(args.gen_csv, index=False)
-        print(f"Wrote generated activities to: {args.gen_csv}")
+    gen_df = decoded_to_activities_df(decoded_gen, purposes, Tm, start_persid=0, prefix=gen_prefix)
+    if gen_csv:
+        Path(gen_csv).parent.mkdir(parents=True, exist_ok=True)
+        gen_df.to_csv(gen_csv, index=False)
+        print(f"Wrote generated activities to: {gen_csv}")
 
     # --------- Per-trajectory validation on generated CSV ----------
-    full_seqs, bigrams = build_truth_sets(args.activities_csv)
+    full_seqs, bigrams = build_truth_sets(activities_csv)
     home_label = "Home"
     val_df = validate_sequences(gen_df, full_seqs, bigrams, home_label=home_label)
-    if args.val_csv:
-        Path(args.val_csv).parent.mkdir(parents=True, exist_ok=True)
-        val_df.to_csv(args.val_csv, index=False)
-        print(f"Wrote per-trajectory validation to: {args.val_csv}")
+    if val_csv:
+        Path(val_csv).parent.mkdir(parents=True, exist_ok=True)
+        val_df.to_csv(val_csv, index=False)
+        print(f"Wrote per-trajectory validation to: {val_csv}")
 
-    print("=== Generated sample sequences (first 5) ===")
-    print(val_df.head(5).to_string(index=False))
+    print("=== Generated sample sequences (first 10 check) ===")
+    print(val_df.head(10).to_string(index=False))
 
-
-if __name__ == "__main__":
-    main()
     
