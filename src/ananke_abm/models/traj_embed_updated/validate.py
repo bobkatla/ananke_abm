@@ -200,6 +200,12 @@ def gen_n_val_traj(
     val_csv: str,
     eval_step_minutes: int,
     device: str = "cuda" if torch.cuda.is_available() else "cpu"):
+    print(f"Validating {num_gen} trajectories...")
+    print(f"Using device: {device}")
+    print(f"Using eval step minutes: {eval_step_minutes}")
+    print(f"Using batch size: {batch_size}")
+    print(f"Output gen csv: {gen_csv}")
+    print(f"Output val csv: {val_csv}")
     set_seed(42)
 
     device = torch.device(device)
