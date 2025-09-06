@@ -19,8 +19,7 @@ Usage:
 
 """
 
-import argparse
-import sys
+from pathlib import Path
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -117,27 +116,23 @@ def plot_flipped(prop_wide: pd.DataFrame, out_png: str | None):
     plt.tight_layout()
 
     if out_png:
-        plt.savefig(out_png, bbox_inches="tight", dpi=300)
-        print(f"Saved plot to: {out_png}")
+        out_path = Path(out_png)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_path, bbox_inches="tight", dpi=300)
+        print(f"Saved plot to: {out_path}")
         plt.close()
     else:
         plt.show()
 
-def main():
-    ap = argparse.ArgumentParser(description="Generate flipped stacked proportional plot from buffer CSV.")
-    ap.add_argument("buffer_csv", type=str, help="Path to buffer CSV (rows=persid, cols=0..maxtime).")
-    ap.add_argument("--out-png", type=str, default=None, help="Optional path to save PNG. If omitted, just shows the plot.")
-    ap.add_argument("--out-csv", type=str, default=None, help="Optional path to save the computed proportion table CSV.")
-    args = ap.parse_args()
-
-    df, time_cols_sorted = load_buffer(args.buffer_csv)
+def fig_stacked_traj(buffer_csv: str, out_png: str | None, out_csv: str | None = None):
+    print(f"Generating flipped stacked proportional plot from {buffer_csv}...")
+    df, time_cols_sorted = load_buffer(buffer_csv)
     prop_wide = compute_proportions(df, time_cols_sorted)
 
-    if args.out_csv:
-        prop_wide.to_csv(args.out_csv)
-        print(f"Saved proportions to: {args.out_csv}")
+    if out_csv:
+        out_path = Path(out_csv)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        prop_wide.to_csv(out_path)
+        print(f"Saved stacked proportions to: {out_csv}")
 
-    plot_flipped(prop_wide, args.out_png)
-
-if __name__ == "__main__":
-    main()
+    plot_flipped(prop_wide, out_png)

@@ -16,7 +16,7 @@ Args:
   --step: bin size in minutes (default 5)
 """
 
-import argparse
+from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
 
@@ -60,20 +60,14 @@ def build_buffer_grid(df: pd.DataFrame, maxtime: int, step: int) -> pd.DataFrame
     out_df.index.name = "persid"
     return out_df.reset_index()
 
-def main():
-    parser = argparse.ArgumentParser(description="Create buffer-analysis CSV from trajectories.")
-    parser.add_argument("input_file", type=str, help="Path to input trajectory CSV")
-    parser.add_argument("output_file", type=str, help="Path to output buffer CSV")
-    parser.add_argument("--maxtime", type=int, default=1800, help="Total horizon in minutes (default 1800)")
-    parser.add_argument("--step", type=int, default=5, help="Bin size in minutes (default 5)")
-    args = parser.parse_args()
+def make_buffer_grid(traj_csv: str, output_csv: str, maxtime: int = 1800, step: int = 5):
+    print(f"Creating buffer grid from {traj_csv}...")
+    df = pd.read_csv(traj_csv)
+    grid = build_buffer_grid(df, maxtime=maxtime, step=step)
 
-    df = pd.read_csv(args.input_file)
-    grid = build_buffer_grid(df, maxtime=args.maxtime, step=args.step)
-    grid.to_csv(args.output_file, index=False)
+    out_path = Path(output_csv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    grid.to_csv(out_path, index=False)
 
-    print(f"Done. Wrote: {args.output_file}")
+    print(f"Wrote buffer grid to: {output_csv}")
     print(f"Shape: {grid.shape[0]} rows x {grid.shape[1]} columns (including 'persid')")
-
-if __name__ == "__main__":
-    main()

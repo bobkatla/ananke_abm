@@ -8,6 +8,7 @@ import click
 from ananke_abm import __version__
 from ananke_abm.cli.run_models.traj_embed import traj_embed
 from ananke_abm.cli.run_models.gen_n_val_traj import gval_traj
+from ananke_abm.cli.run_models.visualize_combined_traj import visualize_combined_traj
 
 @click.group()
 @click.version_option(version=__version__, prog_name="ananke")
@@ -16,6 +17,7 @@ def main():
     pass
 main.add_command(traj_embed)
 main.add_command(gval_traj)
+main.add_command(visualize_combined_traj)
 
 @main.command()
 def info():
