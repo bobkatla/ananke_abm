@@ -5,12 +5,11 @@ from typing import List, Tuple
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 
 # --- configs & model pieces ---
 from ananke_abm.models.traj_embed_updated.configs import DecoderConfig
 from ananke_abm.models.traj_embed_updated.model.purpose_space import PurposeDistributionSpace
-from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid, fourier_time_features
+from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid
 from ananke_abm.models.traj_embed_updated.model.rasterize import rasterize_from_padded_to_grid
 from ananke_abm.models.traj_embed_updated.model.decoder_timefield import TimeFieldDecoder
 from ananke_abm.models.traj_embed_updated.model.encoder import TrajEncoderGRU
@@ -215,16 +214,23 @@ def main():
     purpose_to_idx = ck["purpose_to_idx"]
 
     # Fallbacks in case older ckpts don't have new sections
-    cfg_time = ck.get("configs", {}).get("time", {})
     cfg_basis = ck.get("configs", {}).get("basis", {})
     cfg_pep = ck.get("configs", {}).get("pep", {})
     cfg_dec = ck.get("configs", {}).get("dec", {})
     cfg_vae = ck.get("configs", {}).get("vae", {"latent_dim": DecoderConfig.m_latent})
     cfg_crf = ck.get("configs", {}).get("crf", {"eta": 4.0, "learn_eta": False})
 
-    T_alloc_minutes = int(cfg_time.get("T_alloc_minutes", cfg_time.get("T_minutes", 1800)))
-    T_clock_minutes = int(cfg_time.get("T_clock_minutes", 1440))
-    K_clock_prior   = int(cfg_basis.get("K_clock_prior", cfg_basis.get("K_time_prior", 6)))
+    # Create a time_cfg dict for decoder init, respecting CLI override for eval grid
+    time_cfg_from_ckpt = ck.get("configs", {}).get("time", {})
+    time_cfg = {
+        "ALLOCATION_HORIZON_MINS": int(time_cfg_from_ckpt.get("ALLOCATION_HORIZON_MINS", 1800)),
+        "TRAIN_GRID_MINS": int(time_cfg_from_ckpt.get("TRAIN_GRID_MINS", 10)),
+        "VALID_GRID_MINS": args.eval_step_minutes,
+    }
+
+    T_alloc_minutes = time_cfg["ALLOCATION_HORIZON_MINS"]
+    T_clock_minutes = int(time_cfg_from_ckpt.get("T_clock_minutes", 1440))
+    K_clock_prior   = int(cfg_basis.get("K_clock_prior", 6))
     K_decoder_time  = int(cfg_basis.get("K_decoder_time", 8))
     d_p             = int(cfg_pep.get("d_p", 16))
     dec_alpha_prior = float(cfg_dec.get("alpha_prior", 1.0))
@@ -236,7 +242,7 @@ def main():
     rows = []
     for p in purposes:
         pr = priors[p]
-        rows.append(np.concatenate([pr.time_fourier, [pr.mu_t, pr.sigma_t, pr.mu_d, pr.sigma_d]]).astype("float32"))
+        rows.append(np.concatenate([pr.time_fourier, [pr.mu_t, pr.sigma_t, pr.mu_d, pr.sigma_d, pr.is_primary_ooh]]).astype("float32"))
     phi = np.stack(rows, axis=0)
     phi = (phi - phi.mean(0, keepdims=True)) / (phi.std(0, keepdims=True) + 1e-6)
     phi_t = torch.tensor(phi, dtype=torch.float32, device=device)
@@ -246,8 +252,11 @@ def main():
 
     # --- models ---
     P = len(purposes)
-    dec = TimeFieldDecoder(P=P, m_latent=latent_dim, d_p=d_p,
-                           K_decoder_time=K_decoder_time, alpha_prior=dec_alpha_prior).to(device)
+    dec = TimeFieldDecoder(
+        P=P, m_latent=latent_dim, d_p=d_p,
+        K_decoder_time=K_decoder_time, alpha_prior=dec_alpha_prior,
+        time_cfg=time_cfg
+    ).to(device)
     enc = TrajEncoderGRU(d_p=d_p, K_time_token_clock=4, K_time_token_alloc=0, K_dur_token=4,
                          m_latent=latent_dim, gru_hidden=64, num_layers=1).to(device)
     crf = LinearChainCRF(P=P, eta=crf_eta, learn_eta=crf_learn_eta).to(device)
@@ -255,7 +264,14 @@ def main():
     # Load states (be lenient with older ckpts)
     pds.load_state_dict(ck["model_state"]["pds"], strict=True)
     enc.load_state_dict(ck["model_state"]["enc"], strict=False)
-    dec.load_state_dict(ck["model_state"]["dec"], strict=False)
+    
+    # Remove cached Phi buffers from the state dict to allow for different validation grid sizes
+    decoder_state_dict = ck["model_state"]["dec"]
+    for key in list(decoder_state_dict.keys()):
+        if key.startswith("Phi_"):
+            del decoder_state_dict[key]
+    dec.load_state_dict(decoder_state_dict, strict=False)
+
     if "crf" in ck["model_state"]:
         crf.load_state_dict(ck["model_state"]["crf"], strict=False)
 
@@ -269,14 +285,13 @@ def main():
         dtype=torch.float32,
     )
     L_eval = t_alloc01_eval.numel()
-    Phi_eval = fourier_time_features(t_alloc01_eval, K_decoder_time)           # [L, 2K+1]
     with torch.no_grad():
         loglam_eval = pds.lambda_log_on_alloc_grid(t_alloc_minutes_eval, T_clock_minutes=T_clock_minutes)  # [P,L]
 
     # --- endpoint masks ---
     purp_df = pd.read_csv(args.purposes_csv)
-    ep_masks = build_endpoint_mask(purp_df, purposes, force_home_ends=True)
-    endpoint_mask_eval = endpoint_time_mask(ep_masks.endpoint_allowed, L_eval, device=device)  # [L,P]
+    ep_masks = build_endpoint_mask(purp_df, purposes, can_open_col="can_open_day", can_close_col="can_close_day")
+    endpoint_mask_eval = endpoint_time_mask(ep_masks.open_allowed, ep_masks.close_allowed, L_eval, step_mins=args.eval_step_minutes, device=device)  # [L,P]
 
     # --- data loader ---
     ds = ScheduleDataset(args.activities_csv, T_alloc_minutes=T_alloc_minutes)
@@ -287,7 +302,8 @@ def main():
     )
 
     # --------- Validation: NLL on grid + a few μ-recon decodes ----------
-    totals = []; nlls = []; kls = []  # KL not computed here (μ decode), keep structure
+    totals = []
+    nlls = []
     decoded_preview = []
     with torch.no_grad():
         e_p = pds()
@@ -301,9 +317,12 @@ def main():
                 sample=False
             )
 
-            theta = dec.utilities_on_grid(z, e_p, t_alloc01_eval, loglam_eval,
-                                          endpoint_mask=None, Phi=Phi_eval)  # [B,P,L]
-            fallback_idx = ep_masks.home_idx if ep_masks.home_idx is not None else 0
+            theta = dec.utilities_on_grid(
+                z, e_p, loglam_eval,
+                grid_type="eval",
+                endpoint_mask=endpoint_mask_eval
+            )
+            fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
             y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_eval, fallback_idx=fallback_idx)
 
             # NLL on the grid
@@ -311,8 +330,14 @@ def main():
             nlls.append(float(nll.item()))
             totals.append(float(nll.item()))
 
+            assert endpoint_mask_eval.shape == (theta.shape[-1], theta.shape[1])
+
             # Viterbi for deterministic decode preview (take first few only)
             y_hat = crf.viterbi(theta, endpoint_mask=endpoint_mask_eval)  # [B,L]
+            tail_bins = int(round(60 / time_cfg["VALID_GRID_MINS"]))
+            bad = ~endpoint_mask_eval[-tail_bins:, :].gather(1, y_hat[:, -tail_bins:].T).T  # [B, tail_bins]
+            # print("Tail violations per batch:", bad.any(dim=1).float().mean().item())
+            assert bad.any(dim=1).float().mean().item() == 0, "Tail violations found"
             decoded_preview.extend(labels_to_segments(y_hat, t_alloc01_eval))
 
     print(f"Validation (grid NLL): nll={np.mean(nlls):.4f}")
@@ -332,8 +357,11 @@ def main():
         z_samp = s / (s.norm(dim=-1, keepdim=True) + 1e-8)
 
         e_p = pds()
-        theta_gen = dec.utilities_on_grid(z_samp, e_p, t_alloc01_eval, loglam_eval,
-                                          endpoint_mask=None, Phi=Phi_eval)  # [S,P,L]
+        theta_gen = dec.utilities_on_grid(
+            z_samp, e_p, loglam_eval,
+            grid_type="eval",
+            endpoint_mask=endpoint_mask_eval
+        )
         y_hat_gen = crf.viterbi(theta_gen, endpoint_mask=endpoint_mask_eval)  # [S,L]
         decoded_gen = labels_to_segments(y_hat_gen, t_alloc01_eval)
 
@@ -345,7 +373,7 @@ def main():
 
     # --------- Per-trajectory validation on generated CSV ----------
     full_seqs, bigrams = build_truth_sets(args.activities_csv)
-    home_label = purposes[ep_masks.home_idx] if ep_masks.home_idx is not None else "Home"
+    home_label = "Home"
     val_df = validate_sequences(gen_df, full_seqs, bigrams, home_label=home_label)
     if args.val_csv:
         Path(args.val_csv).parent.mkdir(parents=True, exist_ok=True)
@@ -358,3 +386,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

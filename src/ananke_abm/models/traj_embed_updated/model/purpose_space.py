@@ -1,4 +1,3 @@
-import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -81,16 +80,3 @@ class PurposeDistributionSpace(nn.Module):
         t_clock01 = (t_alloc_minutes.to(dtype=self.phi_p.dtype) % float(T_clock_minutes)) / float(T_clock_minutes)
         return self.lambda_log_clock(t_clock01)
 
-    # ---- Back-compat shim (deprecated) ----
-    @torch.no_grad()
-    def lambda_log(self, t01: torch.Tensor) -> torch.Tensor:
-        """
-        DEPRECATED: Interpret t01 as CLOCK-normalized inputs. Prefer lambda_log_clock(...)
-        or lambda_log_on_alloc_grid(...).
-        """
-        warnings.warn(
-            "PurposeDistributionSpace.lambda_log(t) is deprecated. "
-            "Use lambda_log_clock(t_clock01) or lambda_log_on_alloc_grid(t_alloc_minutes, T_clock).",
-            DeprecationWarning,
-        )
-        return self.lambda_log_clock(t01)

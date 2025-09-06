@@ -20,7 +20,7 @@ from ananke_abm.models.traj_embed_updated.configs import (
 )
 from ananke_abm.models.traj_embed_updated.model.pds_loader import derive_priors_from_activities
 from ananke_abm.models.traj_embed_updated.model.purpose_space import PurposeDistributionSpace
-from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid, fourier_time_features
+from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid, merge_primary_slivers
 from ananke_abm.models.traj_embed_updated.model.rasterize import rasterize_from_padded_to_grid
 from ananke_abm.models.traj_embed_updated.model.decoder_timefield import TimeFieldDecoder
 from ananke_abm.models.traj_embed_updated.model.encoder import TrajEncoderGRU, kl_gaussian_standard
@@ -95,21 +95,27 @@ def collate_fn(batch, purpose_to_idx):
 # -------------------
 # training script
 # -------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--activities_csv", type=str, default="/mnt/data/small_activities_homebound_wd.csv")
-    ap.add_argument("--purposes_csv", type=str, default="/mnt/data/purposes.csv")
-    ap.add_argument("--epochs", type=int, default=50)
-    ap.add_argument("--batch_size", type=int, default=32)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--val_ratio", type=float, default=0.2)
-    ap.add_argument("--outdir", type=str, default="./runs")
-    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    args = ap.parse_args()
+def sanitize_theta(theta: torch.Tensor) -> torch.Tensor:
+    """Numerically stabilizes CRF emissions."""
+    theta_max = torch.max(theta, dim=1, keepdim=True).values
+    theta_stable = theta - theta_max
+    return torch.clamp(theta_stable, min=-30.0)
+
+def train_traj_embed(
+    activities_csv: str,
+    purposes_csv: str,
+    epochs: int = 50,
+    batch_size: int = 32,
+    lr: float = 1e-3,
+    val_ratio: float = 0.2,
+    outdir: str = "./runs",
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+):
     set_seed(42)
 
-    device = torch.device(args.device)
-    outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
+    device = torch.device(device)
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
     # --- configs ---
     time_cfg  = TimeConfig()
@@ -120,21 +126,28 @@ def main():
     crf_cfg   = CRFConfig()
 
     # --- data & priors (24h clock prior; durations by allocation) ---
-    acts = pd.read_csv(args.activities_csv)
-    purp = pd.read_csv(args.purposes_csv)
-    priors, purposes = derive_priors_from_activities(
+    acts = pd.read_csv(activities_csv)
+    purp = pd.read_csv(purposes_csv)
+    purposes = purp["purpose"].tolist()
+    priors = derive_priors_from_activities(
         acts,
         purp,
-        T_alloc_minutes=time_cfg.T_alloc_minutes,
+        T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS,
         K_clock_prior=basis_cfg.K_clock_prior,
         T_clock_minutes=time_cfg.T_clock_minutes,
     )
+    assert len(priors) == len(purposes)
+    is_primary = torch.tensor(
+        purp["is_primary_ooh"].fillna(0).astype(int).to_numpy(),
+        dtype=torch.bool, device=device
+    )
+    tau_bins = max(1, int(round(60 / time_cfg.TRAIN_GRID_MINS)))
 
     # feature matrix phi_p = [Fourier_clock | mu_t | sigma_t | mu_d | sigma_d], standardized
     rows = []
     for p in purposes:
         pr = priors[p]
-        rows.append(np.concatenate([pr.time_fourier, [pr.mu_t, pr.sigma_t, pr.mu_d, pr.sigma_d]]).astype("float32"))
+        rows.append(np.concatenate([pr.time_fourier, [pr.mu_t, pr.sigma_t, pr.mu_d, pr.sigma_d, pr.is_primary_ooh]]).astype("float32"))
     phi = np.stack(rows, axis=0)
     phi = (phi - phi.mean(0, keepdims=True)) / (phi.std(0, keepdims=True) + 1e-6)
     phi_t = torch.tensor(phi, dtype=torch.float32, device=device)
@@ -143,23 +156,23 @@ def main():
     pds = PurposeDistributionSpace(phi_t, d_p=pep_cfg.d_p, hidden=pep_cfg.hidden).to(device)
     pds.set_clock_prior_K(basis_cfg.K_clock_prior)
 
-    # --- allocation grids (train/eval) ---
-    t_alloc_minutes_train, t_alloc01_train = make_alloc_grid(
-        T_alloc_minutes=time_cfg.T_alloc_minutes,
-        step_minutes=time_cfg.train_step_minutes,
-        device=device,
-        dtype=torch.float32,
-    )
-    L_train = t_alloc01_train.numel()
-    Phi_train = fourier_time_features(t_alloc01_train, basis_cfg.K_decoder_time)  # [L, 2K+1]
-
-    # 24h periodic clock prior evaluated on the allocation grid
-    with torch.no_grad():
-        loglam_train = pds.lambda_log_on_alloc_grid(t_alloc_minutes_train, T_clock_minutes=time_cfg.T_clock_minutes)  # [P,L]
+    # --- allocation grids & priors (train/eval) ---
+    loglam_grids = {}
+    for grid_type, step_mins in [("train", time_cfg.TRAIN_GRID_MINS), ("eval", time_cfg.VALID_GRID_MINS)]:
+        t_alloc_minutes, _ = make_alloc_grid(
+            T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS,
+            step_minutes=step_mins,
+            device=device,
+        )
+        with torch.no_grad():
+            loglam_grids[grid_type] = pds.lambda_log_on_alloc_grid(
+                t_alloc_minutes, T_clock_minutes=time_cfg.T_clock_minutes
+            ) # [P, L]
 
     # --- unified endpoint mask ---
-    ep_masks = build_endpoint_mask(purp, purposes, force_home_ends=crf_cfg.force_home_ends)
-    endpoint_mask_train = endpoint_time_mask(ep_masks.endpoint_allowed, L_train, device=device)  # [L,P]
+    ep_masks = build_endpoint_mask(purp, purposes, can_open_col="can_open_day", can_close_col="can_close_day")
+    L_train = loglam_grids["train"].shape[1]
+    endpoint_mask_train = endpoint_time_mask(ep_masks.open_allowed, ep_masks.close_allowed, L_train, step_mins=time_cfg.TRAIN_GRID_MINS, device=device)  # [L,P]
 
     # --- models ---
     P = len(purposes)
@@ -169,6 +182,7 @@ def main():
         d_p=pep_cfg.d_p,
         K_decoder_time=basis_cfg.K_decoder_time,
         alpha_prior=dec_cfg.alpha_prior,
+        time_cfg=vars(time_cfg),
     ).to(device)
 
     enc = TrajEncoderGRU(
@@ -179,6 +193,7 @@ def main():
         m_latent=vae_cfg.latent_dim,
         gru_hidden=64,
         num_layers=1,
+        dropout=0.2
     ).to(device)
 
     crf = LinearChainCRF(
@@ -191,11 +206,11 @@ def main():
     params = list(pds.parameters()) + list(enc.parameters()) + list(dec.parameters())
     if crf_cfg.learn_eta:
         params += list(crf.parameters())
-    opt = optim.Adam(params, lr=args.lr)
+    opt = optim.Adam(params, lr=lr, weight_decay=1e-4)
 
     # --- dataset / loaders ---
-    ds = ScheduleDataset(args.activities_csv, T_alloc_minutes=time_cfg.T_alloc_minutes)
-    tr_idx, va_idx = split_indices(len(ds), val_ratio=args.val_ratio, seed=42)
+    ds = ScheduleDataset(activities_csv, T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS)
+    tr_idx, va_idx = split_indices(len(ds), val_ratio=val_ratio, seed=42)
     tr_subset = torch.utils.data.Subset(ds, tr_idx)
     va_subset = torch.utils.data.Subset(ds, va_idx)
 
@@ -204,7 +219,7 @@ def main():
     def loader(subset, shuffle):
         return torch.utils.data.DataLoader(
             subset,
-            batch_size=args.batch_size,
+            batch_size=batch_size,
             shuffle=shuffle,
             collate_fn=lambda batch: collate_fn(batch, purpose_to_idx),
             num_workers=0,   # tune on your machine
@@ -224,34 +239,50 @@ def main():
             return vae_cfg.beta * (ep / max(1, vae_cfg.kl_anneal_end))
         return vae_cfg.beta
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, epochs + 1):
         enc.train(); dec.train(); pds.train(); crf.train()
         total_tr = 0.0; nll_tr = 0.0; kl_tr = 0.0
 
         beta_weight = beta_at_epoch(epoch)
 
-        for p_pad, t_pad, d_pad, lengths in dl_tr:
+        for i, (p_pad, t_pad, d_pad, lengths) in enumerate(dl_tr):
             p_pad = p_pad.to(device); t_pad = t_pad.to(device); d_pad = d_pad.to(device)
             e_p = pds()  # [P, d_p]
 
             # encode (β-VAE)
             z, s, mu, logvar = enc(
                 p_pad, t_pad, d_pad, lengths, e_p,
-                T_alloc_minutes=time_cfg.T_alloc_minutes,
+                T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS,
                 T_clock_minutes=time_cfg.T_clock_minutes,
                 sample=True,
             )
 
+            if torch.isnan(z).any():
+                print(f"NaN detected in z at batch {i}. Norms: {torch.linalg.norm(s, dim=-1)}")
+                # Consider stopping or saving state here
+                break
+
             # unaries θ on train grid (no mask applied here; CRF will apply)
             theta = dec.utilities_on_grid(
-                z, e_p, t_alloc01_train, loglam_train,
-                endpoint_mask=None,  # avoid double-application; CRF handles endpoints
-                Phi=Phi_train,
+                z, e_p, loglam_grids["train"], grid_type="train",
+                endpoint_mask=endpoint_mask_train,  # avoid double-application; CRF handles endpoints
             )  # [B,P,L]
+            
+            theta = sanitize_theta(theta)
+
+            if torch.isnan(theta).any():
+                print(f"NaN detected in theta at batch {i}.")
+                break
+
+            # Log stats periodically
+            # if i % 50 == 0:
+            #     print(f"Theta stats: min={theta.min():.2f}, max={theta.max():.2f}")
+
 
             # labels on train grid
-            fallback_idx = ep_masks.home_idx if ep_masks.home_idx is not None else 0
+            fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
             y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)  # [B,L]
+            y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
 
             # losses
             nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train)   # scalar
@@ -277,17 +308,18 @@ def main():
 
                 z, s, mu, logvar = enc(
                     p_pad, t_pad, d_pad, lengths, e_p,
-                    T_alloc_minutes=time_cfg.T_alloc_minutes,
+                    T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS,
                     T_clock_minutes=time_cfg.T_clock_minutes,
                     sample=False,  # deterministic μ at val
                 )
                 theta = dec.utilities_on_grid(
-                    z, e_p, t_alloc01_train, loglam_train,
-                    endpoint_mask=None,
-                    Phi=Phi_train,
+                    z, e_p, loglam_grids["train"], grid_type="train",
+                    endpoint_mask=endpoint_mask_train,
                 )
-                fallback_idx = ep_masks.home_idx if ep_masks.home_idx is not None else 0
+                theta = sanitize_theta(theta)
+                fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
                 y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)
+                y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
 
                 nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train)
                 kl  = kl_gaussian_standard(mu, logvar, reduction="mean")
@@ -297,7 +329,7 @@ def main():
 
         avg_tr = total_tr / max(len(dl_tr), 1)
         avg_va = total_va / max(n_batches, 1)
-        if epoch % 10 == 0 or epoch == args.epochs:
+        if epoch % 10 == 0 or epoch == epochs:
             print(f"[{epoch:03d}] train={avg_tr:.4f}  val={avg_va:.4f}  (nll={nll_va/max(n_batches,1):.4f}, kl={kl_va/max(n_batches,1):.4f}, beta={beta_weight:.3f})")
 
         history["epoch"].append(epoch)
@@ -327,13 +359,9 @@ def main():
             torch.save(ckpt, outdir / "ckpt_best.pt")
             print(f"Best val so far: {best_val_total:.4f} at epoch {epoch}")
 
-        if epoch == args.epochs:
+        if epoch == epochs:
             torch.save(ckpt, outdir / "ckpt_final.pt")
             print(f"Final val: {avg_va:.4f} (best {best_val_total:.4f})")
 
     # Save history to CSV
     pd.DataFrame(history).to_csv(outdir / "history.csv", index=False)
-
-
-if __name__ == "__main__":
-    main()

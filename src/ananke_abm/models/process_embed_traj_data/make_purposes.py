@@ -152,7 +152,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--activities_csv", required=True, type=str)
     ap.add_argument("--out_csv", required=True, type=str)
-    ap.add_argument("--persons_csv", type=str, default=None)
+    # ap.add_argument("--persons_csv", type=str, default=None)
 
     ap.add_argument("--purpose_col", type=str, default="purpose")
     ap.add_argument("--start_col", type=str, default="startime")  # VISTA name

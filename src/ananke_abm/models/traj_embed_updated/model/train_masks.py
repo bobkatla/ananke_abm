@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
-import warnings
+from typing import Optional
 
 import pandas as pd
 import torch
@@ -23,97 +22,108 @@ def _parse_bool(x) -> bool:
 @dataclass
 class EndpointMasks:
     """Container for endpoint constraints."""
-    endpoint_allowed: torch.Tensor  # [P] bool; True if purpose can appear at the very first/last step
-    home_idx: Optional[int]         # index of 'Home' purpose if present
-    force_home_ends: bool           # if True, only Home is allowed at ends
+    open_allowed: torch.Tensor  # [P] bool; True if purpose can appear at the very first/last step
+    close_allowed: torch.Tensor  # [P] bool; True if purpose can appear at the very first/last step
 
     def to(self, device: torch.device) -> "EndpointMasks":
         return EndpointMasks(
-            endpoint_allowed=self.endpoint_allowed.to(device),
-            home_idx=self.home_idx,
-            force_home_ends=self.force_home_ends,
+            open_allowed=self.open_allowed.to(device),
+            close_allowed=self.close_allowed.to(device),
         )
 
 
 def build_endpoint_mask(
     purposes_df: pd.DataFrame,
     purposes_order: list[str],
-    force_home_ends: bool = True,
-    can_open_close_col: str = "can_open_close_day",
+    can_open_col: str = "can_open_day",
+    can_close_col: str = "can_close_day",
+    device: str | torch.device = "cpu",
 ) -> EndpointMasks:
     """
     Build a unified endpoint mask for start/end of the allocation window.
 
     Rules:
-      - If force_home_ends == True and 'Home' exists -> only Home is allowed at t=0 and t=L-1.
-      - Else if purposes_df has `can_open_close_col`, allow only those marked True at ends.
+      - If purposes_df has `can_open_col` and `can_close_col`, allow only those marked True at ends.
       - Else allow all purposes at ends.
 
     Args:
-        purposes_df: CSV as DataFrame with at least a 'purpose' column and optional `can_open_close_col`.
+        purposes_df: CSV as DataFrame with at least a 'purpose' column and optional `can_open_col` and `can_close_col`.
         purposes_order: list of purpose names defining index order used by the model.
-        force_home_ends: if True, strictly enforce Home at both ends (when present).
-        can_open_close_col: column name indicating permission to open/close the day.
-
+        can_open_col: column name indicating permission to open the day.
+        can_close_col: column name indicating permission to close the day.
+        device: target device.
     Returns:
-        EndpointMasks(endpoint_allowed=[P] bool, home_idx, force_home_ends)
+        EndpointMasks(open_allowed=[P] bool, close_allowed=[P] bool)
     """
     name_to_idx = {p: i for i, p in enumerate(purposes_order)}
     P = len(purposes_order)
 
-    endpoint_allowed = torch.ones(P, dtype=torch.bool)
-    home_idx = name_to_idx.get("Home", None)
+    open_allowed = torch.ones(P, dtype=torch.bool)
+    close_allowed = torch.ones(P, dtype=torch.bool)
 
-    if force_home_ends:
-        if home_idx is None:
-            warnings.warn(
-                "force_home_ends=True but 'Home' not found in purposes; "
-                "falling back to CSV/open-close permissions.",
-                RuntimeWarning,
-            )
-        else:
-            endpoint_allowed[:] = False
-            endpoint_allowed[home_idx] = True
-            return EndpointMasks(endpoint_allowed, home_idx, True)
-
-    # If we reach here, either force_home_ends=False or Home missing
-    if can_open_close_col in purposes_df.columns:
-        endpoint_allowed[:] = False
+    if can_open_col in purposes_df.columns:
+        open_allowed[:] = False
         for _, r in purposes_df.iterrows():
             p = str(r.get("purpose", "")).strip()
-            if p in name_to_idx and _parse_bool(r.get(can_open_close_col, False)):
-                endpoint_allowed[name_to_idx[p]] = True
-    else:
-        # No column: leave all True (allow all at ends)
-        pass
+            if p in name_to_idx and _parse_bool(r.get(can_open_col, False)):
+                open_allowed[name_to_idx[p]] = True
 
-    return EndpointMasks(endpoint_allowed, home_idx, False)
+    if can_close_col in purposes_df.columns:
+        close_allowed[:] = False
+        for _, r in purposes_df.iterrows():
+            p = str(r.get("purpose", "")).strip()
+            if p in name_to_idx and _parse_bool(r.get(can_close_col, False)):
+                close_allowed[name_to_idx[p]] = True
+
+    return EndpointMasks(open_allowed, close_allowed).to(device)
 
 
 def endpoint_time_mask(
-    endpoint_allowed: torch.Tensor,
+    open_allowed: torch.Tensor,
+    close_allowed: torch.Tensor,
     L: int,
-    device: Optional[torch.device] = None,
+    step_mins: int,
+    head_open_mins: int = 60,
+    tail_close_mins: int = 30,
+    device: str | torch.device = "cpu",
 ) -> torch.Tensor:
     """
     Expand a [P]-bool endpoint permission vector into a [L, P]-bool time mask
     that only constrains the first and last time steps.
 
     Args:
-        endpoint_allowed: [P] bool; True if purpose allowed at endpoints.
+        open_allowed: [P] bool; True if purpose allowed at endpoints.
+        close_allowed: [P] bool; True if purpose allowed at endpoints.
         L: length of the time grid (e.g., 360 for 5-min over 30h).
         device: target device.
 
     Returns:
-        M: [L, P] bool; rows 0 and L-1 copy endpoint_allowed; others are True.
+        M: [L, P] bool; rows 0 and L-1 copy open_allowed and close_allowed; others are True.
     """
-    if device is None:
-        device = endpoint_allowed.device
-    P = int(endpoint_allowed.numel())
-    M = torch.ones(L, P, dtype=torch.bool, device=device)
-    M[0, :] = endpoint_allowed.to(device)
-    M[-1, :] = endpoint_allowed.to(device)
-    return M
+    P = open_allowed.numel()
+    mask = torch.ones(L, P, dtype=torch.bool, device=device)
+
+    head_bins = max(1, int(round(head_open_mins / max(1, step_mins)))) if head_open_mins > 0 else 1
+    tail_bins = max(1, int(round(tail_close_mins / max(1, step_mins)))) if tail_close_mins > 0 else 1
+    head_bins = min(head_bins, L)
+    tail_bins = min(tail_bins, L)
+    
+    # Head window
+    if head_open_mins > 0:
+        mask[:head_bins, :] = False
+        mask[:head_bins, open_allowed] = True
+    
+    # Tail window
+    if tail_close_mins > 0:
+        mask[-tail_bins:, :] = False
+        mask[-tail_bins:, close_allowed] = True
+    
+    # safety constraints
+    mask[0, :] = False
+    mask[0, open_allowed] = True
+    mask[-1, :] = False
+    mask[-1, close_allowed] = True
+    return mask
 
 
 def apply_endpoint_mask_inplace(theta: torch.Tensor, endpoint_mask: torch.Tensor, neg_large: float = -1e4) -> None:

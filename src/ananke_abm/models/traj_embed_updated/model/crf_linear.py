@@ -67,19 +67,49 @@ class LinearChainCRF(nn.Module):
     @staticmethod
     def _apply_endpoint_mask_inplace(theta: torch.Tensor, endpoint_mask: Optional[torch.Tensor], neg_large: float):
         """
-        theta: [B,P,L], endpoint_mask: [L,P] bool (True=allowed) or None.
-        Only first/last steps are constrained; we add a large negative to forbidden unaries.
+        theta: [B,P,L]
+        endpoint_mask:
+          - None: no constraints
+          - [L,P] bool: True = allowed at time t for class p (enforce at *all* t)
+          - [2,P] bool (legacy): row 0 = allowed at t=0, row 1 = allowed at t=L-1
+        We add a large negative to forbidden unaries (safe with Potts).
         """
         if endpoint_mask is None:
             return
-        assert endpoint_mask.dim() == 2 and endpoint_mask.shape[1] == theta.shape[1], \
-            "endpoint_mask must be [L, P]"
-        forbid_first = ~endpoint_mask[0]   # [P]
-        forbid_last  = ~endpoint_mask[-1]  # [P]
-        if forbid_first.any():
-            theta[:, forbid_first, 0] += neg_large
-        if forbid_last.any():
-            theta[:, forbid_last, -1] += neg_large
+
+        if endpoint_mask.dim() == 2 and endpoint_mask.shape[0] == theta.shape[2]:
+            # time-expanded mask: [L,P]
+            L = theta.shape[2]
+            allow = endpoint_mask.to(dtype=torch.bool, device=theta.device)        # [L,P]
+            forbid = (~allow).T.unsqueeze(0).expand(theta.shape[0], -1, -1)        # [B,P,L]
+            theta[forbid] += neg_large
+            return
+
+        if endpoint_mask.dim() == 2 and endpoint_mask.shape[0] == 2:
+            # legacy 2-row mask: first/last only
+            B, P, L = theta.shape
+            allow0 = endpoint_mask[0].to(dtype=torch.bool, device=theta.device)    # [P]
+            allowL = endpoint_mask[1].to(dtype=torch.bool, device=theta.device)    # [P]
+            forbid0 = ~allow0
+            forbidL = ~allowL
+            if forbid0.any():
+                theta[:, forbid0, 0] += neg_large
+            if forbidL.any():
+                theta[:, forbidL, L-1] += neg_large
+            return
+
+        # fallback: treat 1D [P] as both first/last
+        if endpoint_mask.dim() == 1 and endpoint_mask.numel() == theta.shape[1]:
+            B, P, L = theta.shape
+            allow = endpoint_mask.to(dtype=torch.bool, device=theta.device)
+            forbid = ~allow
+            if forbid.any():
+                theta[:, forbid, 0] += neg_large
+                theta[:, forbid, L-1] += neg_large
+            return
+
+        raise AssertionError(f"endpoint_mask has invalid shape {tuple(endpoint_mask.shape)} for theta {tuple(theta.shape)}")
+
 
     def _forward_logZ(self, theta: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
         """

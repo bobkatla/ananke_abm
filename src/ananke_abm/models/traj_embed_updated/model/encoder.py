@@ -148,6 +148,7 @@ class TrajEncoderGRU(nn.Module):
 
         mu = self.to_mu(r)
         logvar = self.to_logvar(r)
+        logvar = torch.clamp(logvar, -10, 8)
 
         if sample:
             eps = torch.randn_like(mu)
@@ -155,7 +156,7 @@ class TrajEncoderGRU(nn.Module):
         else:
             s = mu
 
-        z = s / (s.norm(dim=-1, keepdim=True) + 1e-8)
+        z = s / (s.norm(dim=-1, keepdim=True) + 1e-9)
 
         if return_repr:
             return z, s, mu, logvar, r

@@ -22,6 +22,7 @@ class PurposePriors:
     sigma_t: float
     mu_d: float
     sigma_d: float
+    is_primary_ooh: float
 
 
 def _fit_time_fourier_from_hist(
@@ -82,7 +83,7 @@ def derive_priors_from_activities(
     T_alloc_minutes: int,
     K_clock_prior: int,
     T_clock_minutes: int = 1440,
-) -> Tuple[Dict[str, PurposePriors], List[str]]:
+) -> Dict[str, PurposePriors]:
     """
     Build priors per purpose from schedules (ignoring persons).
 
@@ -113,6 +114,7 @@ def derive_priors_from_activities(
                 sigma_t=0.25,
                 mu_d=mean_d,
                 sigma_d=std_d,
+                is_primary_ooh=0.0,
             )
             continue
 
@@ -143,6 +145,7 @@ def derive_priors_from_activities(
             sigma_t=sigma_t,
             mu_d=mean_d,
             sigma_d=std_d,
+            is_primary_ooh=purposes_df[purposes_df["purpose"] == p]["is_primary_ooh"].values[0],
         )
 
-    return priors, purposes
+    return priors

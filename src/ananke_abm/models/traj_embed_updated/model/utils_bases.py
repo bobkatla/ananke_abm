@@ -4,7 +4,6 @@ from typing import Tuple, Optional
 import numpy as np
 import pandas as pd
 import torch
-import warnings
 
 
 # ---------------------------
@@ -26,25 +25,6 @@ def fourier_time_features(t: torch.Tensor, K: int) -> torch.Tensor:
     sin_part = torch.sin(angles)
     feat = torch.cat([base, cos_part, sin_part], dim=-1)             # (..., 1+K+K)
     return feat
-
-
-# -----------------------------------------
-# Quadrature nodes (deprecated in new CRF)
-# -----------------------------------------
-def gauss_legendre_nodes(Q: int, dtype=torch.float32, device: str | torch.device = "cpu"):
-    """
-    DEPRECATED for training. Kept for back-compat with legacy validation code.
-    Returns Gauss–Legendre nodes and weights on [0,1].
-    """
-    warnings.warn(
-        "gauss_legendre_nodes is deprecated in the CRF-VAE pipeline; "
-        "training now uses a CRF on a time grid.",
-        DeprecationWarning,
-    )
-    xs, ws = np.polynomial.legendre.leggauss(Q)  # nodes on [-1,1]
-    t = torch.as_tensor((xs + 1.0) / 2.0, dtype=dtype, device=device)  # (Q,)
-    w = torch.as_tensor(ws / 2.0, dtype=dtype, device=device)          # (Q,)
-    return t, w
 
 
 # ------------------------------------------------------
@@ -76,6 +56,58 @@ def make_alloc_grid(
     t_alloc01 = t_alloc_minutes / float(T_alloc_minutes)
     t_alloc01 = torch.clamp(t_alloc01, 0.0, 1.0)
     return t_alloc_minutes, t_alloc01
+
+
+def merge_primary_slivers(y_grid: torch.Tensor,
+                          is_primary: torch.Tensor,   # [P] bool
+                          tau_bins: int) -> torch.Tensor:
+    """
+    In-place merges any run of length < tau_bins that is non-primary and
+    is flanked by the same primary label on both sides: A ... B ... A  ->  A ... A ... A
+    y_grid: [B,L] long, is_primary: [P] bool, tau_bins: sliver threshold in bins.
+    """
+    B, L = y_grid.shape
+    y = y_grid.clone()
+    for b in range(B):
+        seq = y[b]
+        # run-length scan
+        start = 0
+        while start < L:
+            end = start
+            lab = int(seq[start].item())
+            while end < L and int(seq[end].item()) == lab:
+                end += 1
+            run_len = end - start
+            # Check pattern A (primary) ... B (non-primary short) ... A (same primary)
+            # Look at the *next* run if exists
+            if end < L and not is_primary[lab]:
+                # previous run: [prev_start, start), current run: [start,end)
+                # need prev and next runs to be same primary
+                # Find previous run bounds
+                prev_end = start
+                prev_start = prev_end - 1
+                if prev_start >= 0:
+                    prev_lab = int(seq[prev_start].item())
+                    while prev_start >= 0 and int(seq[prev_start].item()) == prev_lab:
+                        prev_start -= 1
+                    prev_start += 1
+                    # Next run bounds
+                    next_start = end
+                    if next_start < L:
+                        next_lab = int(seq[next_start].item())
+                        next_end = next_start
+                        while next_end < L and int(seq[next_end].item()) == next_lab:
+                            next_end += 1
+                        # Conditions: prev and next labels identical, primary; current run short
+                        if (run_len < tau_bins and
+                            prev_lab == next_lab and
+                            is_primary[prev_lab]):
+                            seq[start:end] = prev_lab  # merge sliver into primary
+                            # continue from end of merged region to avoid infinite loop
+                            start = end
+                            continue
+            start = end
+    return y
 
 
 # -------------------------------------------------------------------
@@ -137,35 +169,6 @@ def build_clock_binned_transition_costs(
     prob = cnt / cnt.sum(axis=2, keepdims=True)   # normalize over destination b
     cost = -np.log(prob + 1e-12)                  # [nbins, P, P]
     return torch.tensor(cost, dtype=torch.float32, device=device)
-
-
-# -------------------------------------------------------
-# Back-compat wrapper (old per-day-normalized transition)
-# -------------------------------------------------------
-def build_time_binned_transition_costs(
-    activities_csv: str,
-    purposes: list[str],
-    nbins: int = 24,
-    eps: float = 1.0,
-    device: str | torch.device = "cpu",
-):
-    """
-    DEPRECATED: Use build_clock_binned_transition_costs. This version normalized
-    by a per-person 'day length'; it is not clock-aware.
-    """
-    warnings.warn(
-        "build_time_binned_transition_costs is deprecated. "
-        "Use build_clock_binned_transition_costs(..., T_clock_minutes=1440).",
-        DeprecationWarning,
-    )
-    return build_clock_binned_transition_costs(
-        activities_csv=activities_csv,
-        purposes=purposes,
-        nbins=nbins,
-        eps=eps,
-        T_clock_minutes=1440,
-        device=device,
-    )
 
 
 # -------------------------------------------------------

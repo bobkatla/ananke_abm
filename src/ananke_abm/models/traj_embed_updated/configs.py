@@ -1,16 +1,15 @@
 from dataclasses import dataclass
-import warnings
 
 # ---- TIME & GRIDS ----
 @dataclass
 class TimeConfig:
     # Allocation horizon (what we decode/optimize over) and circadian clock
-    T_alloc_minutes: int = 1800      # 30h window to allow spillovers
+    ALLOCATION_HORIZON_MINS: int = 1800      # 30h window to allow spillovers
     T_clock_minutes: int = 1440      # 24h periodic clock
 
     # Grid step sizes
-    train_step_minutes: int = 5      # CRF training grid (fast)
-    eval_step_minutes: int = 1       # CRF/Viterbi decode grid (fidelity)
+    TRAIN_GRID_MINS: int = 10      # CRF training grid (fast)
+    VALID_GRID_MINS: int = 2       # CRF/Viterbi decode grid (fidelity)
 
     # (legacy) old normalized flag retained for back-compat; unused going forward
     t_norm: bool = True
@@ -43,9 +42,8 @@ class VAEConfig:
 # ---- CRF DECODER (resource allocation on a grid) ----
 @dataclass
 class CRFConfig:
-    eta: float = 4.0                 # Potts switching penalty (off-diagonal)
-    learn_eta: bool = False          # make eta learnable if True
-    force_home_ends: bool = True     # unified endpoint constraint (Home only at ends if True)
+    eta: float = 8.0                 # Potts switching penalty (off-diagonal)
+    learn_eta: bool = True          # make eta learnable if True
     use_transition_mask: bool = False  # enable bigram feasibility masks
 
 
@@ -56,17 +54,3 @@ class DecoderConfig:
     m_latent: int = 16
     alpha_prior: float = 1.0         # weight for log λ_p(clock(t)) bias in utilities
 
-
-# ---- (DEPRECATED) QUADRATURE CONFIG ----
-# We no longer train with CE/EMD/TV over Gauss–Legendre nodes; CRF NLL replaces them.
-# Keep this stub to avoid immediate import errors until other files are patched.
-@dataclass
-class QuadratureConfig:
-    Q_nodes_train: int = 48
-    Q_nodes_val: int = 96
-    def __post_init__(self):
-        warnings.warn(
-            "QuadratureConfig is deprecated in the CRF-VAE pipeline; "
-            "losses now use a CRF on a time grid. This class will be removed.",
-            DeprecationWarning,
-        )
