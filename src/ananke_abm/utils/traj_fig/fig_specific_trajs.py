@@ -15,7 +15,6 @@ Usage:
   python make_zoomed_lines.py buffer_real_5m.csv --eps-work 0.002 --eps-ssa 0.0015
 """
 
-import argparse
 import os
 import numpy as np
 import pandas as pd
@@ -100,16 +99,10 @@ def plot_zoom_yonly(x_hr: np.ndarray,
     if show or not save_path:
         plt.show()
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("buffer_csv", type=str, help="Path to buffer grid CSV")
-    ap.add_argument("--out-dir", type=str, default=None, help="If provided, save PNGs here; otherwise show the figures.")
-    ap.add_argument("--eps-work", type=float, default=0.002, help="Y-zoom threshold for Work/Education")
-    ap.add_argument("--eps-ssa", type=float, default=0.0015, help="Y-zoom threshold for Social/Shopping/Accompanying")
-    ap.add_argument("--dpi", type=int, default=300, help="Figure DPI")
-    args = ap.parse_args()
+def fig_specific_trajs(buffer_csv: str, out_dir: str | None, eps_work: float = 0.002, eps_ssa: float = 0.0015, dpi: int = 300):
+    print(f"Generating zoomed line plots from {buffer_csv}...")
+    df, tcols = load_buffer(buffer_csv)
 
-    df, tcols = load_buffer(args.buffer_csv)
     prop = compute_proportions(df, tcols)
 
     # Drop terminal point from the series (interval convention); X-axis still shown 0..30
@@ -121,10 +114,10 @@ def main():
     x_hr = times_min / 60.0
 
     # Ensure directory if saving
-    if args.out_dir:
-        os.makedirs(args.out_dir, exist_ok=True)
-        out1 = os.path.join(args.out_dir, "lines_work_education_zoom.png")
-        out2 = os.path.join(args.out_dir, "lines_social_shopping_accompanying_zoom.png")
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        out1 = os.path.join(out_dir, "lines_work_education_zoom.png")
+        out2 = os.path.join(out_dir, "lines_social_shopping_accompanying_zoom.png")
     else:
         out1 = out2 = None
 
@@ -132,16 +125,14 @@ def main():
     series_we = {"Work": prop["Work"].to_numpy(),
                  "Education": prop["Education"].to_numpy()}
     plot_zoom_yonly(x_hr, series_we,
-                    "Proportion over Time — Work & Education (Y-zoom, 0–30h X-axis)",
-                    save_path=out1, eps=args.eps_work, dpi=args.dpi, show=(args.out_dir is None))
+                    "Proportion over Time — Work & Education",
+                    save_path=out1, eps=eps_work, dpi=dpi, show=(out_dir is None))
 
     # Plot 2: Social, Shopping & Accompanying
     series_ssa = {"Social": prop["Social"].to_numpy(),
                   "Shopping": prop["Shopping"].to_numpy(),
                   "Accompanying": prop["Accompanying"].to_numpy()}
     plot_zoom_yonly(x_hr, series_ssa,
-                    "Proportion over Time — Social, Shopping & Accompanying (Y-zoom, 0–30h X-axis)",
-                    save_path=out2, eps=args.eps_ssa, dpi=args.dpi, show=(args.out_dir is None))
+                    "Proportion over Time — Social, Shopping & Accompanying",
+                    save_path=out2, eps=eps_ssa, dpi=dpi, show=(out_dir is None))
 
-if __name__ == "__main__":
-    main()

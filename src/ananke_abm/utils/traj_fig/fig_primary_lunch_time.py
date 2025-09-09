@@ -18,9 +18,8 @@ Usage:
   #   (If --out-dir is omitted, figures are shown instead of saved)
 """
 
-import argparse
 import os
-from typing import List, Dict
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -147,42 +146,38 @@ def stacked_plot(props_wide: pd.DataFrame,
     if show or not out_png:
         plt.show()
 
-def main():
-    ap = argparse.ArgumentParser(description="Zoomed stacked plots for Work/Education main activity (10:00 & 14:00).")
-    ap.add_argument("buffer_csv", type=str, help="Path to buffer grid CSV")
-    ap.add_argument("--out-dir", type=str, default=None, help="If provided, save plots here; otherwise show figures.")
-    ap.add_argument("--t0", type=int, default=600, help="Window start (minutes), default 600 (10:00).")
-    ap.add_argument("--t1", type=int, default=840, help="Window end (minutes), default 840 (14:00).")
-    ap.add_argument("--dpi", type=int, default=300, help="Figure DPI.")
-    ap.add_argument("--show", action="store_true", help="Also show figures when saving.")
-    args = ap.parse_args()
-
-    df = load_buffer(args.buffer_csv)
+def fig_primary_lunch_time(
+        buffer_csv: str,
+        out_dir: str | None,
+        y_work_max: float = 0.5,
+        y_edu_max: float = 0.5,
+        t0: int = 600,
+        t1: int = 840,
+        dpi: int = 300):
+    print(f"Generating zoomed stacked plots for Work/Education main activity ({t0} & {t1})...")
+    df = load_buffer(buffer_csv)
     time_cols_int = sorted([int(c) for c in df.columns if c != "persid"])
     step = detect_step(time_cols_int)
+    tcols = list(range(t0, t1 + step, step))
 
     # Construct time columns for the requested window (inclusive)
-    tcols = list(range(args.t0, args.t1 + step, step))
-
     # --- Work cohort ---
-    df_work = filter_main(df, "Work", args.t0, args.t1)
+    df_work = filter_main(df, "Work", t0, t1)
     n_work = len(df_work)
     props_work = compute_props(df_work, tcols, "Work")
     out_work = None
-    if args.out_dir:
-        out_work = os.path.join(args.out_dir, "stacked_work_10to14_zoom_0_05.png")
-    title_work = f"Stacked Proportions (Y-zoom 0-0.04, includes last bin) — Work @ 10:00 & 14:00 — n={n_work:,}"
-    stacked_plot(props_work, title_work, y_max=0.05, out_png=out_work, t0=args.t0, t1=args.t1, dpi=args.dpi, show=args.show, main="Work")
+    if out_dir:
+        out_work = os.path.join(out_dir, "stacked_work_zoom.png")
+    title_work = f"Stacked Proportions (Y-zoom 0-{y_work_max}, includes last bin) — Work — n={n_work:,}"
+    stacked_plot(props_work, title_work, y_max=y_work_max, out_png=out_work, t0=t0, t1=t1, dpi=dpi, show=True if out_dir is None else False, main="Work")
 
     # --- Education cohort ---
-    df_edu = filter_main(df, "Education", args.t0, args.t1)
+    df_edu = filter_main(df, "Education", t0, t1)
     n_edu = len(df_edu)
     props_edu = compute_props(df_edu, tcols, "Education")
     out_edu = None
-    if args.out_dir:
-        out_edu = os.path.join(args.out_dir, "stacked_education_10to14_zoom_0_005.png")
-    title_edu = f"Stacked Proportions (Y-zoom 0-0.004, includes last bin) — Education @ 10:00 & 14:00 — n={n_edu:,}"
-    stacked_plot(props_edu, title_edu, y_max=0.005, out_png=out_edu, t0=args.t0, t1=args.t1, dpi=args.dpi, show=args.show, main="Education")
+    if out_dir:
+        out_edu = os.path.join(out_dir, "stacked_education_zoom.png")
+    title_edu = f"Stacked Proportions (Y-zoom 0-{y_edu_max}, includes last bin) — Education — n={n_edu:,}"
+    stacked_plot(props_edu, title_edu, y_max=y_edu_max, out_png=out_edu, t0=t0, t1=t1, dpi=dpi, show=True if out_dir is None else False, main="Education")
 
-if __name__ == "__main__":
-    main()
