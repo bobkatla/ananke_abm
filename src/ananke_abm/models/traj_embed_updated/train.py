@@ -1,4 +1,4 @@
-import argparse
+import click
 import random
 from pathlib import Path
 
@@ -112,6 +112,8 @@ def train_traj_embed(
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
     set_seed(42)
+    click.echo(f"Training for {epochs} epochs...")
+    click.echo(f"Using device: {device}")
 
     device = torch.device(device)
     outdir = Path(outdir)
@@ -258,7 +260,7 @@ def train_traj_embed(
             )
 
             if torch.isnan(z).any():
-                print(f"NaN detected in z at batch {i}. Norms: {torch.linalg.norm(s, dim=-1)}")
+                click.echo(f"NaN detected in z at batch {i}. Norms: {torch.linalg.norm(s, dim=-1)}")
                 # Consider stopping or saving state here
                 break
 
@@ -271,12 +273,12 @@ def train_traj_embed(
             theta = sanitize_theta(theta)
 
             if torch.isnan(theta).any():
-                print(f"NaN detected in theta at batch {i}.")
+                click.echo(f"NaN detected in theta at batch {i}.")
                 break
 
             # Log stats periodically
             # if i % 50 == 0:
-            #     print(f"Theta stats: min={theta.min():.2f}, max={theta.max():.2f}")
+            #     click.echo(f"Theta stats: min={theta.min():.2f}, max={theta.max():.2f}")
 
 
             # labels on train grid
@@ -330,7 +332,7 @@ def train_traj_embed(
         avg_tr = total_tr / max(len(dl_tr), 1)
         avg_va = total_va / max(n_batches, 1)
         if epoch % 10 == 0 or epoch == epochs:
-            print(f"[{epoch:03d}] train={avg_tr:.4f}  val={avg_va:.4f}  (nll={nll_va/max(n_batches,1):.4f}, kl={kl_va/max(n_batches,1):.4f}, beta={beta_weight:.3f})")
+            click.echo(f"[{epoch:03d}] train={avg_tr:.4f}  val={avg_va:.4f}  (nll={nll_va/max(n_batches,1):.4f}, kl={kl_va/max(n_batches,1):.4f}, beta={beta_weight:.3f})")
 
         history["epoch"].append(epoch)
         history["train_total"].append(avg_tr)
@@ -357,11 +359,11 @@ def train_traj_embed(
         if avg_va < best_val_total:
             best_val_total = avg_va
             torch.save(ckpt, outdir / "ckpt_best.pt")
-            print(f"Best val so far: {best_val_total:.4f} at epoch {epoch}")
+            click.echo(f"Best val so far: {best_val_total:.4f} at epoch {epoch}")
 
         if epoch == epochs:
             torch.save(ckpt, outdir / "ckpt_final.pt")
-            print(f"Final val: {avg_va:.4f} (best {best_val_total:.4f})")
+            click.echo(f"Final val: {avg_va:.4f} (best {best_val_total:.4f})")
 
     # Save history to CSV
     pd.DataFrame(history).to_csv(outdir / "history.csv", index=False)

@@ -4,6 +4,7 @@ from typing import List, Tuple
 import numpy as np
 import pandas as pd
 import torch
+import click
 
 # --- configs & model pieces ---
 from ananke_abm.models.traj_embed_updated.configs import DecoderConfig
@@ -200,12 +201,12 @@ def gen_n_val_traj(
     val_csv: str,
     eval_step_minutes: int,
     device: str = "cuda" if torch.cuda.is_available() else "cpu"):
-    print(f"Validating {num_gen} trajectories...")
-    print(f"Using device: {device}")
-    print(f"Using eval step minutes: {eval_step_minutes}")
-    print(f"Using batch size: {batch_size}")
-    print(f"Output gen csv: {gen_csv}")
-    print(f"Output val csv: {val_csv}")
+    click.echo(f"Validating {num_gen} trajectories...")
+    click.echo(f"Using device: {device}")
+    click.echo(f"Using eval step minutes: {eval_step_minutes}")
+    click.echo(f"Using batch size: {batch_size}")
+    click.echo(f"Output gen csv: {gen_csv}")
+    click.echo(f"Output val csv: {val_csv}")
     set_seed(42)
 
     device = torch.device(device)
@@ -339,18 +340,18 @@ def gen_n_val_traj(
             y_hat = crf.viterbi(theta, endpoint_mask=endpoint_mask_eval)  # [B,L]
             tail_bins = int(round(60 / time_cfg["VALID_GRID_MINS"]))
             bad = ~endpoint_mask_eval[-tail_bins:, :].gather(1, y_hat[:, -tail_bins:].T).T  # [B, tail_bins]
-            # print("Tail violations per batch:", bad.any(dim=1).float().mean().item())
+            # click.echo("Tail violations per batch:", bad.any(dim=1).float().mean().item())
             assert bad.any(dim=1).float().mean().item() == 0, "Tail violations found"
             decoded_preview.extend(labels_to_segments(y_hat, t_alloc01_eval))
 
-    print(f"Validation (grid NLL): nll={np.mean(nlls):.4f}")
+    click.echo(f"Validation (grid NLL): nll={np.mean(nlls):.4f}")
 
     # Show a few reconstructed samples (first 3)
     Tm = T_alloc_minutes
-    # print("=== Reconstructions (μ → Viterbi) ===")
+    # click.echo("=== Reconstructions (μ → Viterbi) ===")
     # for b, segs in enumerate(decoded_preview[:3]):
     #     pretty = " | ".join(f"{purposes[p]} @ {int(t0*Tm)}m for {int(d*Tm)}m" for (p,t0,d) in segs)
-    #     print(f"Rec {b}: {pretty}")
+    #     click.echo(f"Rec {b}: {pretty}")
 
     # --------- Generation from prior ----------
     # Sample s ~ N(0, I), then z = normalize(s), decode with Viterbi.
@@ -372,7 +373,7 @@ def gen_n_val_traj(
     if gen_csv:
         Path(gen_csv).parent.mkdir(parents=True, exist_ok=True)
         gen_df.to_csv(gen_csv, index=False)
-        print(f"Wrote generated activities to: {gen_csv}")
+        click.echo(f"Wrote generated activities to: {gen_csv}")
 
     # --------- Per-trajectory validation on generated CSV ----------
     full_seqs, bigrams = build_truth_sets(activities_csv)
@@ -381,9 +382,9 @@ def gen_n_val_traj(
     if val_csv:
         Path(val_csv).parent.mkdir(parents=True, exist_ok=True)
         val_df.to_csv(val_csv, index=False)
-        print(f"Wrote per-trajectory validation to: {val_csv}")
+        click.echo(f"Wrote per-trajectory validation to: {val_csv}")
 
-    print("=== Generated sample sequences (first 10 check) ===")
-    print(val_df.head(10).to_string(index=False))
+    click.echo("=== Generated sample sequences (first 10 check) ===")
+    click.echo(val_df.head(10).to_string(index=False))
 
     

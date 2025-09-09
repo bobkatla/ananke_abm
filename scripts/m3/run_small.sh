@@ -12,9 +12,9 @@
 module load miniforge3
 mamba activate ananke
 uv run ananke traj-embed \
--av "..\..\src\data\traj_processed\small_activities_homebound_wd.csv" \
--pv "..\..\src\data\traj_processed\purposes_new.csv" \
--o "..\..\src\output\traj_embed\models\small" \
+-av "src/data/traj_processed/small_activities_homebound_wd.csv" \
+-pv "src/data/traj_processed/purposes_new.csv" \
+-o "src/output/traj_embed/models/small" \
 -e 200 \
 -b 32 \
 --lr 1e-3 \
