@@ -146,7 +146,14 @@ def stacked_plot(props_wide: pd.DataFrame,
     if show or not out_png:
         plt.show()
 
-def fig_primary_lunch_time(buffer_csv: str, out_dir: str | None, t0: int = 600, t1: int = 840, dpi: int = 300, show: bool = False):
+def fig_primary_lunch_time(
+        buffer_csv: str,
+        out_dir: str | None,
+        y_work_max: float = 0.5,
+        y_edu_max: float = 0.5,
+        t0: int = 600,
+        t1: int = 840,
+        dpi: int = 300):
     print(f"Generating zoomed stacked plots for Work/Education main activity ({t0} & {t1})...")
     df = load_buffer(buffer_csv)
     time_cols_int = sorted([int(c) for c in df.columns if c != "persid"])
@@ -160,9 +167,9 @@ def fig_primary_lunch_time(buffer_csv: str, out_dir: str | None, t0: int = 600, 
     props_work = compute_props(df_work, tcols, "Work")
     out_work = None
     if out_dir:
-        out_work = os.path.join(out_dir, "stacked_work_10to14_zoom.png")
-    title_work = f"Stacked Proportions (Y-zoom 0-0.5, includes last bin) — Work @ 10:00 & 14:00 — n={n_work:,}"
-    stacked_plot(props_work, title_work, y_max=0.5, out_png=out_work, t0=t0, t1=t1, dpi=dpi, show=show, main="Work")
+        out_work = os.path.join(out_dir, "stacked_work_zoom.png")
+    title_work = f"Stacked Proportions (Y-zoom 0-{y_work_max}, includes last bin) — Work — n={n_work:,}"
+    stacked_plot(props_work, title_work, y_max=y_work_max, out_png=out_work, t0=t0, t1=t1, dpi=dpi, show=True if out_dir is None else False, main="Work")
 
     # --- Education cohort ---
     df_edu = filter_main(df, "Education", t0, t1)
@@ -170,7 +177,7 @@ def fig_primary_lunch_time(buffer_csv: str, out_dir: str | None, t0: int = 600, 
     props_edu = compute_props(df_edu, tcols, "Education")
     out_edu = None
     if out_dir:
-        out_edu = os.path.join(out_dir, "stacked_education_10to14_zoom.png")
-    title_edu = f"Stacked Proportions (Y-zoom 0-0.5, includes last bin) — Education @ 10:00 & 14:00 — n={n_edu:,}"
-    stacked_plot(props_edu, title_edu, y_max=0.5, out_png=out_edu, t0=t0, t1=t1, dpi=dpi, show=show, main="Education")
+        out_edu = os.path.join(out_dir, "stacked_education_zoom.png")
+    title_edu = f"Stacked Proportions (Y-zoom 0-{y_edu_max}, includes last bin) — Education — n={n_edu:,}"
+    stacked_plot(props_edu, title_edu, y_max=y_edu_max, out_png=out_edu, t0=t0, t1=t1, dpi=dpi, show=True if out_dir is None else False, main="Education")
 
