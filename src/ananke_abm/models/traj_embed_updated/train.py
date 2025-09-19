@@ -20,11 +20,12 @@ from ananke_abm.models.traj_embed_updated.configs import (
 )
 from ananke_abm.models.traj_embed_updated.model.pds_loader import derive_priors_from_activities
 from ananke_abm.models.traj_embed_updated.model.purpose_space import PurposeDistributionSpace
-from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid, merge_primary_slivers
+from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid, merge_primary_slivers, segments_from_padded_to_grid
 from ananke_abm.models.traj_embed_updated.model.rasterize import rasterize_from_padded_to_grid
 from ananke_abm.models.traj_embed_updated.model.decoder_timefield import TimeFieldDecoder
 from ananke_abm.models.traj_embed_updated.model.encoder import TrajEncoderGRU, kl_gaussian_standard
 from ananke_abm.models.traj_embed_updated.model.crf_linear import LinearChainCRF
+from ananke_abm.models.traj_embed_updated.model.crf_semi import SemiMarkovCRF, build_duration_logprob_table
 from ananke_abm.models.traj_embed_updated.model.train_masks import build_endpoint_mask, endpoint_time_mask
 
 
@@ -110,6 +111,7 @@ def train_traj_embed(
     val_ratio: float = 0.2,
     outdir: str = "./runs",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    crf_mode: str = "linear",  # "linear" or "semi"
 ):
     set_seed(42)
     click.echo(f"Training for {epochs} epochs...")
@@ -171,6 +173,16 @@ def train_traj_embed(
                 t_alloc_minutes, T_clock_minutes=time_cfg.T_clock_minutes
             ) # [P, L]
 
+    if crf_mode == "semi":
+        dur_logprob = build_duration_logprob_table(
+            priors=priors,
+            purposes=purposes,
+            step_minutes=time_cfg.TRAIN_GRID_MINS,
+            T_alloc_minutes=time_cfg.T_clock_minutes,
+            Dmax_minutes=getattr(crf_cfg, "semi_Dmax_minutes", 300),  # default 5h,
+            device=device,
+        )  # [P, Dmax_bins]
+
     # --- unified endpoint mask ---
     ep_masks = build_endpoint_mask(purp, purposes, can_open_col="can_open_day", can_close_col="can_close_day")
     L_train = loglam_grids["train"].shape[1]
@@ -198,12 +210,19 @@ def train_traj_embed(
         dropout=0.2
     ).to(device)
 
-    crf = LinearChainCRF(
-        P=P,
-        eta=crf_cfg.eta,
-        learn_eta=crf_cfg.learn_eta,
-        transition_mask=None,   # plug in a [P,P] Bool mask if you want to forbid transitions
-    ).to(device)
+    if crf_mode == "linear":
+        crf = LinearChainCRF(
+            P=P,
+            eta=crf_cfg.eta,
+            learn_eta=crf_cfg.learn_eta,
+            transition_mask=None,   # plug in a [P,P] Bool mask if you want to forbid transitions
+        ).to(device)
+    elif crf_mode == "semi":
+        crf = SemiMarkovCRF(
+            P=P,
+            eta=crf_cfg.eta,
+            learn_eta=crf_cfg.learn_eta,
+        ).to(device)
 
     params = list(pds.parameters()) + list(enc.parameters()) + list(dec.parameters())
     if crf_cfg.learn_eta:
@@ -267,9 +286,8 @@ def train_traj_embed(
             # unaries θ on train grid (no mask applied here; CRF will apply)
             theta = dec.utilities_on_grid(
                 z, e_p, loglam_grids["train"], grid_type="train",
-                endpoint_mask=endpoint_mask_train,  # avoid double-application; CRF handles endpoints
+                endpoint_mask=None,  # avoid double-application; CRF handles endpoints
             )  # [B,P,L]
-            
             theta = sanitize_theta(theta)
 
             if torch.isnan(theta).any():
@@ -279,16 +297,22 @@ def train_traj_embed(
             # Log stats periodically
             # if i % 50 == 0:
             #     click.echo(f"Theta stats: min={theta.min():.2f}, max={theta.max():.2f}")
+            
+            if crf_mode == "linear":
+                fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
+                y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)  # [B,L]
+                y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
+                nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train)
+            elif crf_mode == "semi":
+                y_segs = segments_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train)
+                nll = crf.nll(
+                    theta=theta,
+                    gold_segments=y_segs,
+                    dur_logprob=dur_logprob,                 # [P, Dmax_bins] on TRAIN grid
+                    endpoint_mask=endpoint_mask_train,       # [L,P] on TRAIN grid
+                )
 
-
-            # labels on train grid
-            fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
-            y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)  # [B,L]
-            y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
-
-            # losses
-            nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train)   # scalar
-            kl  = kl_gaussian_standard(mu, logvar, reduction="mean")          # scalar
+            kl  = kl_gaussian_standard(mu, logvar, reduction="mean")
             loss = nll + beta_weight * kl
 
             # step
@@ -319,14 +343,23 @@ def train_traj_embed(
                     endpoint_mask=endpoint_mask_train,
                 )
                 theta = sanitize_theta(theta)
-                fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
-                y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)
-                y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
 
-                nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train)
+                if crf_mode == "linear":
+                    fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
+                    y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)
+                    y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
+                    nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train)
+                elif crf_mode == "semi":
+                    y_segs = segments_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train)
+                    nll = crf.nll(
+                        theta=theta,
+                        gold_segments=y_segs,
+                        dur_logprob=dur_logprob,                 # [P, Dmax_bins] on TRAIN grid
+                        endpoint_mask=endpoint_mask_train,       # [L,P] on TRAIN grid
+                    )
+                
                 kl  = kl_gaussian_standard(mu, logvar, reduction="mean")
                 loss = nll + beta_weight * kl
-
                 total_va += float(loss.item()); nll_va += float(nll.item()); kl_va += float(kl.item()); n_batches += 1
 
         avg_tr = total_tr / max(len(dl_tr), 1)

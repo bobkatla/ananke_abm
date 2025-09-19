@@ -1,5 +1,5 @@
 import math
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 import numpy as np
 import pandas as pd
@@ -222,3 +222,35 @@ def viterbi_timecost_decode(u, t_nodes, C_t, switch_cost: float = 0.0):
                 t0 = t
         paths.append(segs)
     return paths
+
+
+def segments_from_padded_to_grid(
+    p_pad: torch.Tensor,    # [B,Lmax] long
+    t_pad: torch.Tensor,    # [B,Lmax] float in [0,1]
+    d_pad: torch.Tensor,    # [B,Lmax] float in [0,1]
+    lengths: List[int],
+    L: int,                 # number of grid bins
+) -> List[List[Tuple[int,int,int]]]:
+    """
+    Returns per-batch list of segments as (p, s, d) in grid bins, merged for identical adjacents.
+    """
+    B, Lmax = p_pad.shape
+    out: List[List[Tuple[int,int,int]]] = []
+    for b in range(B):
+        Lb = lengths[b]
+        segs: List[Tuple[int,int,int]] = []
+        for i in range(Lb):
+            p = int(p_pad[b,i].item())
+            s = max(0, min(L-1, int(round(t_pad[b,i].item() * L))))
+            d = max(1, int(round(d_pad[b,i].item() * L)))
+            t_end = min(L, s + d)
+            d = t_end - s
+            if d <= 0: continue
+            if segs and segs[-1][0] == p and segs[-1][1] + segs[-1][2] == s:
+                # merge
+                prev_p, prev_s, prev_d = segs[-1]
+                segs[-1] = (prev_p, prev_s, prev_d + d)
+            else:
+                segs.append((p, s, d))
+        out.append(segs)
+    return out

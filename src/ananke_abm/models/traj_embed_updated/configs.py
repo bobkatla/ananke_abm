@@ -45,6 +45,7 @@ class CRFConfig:
     eta: float = 8.0                 # Potts switching penalty (off-diagonal)
     learn_eta: bool = True          # make eta learnable if True
     use_transition_mask: bool = False  # enable bigram feasibility masks
+    semi_Dmax_minutes: int = 300   # max segment duration for semi-CRF
 
 
 # ---- DECODER MISC ----
