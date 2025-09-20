@@ -172,21 +172,43 @@ def train_traj_embed(
             loglam_grids[grid_type] = pds.lambda_log_on_alloc_grid(
                 t_alloc_minutes, T_clock_minutes=time_cfg.T_clock_minutes
             ) # [P, L]
+    L_train = loglam_grids["train"].shape[1]
+    L_eval  = loglam_grids["eval"].shape[1]
 
     if crf_mode == "semi":
-        dur_logprob = build_duration_logprob_table(
+        dur_logprob_train = build_duration_logprob_table(
             priors=priors,
             purposes=purposes,
             step_minutes=time_cfg.TRAIN_GRID_MINS,
-            T_alloc_minutes=time_cfg.T_clock_minutes,
-            Dmax_minutes=getattr(crf_cfg, "semi_Dmax_minutes", 300),  # default 5h,
+            T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS,
+            Dmax_minutes=getattr(crf_cfg, "semi_Dmax_minutes", 300),
             device=device,
-        )  # [P, Dmax_bins]
+        )  # [P, Dmax_bins_train]
+        assert dur_logprob_train.shape[0] == len(purposes)
+
+        dur_logprob_eval = build_duration_logprob_table(
+            priors=priors,
+            purposes=purposes,
+            step_minutes=time_cfg.VALID_GRID_MINS,
+            T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS,
+            Dmax_minutes=getattr(crf_cfg, "semi_Dmax_minutes", 300),
+            device=device,
+        )  # [P, Dmax_bins_eval]
+        assert dur_logprob_eval.shape[0] == len(purposes)
 
     # --- unified endpoint mask ---
     ep_masks = build_endpoint_mask(purp, purposes, can_open_col="can_open_day", can_close_col="can_close_day")
-    L_train = loglam_grids["train"].shape[1]
-    endpoint_mask_train = endpoint_time_mask(ep_masks.open_allowed, ep_masks.close_allowed, L_train, step_mins=time_cfg.TRAIN_GRID_MINS, device=device)  # [L,P]
+    endpoint_mask_train = endpoint_time_mask(
+        ep_masks.open_allowed, ep_masks.close_allowed,
+        L_train, step_mins=time_cfg.TRAIN_GRID_MINS, device=device
+    )  # [L_train, P]
+    assert endpoint_mask_train.shape == (L_train, len(purposes))
+
+    endpoint_mask_eval = endpoint_time_mask(
+        ep_masks.open_allowed, ep_masks.close_allowed,
+        L_eval, step_mins=time_cfg.VALID_GRID_MINS, device=device
+    )  # [L_eval, P]
+    assert endpoint_mask_eval.shape == (L_eval, len(purposes))
 
     # --- models ---
     P = len(purposes)
@@ -265,6 +287,7 @@ def train_traj_embed(
         total_tr = 0.0; nll_tr = 0.0; kl_tr = 0.0
 
         beta_weight = beta_at_epoch(epoch)
+        n_batches_train = 0
 
         for i, (p_pad, t_pad, d_pad, lengths) in enumerate(dl_tr):
             p_pad = p_pad.to(device); t_pad = t_pad.to(device); d_pad = d_pad.to(device)
@@ -289,6 +312,8 @@ def train_traj_embed(
                 endpoint_mask=None,  # avoid double-application; CRF handles endpoints
             )  # [B,P,L]
             theta = sanitize_theta(theta)
+            B, P, Lg = theta.shape
+            assert endpoint_mask_train.shape == (Lg, P)
 
             if torch.isnan(theta).any():
                 click.echo(f"NaN detected in theta at batch {i}.")
@@ -308,7 +333,7 @@ def train_traj_embed(
                 nll = crf.nll(
                     theta=theta,
                     gold_segments=y_segs,
-                    dur_logprob=dur_logprob,                 # [P, Dmax_bins] on TRAIN grid
+                    dur_logprob=dur_logprob_train,                 # [P, Dmax_bins] on TRAIN grid
                     endpoint_mask=endpoint_mask_train,       # [L,P] on TRAIN grid
                 )
 
@@ -322,10 +347,11 @@ def train_traj_embed(
             opt.step()
 
             total_tr += float(loss.item()); nll_tr += float(nll.item()); kl_tr += float(kl.item())
+            n_batches_train += 1
 
         # ---- validation ----
         enc.eval(); dec.eval(); pds.eval(); crf.eval()
-        total_va = 0.0; nll_va = 0.0; kl_va = 0.0; n_batches = 0
+        total_va = 0.0; nll_va = 0.0; kl_va = 0.0; n_batches_val = 0
 
         with torch.no_grad():
             e_p = pds()
@@ -339,39 +365,41 @@ def train_traj_embed(
                     sample=False,  # deterministic μ at val
                 )
                 theta = dec.utilities_on_grid(
-                    z, e_p, loglam_grids["train"], grid_type="train",
-                    endpoint_mask=endpoint_mask_train,
+                    z, e_p, loglam_grids["eval"], grid_type="eval",
+                    endpoint_mask=None,
                 )
                 theta = sanitize_theta(theta)
+                B, P, Lg = theta.shape
+                assert endpoint_mask_eval.shape == (Lg, P)
 
                 if crf_mode == "linear":
                     fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
-                    y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)
+                    y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_eval, fallback_idx=fallback_idx)
                     y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
-                    nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train)
+                    nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_eval)
                 elif crf_mode == "semi":
-                    y_segs = segments_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train)
+                    y_segs = segments_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_eval)
                     nll = crf.nll(
                         theta=theta,
                         gold_segments=y_segs,
-                        dur_logprob=dur_logprob,                 # [P, Dmax_bins] on TRAIN grid
-                        endpoint_mask=endpoint_mask_train,       # [L,P] on TRAIN grid
+                        dur_logprob=dur_logprob_eval,                 # [P, Dmax_bins] on EVAL grid
+                        endpoint_mask=endpoint_mask_eval,       # [L,P] on EVAL grid
                     )
                 
                 kl  = kl_gaussian_standard(mu, logvar, reduction="mean")
                 loss = nll + beta_weight * kl
-                total_va += float(loss.item()); nll_va += float(nll.item()); kl_va += float(kl.item()); n_batches += 1
+                total_va += float(loss.item()); nll_va += float(nll.item()); kl_va += float(kl.item()); n_batches_val += 1
 
-        avg_tr = total_tr / max(len(dl_tr), 1)
-        avg_va = total_va / max(n_batches, 1)
+        avg_tr = total_tr / max(n_batches_train, 1)
+        avg_va = total_va / max(n_batches_val, 1)
         if epoch % 10 == 0 or epoch == epochs:
-            click.echo(f"[{epoch:03d}] train={avg_tr:.4f}  val={avg_va:.4f}  (nll={nll_va/max(n_batches,1):.4f}, kl={kl_va/max(n_batches,1):.4f}, beta={beta_weight:.3f})")
+            click.echo(f"[{epoch:03d}] train={avg_tr:.4f}  val={avg_va:.4f}  (nll={nll_va/max(n_batches_val,1):.4f}, kl={kl_va/max(n_batches_val,1):.4f}, beta={beta_weight:.3f})")
 
         history["epoch"].append(epoch)
         history["train_total"].append(avg_tr)
         history["val_total"].append(avg_va)
-        history["nll"].append(nll_va / max(n_batches, 1))
-        history["kl"].append(kl_va / max(n_batches, 1))
+        history["nll"].append(nll_va / max(n_batches_val, 1))
+        history["kl"].append(kl_va / max(n_batches_val, 1))
 
         # --- checkpoint ---
         ckpt = {
