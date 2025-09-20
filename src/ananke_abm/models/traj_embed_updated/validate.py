@@ -374,7 +374,7 @@ def gen_n_val_traj(
                 # rasterize labels to grid for NLL
                 fallback_idx = 0
                 y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_eval, fallback_idx=fallback_idx)
-                nll = lin_crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_eval)
+                nll = (lin_crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_eval)) / max(theta.shape[-1], 1) 
                 y_hat = lin_crf.viterbi(theta, endpoint_mask=endpoint_mask_eval)  # [B,L]
                 decoded_preview.extend(labels_to_segments(y_hat, t_alloc01_eval))
             else:
@@ -397,12 +397,12 @@ def gen_n_val_traj(
                     segs.append((int(cur), int(s), int(len(yb) - s)))
                     segs_b.append(segs)
 
-                nll = semi_crf.nll(
+                nll = (semi_crf.nll(
                     theta=theta,
                     gold_segments=segs_b,
                     dur_logprob=dur_logprob,
                     endpoint_mask=endpoint_mask_eval,
-                )
+                )) / max(theta.shape[-1], 1)
                 # semi-CRF Viterbi for preview
                 y_hat_segments = semi_crf.viterbi(
                     theta=theta,
@@ -474,4 +474,3 @@ def gen_n_val_traj(
 
     click.echo("=== Generated sample sequences (first 10 check) ===")
     click.echo(val_df.head(10).to_string(index=False))
-    

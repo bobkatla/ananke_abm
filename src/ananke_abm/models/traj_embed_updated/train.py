@@ -335,7 +335,7 @@ def train_traj_embed(
                     gold_segments=y_segs,
                     dur_logprob=dur_logprob_train,                 # [P, Dmax_bins] on TRAIN grid
                     endpoint_mask=endpoint_mask_train,       # [L,P] on TRAIN grid
-                )
+                ) / max(theta.shape[-1], 1)  # normalize by length
 
             kl  = kl_gaussian_standard(mu, logvar, reduction="mean")
             loss = nll + beta_weight * kl
@@ -384,7 +384,7 @@ def train_traj_embed(
                         gold_segments=y_segs,
                         dur_logprob=dur_logprob_eval,                 # [P, Dmax_bins] on EVAL grid
                         endpoint_mask=endpoint_mask_eval,       # [L,P] on EVAL grid
-                    )
+                    ) / max(theta.shape[-1], 1)  # normalize by length
                 
                 kl  = kl_gaussian_standard(mu, logvar, reduction="mean")
                 loss = nll + beta_weight * kl
