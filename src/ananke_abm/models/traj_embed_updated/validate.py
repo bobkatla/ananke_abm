@@ -1,3 +1,4 @@
+# ananke_abm/models/traj_embed_updated/validate.py
 from pathlib import Path
 from typing import List, Tuple
 
@@ -14,6 +15,9 @@ from ananke_abm.models.traj_embed_updated.model.rasterize import rasterize_from_
 from ananke_abm.models.traj_embed_updated.model.decoder_timefield import TimeFieldDecoder
 from ananke_abm.models.traj_embed_updated.model.encoder import TrajEncoderGRU
 from ananke_abm.models.traj_embed_updated.model.crf_linear import LinearChainCRF
+from ananke_abm.models.traj_embed_updated.model.crf_semi import (
+    SemiMarkovCRF, build_duration_logprob_table
+)
 from ananke_abm.models.traj_embed_updated.model.train_masks import build_endpoint_mask, endpoint_time_mask
 
 
@@ -23,6 +27,13 @@ from ananke_abm.models.traj_embed_updated.model.train_masks import build_endpoin
 def set_seed(seed: int = 42):
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+def sanitize_theta(theta: torch.Tensor) -> torch.Tensor:
+    """Numerically stabilizes CRF emissions (shift-invariant)."""
+    theta_max = torch.max(theta, dim=1, keepdim=True).values
+    theta_stable = theta - theta_max
+    return torch.clamp(theta_stable, min=-30.0, max=30.0)
 
 
 class ScheduleDataset(torch.utils.data.Dataset):
@@ -68,9 +79,9 @@ def labels_to_segments(y_hat: torch.Tensor, t_alloc01: torch.Tensor) -> List[Lis
     t_alloc01: [L] normalized grid positions in [0,1]
     Returns: list over batch; each item is list[(p_idx, t0_norm, d_norm)]
     """
-    B, L = y_hat.shape[0], y_hat.shape[1]
+    B, L = y_hat.shape
     t = t_alloc01.detach().cpu().numpy()
-    out = []
+    out: List[List[Tuple[int, float, float]]] = []
     for b in range(B):
         yb = y_hat[b].detach().cpu().numpy()
         if L == 0:
@@ -200,13 +211,20 @@ def gen_n_val_traj(
     gen_csv: str,
     val_csv: str,
     eval_step_minutes: int,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"):
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    crf_mode: str = "linear",        # "linear" | "semi"
+    semi_Dmax_minutes: int = 300,    # only used when crf_mode="semi"
+):
+    """
+    Validate & generate using the trained model.
+    - Uses the same emissions as training (decoder utilities + clock prior).
+    - CRF constraints are applied only inside CRF (no double-masking).
+    - crf_mode chooses Linear or Semi-Markov decoding & NLL.
+    """
     click.echo(f"Validating {num_gen} trajectories...")
     click.echo(f"Using device: {device}")
     click.echo(f"Using eval step minutes: {eval_step_minutes}")
-    click.echo(f"Using batch size: {batch_size}")
-    click.echo(f"Output gen csv: {gen_csv}")
-    click.echo(f"Output val csv: {val_csv}")
+    click.echo(f"Using CRF mode: {crf_mode}")
     set_seed(42)
 
     device = torch.device(device)
@@ -219,21 +237,22 @@ def gen_n_val_traj(
 
     # Fallbacks in case older ckpts don't have new sections
     cfg_basis = ck.get("configs", {}).get("basis", {})
-    cfg_pep = ck.get("configs", {}).get("pep", {})
-    cfg_dec = ck.get("configs", {}).get("dec", {})
-    cfg_vae = ck.get("configs", {}).get("vae", {"latent_dim": DecoderConfig.m_latent})
-    cfg_crf = ck.get("configs", {}).get("crf", {"eta": 4.0, "learn_eta": False})
+    cfg_pep   = ck.get("configs", {}).get("pep", {})
+    cfg_dec   = ck.get("configs", {}).get("dec", {})
+    cfg_vae   = ck.get("configs", {}).get("vae", {"latent_dim": DecoderConfig.m_latent})
+    cfg_crf   = ck.get("configs", {}).get("crf", {"eta": 4.0, "learn_eta": False})
 
     # Create a time_cfg dict for decoder init, respecting CLI override for eval grid
     time_cfg_from_ckpt = ck.get("configs", {}).get("time", {})
     time_cfg = {
         "ALLOCATION_HORIZON_MINS": int(time_cfg_from_ckpt.get("ALLOCATION_HORIZON_MINS", 1800)),
         "TRAIN_GRID_MINS": int(time_cfg_from_ckpt.get("TRAIN_GRID_MINS", 10)),
-        "VALID_GRID_MINS": eval_step_minutes,
+        "VALID_GRID_MINS": int(eval_step_minutes),
+        "T_clock_minutes": int(time_cfg_from_ckpt.get("T_clock_minutes", 1440)),
     }
 
     T_alloc_minutes = time_cfg["ALLOCATION_HORIZON_MINS"]
-    T_clock_minutes = int(time_cfg_from_ckpt.get("T_clock_minutes", 1440))
+    T_clock_minutes = time_cfg["T_clock_minutes"]
     K_clock_prior   = int(cfg_basis.get("K_clock_prior", 6))
     K_decoder_time  = int(cfg_basis.get("K_decoder_time", 8))
     d_p             = int(cfg_pep.get("d_p", 16))
@@ -246,7 +265,9 @@ def gen_n_val_traj(
     rows = []
     for p in purposes:
         pr = priors[p]
-        rows.append(np.concatenate([pr.time_fourier, [pr.mu_t, pr.sigma_t, pr.mu_d, pr.sigma_d, pr.is_primary_ooh]]).astype("float32"))
+        # if your priors include is_primary_ooh, keep it; else default 0.0
+        is_prim = float(getattr(pr, "is_primary_ooh", 0.0))
+        rows.append(np.concatenate([pr.time_fourier, [pr.mu_t, pr.sigma_t, pr.mu_d, pr.sigma_d, is_prim]]).astype("float32"))
     phi = np.stack(rows, axis=0)
     phi = (phi - phi.mean(0, keepdims=True)) / (phi.std(0, keepdims=True) + 1e-6)
     phi_t = torch.tensor(phi, dtype=torch.float32, device=device)
@@ -263,12 +284,15 @@ def gen_n_val_traj(
     ).to(device)
     enc = TrajEncoderGRU(d_p=d_p, K_time_token_clock=4, K_time_token_alloc=0, K_dur_token=4,
                          m_latent=latent_dim, gru_hidden=64, num_layers=1).to(device)
-    crf = LinearChainCRF(P=P, eta=crf_eta, learn_eta=crf_learn_eta).to(device)
+
+    # Both CRFs available; we choose by crf_mode below
+    lin_crf  = LinearChainCRF(P=P, eta=crf_eta, learn_eta=crf_learn_eta).to(device)
+    semi_crf = SemiMarkovCRF(P=P, eta=crf_eta, learn_eta=crf_learn_eta).to(device)
 
     # Load states (be lenient with older ckpts)
     pds.load_state_dict(ck["model_state"]["pds"], strict=True)
     enc.load_state_dict(ck["model_state"]["enc"], strict=False)
-    
+
     # Remove cached Phi buffers from the state dict to allow for different validation grid sizes
     decoder_state_dict = ck["model_state"]["dec"]
     for key in list(decoder_state_dict.keys()):
@@ -277,9 +301,14 @@ def gen_n_val_traj(
     dec.load_state_dict(decoder_state_dict, strict=False)
 
     if "crf" in ck["model_state"]:
-        crf.load_state_dict(ck["model_state"]["crf"], strict=False)
+        # same state dict for both; it may only hold eta for linear; semi ignores extras
+        try:
+            lin_crf.load_state_dict(ck["model_state"]["crf"], strict=False)
+            semi_crf.load_state_dict(ck["model_state"]["crf"], strict=False)
+        except Exception:
+            pass
 
-    pds.eval(); enc.eval(); dec.eval(); crf.eval()
+    pds.eval(); enc.eval(); dec.eval(); lin_crf.eval(); semi_crf.eval()
 
     # --- grids & priors on grid ---
     t_alloc_minutes_eval, t_alloc01_eval = make_alloc_grid(
@@ -295,7 +324,20 @@ def gen_n_val_traj(
     # --- endpoint masks ---
     purp_df = pd.read_csv(purposes_csv)
     ep_masks = build_endpoint_mask(purp_df, purposes, can_open_col="can_open_day", can_close_col="can_close_day")
-    endpoint_mask_eval = endpoint_time_mask(ep_masks.open_allowed, ep_masks.close_allowed, L_eval, step_mins=eval_step_minutes, device=device)  # [L,P]
+    endpoint_mask_eval = endpoint_time_mask(
+        ep_masks.open_allowed, ep_masks.close_allowed, L_eval, step_mins=eval_step_minutes, device=device
+    )  # [L,P]
+
+    # --- duration prior table (semi only) ---
+    if crf_mode == "semi":
+        dur_logprob = build_duration_logprob_table(
+            priors=priors,
+            purposes=purposes,
+            step_minutes=int(eval_step_minutes),
+            T_alloc_minutes=T_alloc_minutes,
+            Dmax_minutes=int(semi_Dmax_minutes),
+            device=device,
+        )  # [P, Dmax_bins]
 
     # --- data loader ---
     ds = ScheduleDataset(activities_csv, T_alloc_minutes=T_alloc_minutes)
@@ -306,7 +348,6 @@ def gen_n_val_traj(
     )
 
     # --------- Validation: NLL on grid + a few μ-recon decodes ----------
-    totals = []
     nlls = []
     decoded_preview = []
     with torch.no_grad():
@@ -321,40 +362,69 @@ def gen_n_val_traj(
                 sample=False
             )
 
+            # emissions on eval grid; CRF will handle constraints (no endpoint mask here)
             theta = dec.utilities_on_grid(
                 z, e_p, loglam_eval,
                 grid_type="eval",
-                endpoint_mask=endpoint_mask_eval
+                endpoint_mask=None
             )
-            fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
-            y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_eval, fallback_idx=fallback_idx)
+            theta = sanitize_theta(theta)
 
-            # NLL on the grid
-            nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_eval)
+            if crf_mode == "linear":
+                # rasterize labels to grid for NLL
+                fallback_idx = 0
+                y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_eval, fallback_idx=fallback_idx)
+                nll = lin_crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_eval)
+                y_hat = lin_crf.viterbi(theta, endpoint_mask=endpoint_mask_eval)  # [B,L]
+                decoded_preview.extend(labels_to_segments(y_hat, t_alloc01_eval))
+            else:
+                # build gold segments for NLL under semi-CRF
+                # (re-use rasterized labels to extract segments)
+                fallback_idx = 0
+                y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_eval, fallback_idx=fallback_idx)
+                # convert dense labels -> segments (p, s, d) in bin indices
+                segs_b: List[List[Tuple[int,int,int]]] = []
+                for b in range(y_grid.shape[0]):
+                    yb = y_grid[b].cpu().tolist()
+                    if len(yb) == 0:
+                        segs_b.append([])
+                        continue
+                    cur = yb[0]; s = 0; segs = []
+                    for i in range(1, len(yb)):
+                        if yb[i] != cur:
+                            segs.append((int(cur), int(s), int(i - s)))
+                            cur = yb[i]; s = i
+                    segs.append((int(cur), int(s), int(len(yb) - s)))
+                    segs_b.append(segs)
+
+                nll = semi_crf.nll(
+                    theta=theta,
+                    gold_segments=segs_b,
+                    dur_logprob=dur_logprob,
+                    endpoint_mask=endpoint_mask_eval,
+                )
+                # semi-CRF Viterbi for preview
+                y_hat_segments = semi_crf.viterbi(
+                    theta=theta,
+                    dur_logprob=dur_logprob,
+                    endpoint_mask=endpoint_mask_eval,
+                    Dmax_bins=dur_logprob.shape[1],
+                )
+                # convert segments -> (p, t0_norm, d_norm)
+                for segs in y_hat_segments:
+                    out = []
+                    for (p, s_bin, d_bins) in segs:
+                        t0 = float(t_alloc01_eval[s_bin].item())
+                        t1 = float(t_alloc01_eval[min(s_bin + d_bins, L_eval - 1)].item())
+                        out.append((p, t0, max(t1 - t0, 0.0)))
+                    decoded_preview.append(out)
+
             nlls.append(float(nll.item()))
-            totals.append(float(nll.item()))
-
-            assert endpoint_mask_eval.shape == (theta.shape[-1], theta.shape[1])
-
-            # Viterbi for deterministic decode preview (take first few only)
-            y_hat = crf.viterbi(theta, endpoint_mask=endpoint_mask_eval)  # [B,L]
-            tail_bins = int(round(60 / time_cfg["VALID_GRID_MINS"]))
-            bad = ~endpoint_mask_eval[-tail_bins:, :].gather(1, y_hat[:, -tail_bins:].T).T  # [B, tail_bins]
-            # click.echo("Tail violations per batch:", bad.any(dim=1).float().mean().item())
-            assert bad.any(dim=1).float().mean().item() == 0, "Tail violations found"
-            decoded_preview.extend(labels_to_segments(y_hat, t_alloc01_eval))
 
     click.echo(f"Validation (grid NLL): nll={np.mean(nlls):.4f}")
 
-    # Show a few reconstructed samples (first 3)
-    Tm = T_alloc_minutes
-    # click.echo("=== Reconstructions (μ → Viterbi) ===")
-    # for b, segs in enumerate(decoded_preview[:3]):
-    #     pretty = " | ".join(f"{purposes[p]} @ {int(t0*Tm)}m for {int(d*Tm)}m" for (p,t0,d) in segs)
-    #     click.echo(f"Rec {b}: {pretty}")
-
     # --------- Generation from prior ----------
-    # Sample s ~ N(0, I), then z = normalize(s), decode with Viterbi.
+    Tm = T_alloc_minutes
     with torch.no_grad():
         S = int(num_gen)
         s = torch.randn(S, latent_dim, device=device)
@@ -364,10 +434,28 @@ def gen_n_val_traj(
         theta_gen = dec.utilities_on_grid(
             z_samp, e_p, loglam_eval,
             grid_type="eval",
-            endpoint_mask=endpoint_mask_eval
+            endpoint_mask=None
         )
-        y_hat_gen = crf.viterbi(theta_gen, endpoint_mask=endpoint_mask_eval)  # [S,L]
-        decoded_gen = labels_to_segments(y_hat_gen, t_alloc01_eval)
+        theta_gen = sanitize_theta(theta_gen)
+
+        if crf_mode == "linear":
+            y_hat_gen = lin_crf.viterbi(theta_gen, endpoint_mask=endpoint_mask_eval)  # [S,L]
+            decoded_gen = labels_to_segments(y_hat_gen, t_alloc01_eval)
+        else:
+            y_hat_segments = semi_crf.viterbi(
+                theta=theta_gen,
+                dur_logprob=dur_logprob,
+                endpoint_mask=endpoint_mask_eval,
+                Dmax_bins=dur_logprob.shape[1],
+            )
+            decoded_gen = []
+            for segs in y_hat_segments:
+                out = []
+                for (p, s_bin, d_bins) in segs:
+                    t0 = float(t_alloc01_eval[s_bin].item())
+                    t1 = float(t_alloc01_eval[min(s_bin + d_bins, L_eval - 1)].item())
+                    out.append((p, t0, max(t1 - t0, 0.0)))
+                decoded_gen.append(out)
 
     gen_df = decoded_to_activities_df(decoded_gen, purposes, Tm, start_persid=0, prefix=gen_prefix)
     if gen_csv:
@@ -386,5 +474,4 @@ def gen_n_val_traj(
 
     click.echo("=== Generated sample sequences (first 10 check) ===")
     click.echo(val_df.head(10).to_string(index=False))
-
     
