@@ -326,8 +326,8 @@ def train_traj_embed(
             if crf_mode == "linear":
                 fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
                 y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)  # [B,L]
-                y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
-                nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train)
+                # y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
+                nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train) / max(theta.shape[-1], 1)  # normalize by length
             elif crf_mode == "semi":
                 y_segs = segments_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train)
                 nll = crf.nll(
@@ -375,8 +375,8 @@ def train_traj_embed(
                 if crf_mode == "linear":
                     fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
                     y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_eval, fallback_idx=fallback_idx)
-                    y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
-                    nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_eval)
+                    # y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
+                    nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_eval) / max(theta.shape[-1], 1)  # normalize by length
                 elif crf_mode == "semi":
                     y_segs = segments_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_eval)
                     nll = crf.nll(
