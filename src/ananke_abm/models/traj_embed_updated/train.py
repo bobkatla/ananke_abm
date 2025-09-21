@@ -227,6 +227,7 @@ def train_traj_embed(
         K_time_token_alloc=0,    # optional; set >0 to include alloc-position Fourier tokens
         K_dur_token=4,
         m_latent=vae_cfg.latent_dim,
+        bidirectional=True,
         gru_hidden=128,
         num_layers=3,
         dropout=0.2
@@ -430,7 +431,7 @@ def train_traj_embed(
                     "gru_hidden": 128,          # whatever you trained with
                     "num_layers": 3,            # whatever you trained with
                     "dropout": 0.2,
-                    "bidirectional": False,
+                    "bidirectional": True,
                     "use_token_resmlp": True,
                     "token_resmlp_hidden": 256,
                     "use_residual_gru": True,

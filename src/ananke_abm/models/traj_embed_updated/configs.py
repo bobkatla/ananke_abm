@@ -26,17 +26,17 @@ class BasisConfig:
 # ---- PURPOSE EMBEDDINGS ----
 @dataclass
 class PurposeEmbeddingConfig:
-    d_p: int = 16
+    d_p: int = 32
     hidden: int = 64
 
 
 # ---- LATENT (β-VAE) ----
 @dataclass
 class VAEConfig:
-    latent_dim: int = 16             # dim(s); z = s / ||s||
-    beta: float = 0.2                # KL weight
+    latent_dim: int = 32             # dim(s); z = s / ||s||
+    beta: float = 0.25                # KL weight
     kl_anneal_start: int = 0         # optional linear anneal (epoch)
-    kl_anneal_end:   int = 0
+    kl_anneal_end:   int = 50
 
 
 # ---- CRF DECODER (resource allocation on a grid) ----
@@ -52,6 +52,6 @@ class CRFConfig:
 @dataclass
 class DecoderConfig:
     # Keep m_latent for temporary back-compat with existing code; should match VAEConfig.latent_dim
-    m_latent: int = 16
+    m_latent: int = 32
     alpha_prior: float = 1.0         # weight for log λ_p(clock(t)) bias in utilities
 
