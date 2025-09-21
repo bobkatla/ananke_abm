@@ -282,8 +282,27 @@ def gen_n_val_traj(
         K_decoder_time=K_decoder_time, alpha_prior=dec_alpha_prior,
         time_cfg=time_cfg
     ).to(device)
-    enc = TrajEncoderGRU(d_p=d_p, K_time_token_clock=4, K_time_token_alloc=0, K_dur_token=4,
-                         m_latent=latent_dim, gru_hidden=64, num_layers=1).to(device)
+    cfgs = ck.get("configs", {})
+    enc_arch = cfgs.get("enc_arch", {})
+
+    # Fallbacks keep legacy ckpts working
+    enc_kwargs = dict(
+        d_p=enc_arch.get("d_p", d_p),
+        K_time_token_clock=enc_arch.get("K_time_token_clock", 4),
+        K_time_token_alloc=enc_arch.get("K_time_token_alloc", 0),
+        K_dur_token=enc_arch.get("K_dur_token", 4),
+        m_latent=enc_arch.get("m_latent", latent_dim),
+        gru_hidden=enc_arch.get("gru_hidden", 64),
+        num_layers=enc_arch.get("num_layers", 1),
+        dropout=enc_arch.get("dropout", 0.0),
+        bidirectional=enc_arch.get("bidirectional", False),
+        use_token_resmlp=enc_arch.get("use_token_resmlp", False),
+        token_resmlp_hidden=enc_arch.get("token_resmlp_hidden", 128),
+        use_residual_gru=enc_arch.get("use_residual_gru", True),
+        use_attn_pool=enc_arch.get("use_attn_pool", False),
+    )
+    enc = TrajEncoderGRU(**enc_kwargs).to(device)
+    enc.load_state_dict(ck["model_state"]["enc"], strict=True)  # strict=True now works
 
     # Both CRFs available; we choose by crf_mode below
     lin_crf  = LinearChainCRF(P=P, eta=crf_eta, learn_eta=crf_learn_eta).to(device)

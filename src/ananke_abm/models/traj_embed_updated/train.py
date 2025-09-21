@@ -227,8 +227,8 @@ def train_traj_embed(
         K_time_token_alloc=0,    # optional; set >0 to include alloc-position Fourier tokens
         K_dur_token=4,
         m_latent=vae_cfg.latent_dim,
-        gru_hidden=64,
-        num_layers=1,
+        gru_hidden=128,
+        num_layers=3,
         dropout=0.2
     ).to(device)
 
@@ -274,7 +274,7 @@ def train_traj_embed(
 
     # --- training loop ---
     history = {"epoch": [], "train_total": [], "val_total": [], "nll": [], "kl": []}
-    best_val_total = float("inf")
+    best_check_loss = float("inf")
 
     def beta_at_epoch(ep: int) -> float:
         if vae_cfg.kl_anneal_end and ep < vae_cfg.kl_anneal_end:
@@ -417,14 +417,15 @@ def train_traj_embed(
                 "crf": vars(CRFConfig()),
             },
         }
-        if avg_va < best_val_total:
-            best_val_total = avg_va
+        check_loss = (avg_tr + avg_va * 2) / 3  # weighted toward val
+        if check_loss < best_check_loss:
+            best_check_loss = check_loss
             torch.save(ckpt, outdir / "ckpt_best.pt")
-            click.echo(f"Best val so far: {best_val_total:.4f} at epoch {epoch}")
+            click.echo(f"Best check so far: {best_check_loss:.4f} at epoch {epoch}")
 
         if epoch == epochs:
             torch.save(ckpt, outdir / "ckpt_final.pt")
-            click.echo(f"Final val: {avg_va:.4f} (best {best_val_total:.4f})")
+            click.echo(f"Final val: {avg_va:.4f} (best {best_check_loss:.4f})")
 
     # Save history to CSV
     pd.DataFrame(history).to_csv(outdir / "history.csv", index=False)
