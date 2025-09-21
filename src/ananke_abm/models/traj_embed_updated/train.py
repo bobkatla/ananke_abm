@@ -404,7 +404,12 @@ def train_traj_embed(
         # --- checkpoint ---
         ckpt = {
             "epoch": epoch,
-            "model_state": {"pds": pds.state_dict(), "enc": enc.state_dict(), "dec": dec.state_dict(), "crf": crf.state_dict()},
+            "model_state": {
+                "pds": pds.state_dict(),
+                "enc": enc.state_dict(),
+                "dec": dec.state_dict(),
+                "crf": crf.state_dict(),
+            },
             "priors": priors,
             "purposes": purposes,
             "purpose_to_idx": {p: i for i, p in enumerate(purposes)},
@@ -415,8 +420,25 @@ def train_traj_embed(
                 "dec": vars(DecoderConfig()),
                 "vae": vars(VAEConfig()),
                 "crf": vars(CRFConfig()),
+                # NEW: persist encoder arch so validate.py can rebuild the same module
+                "enc_arch": {
+                    "d_p": PurposeEmbeddingConfig().d_p,                # or pep_cfg.d_p
+                    "K_time_token_clock": 4,
+                    "K_time_token_alloc": 0,
+                    "K_dur_token": 4,
+                    "m_latent": VAEConfig().latent_dim,
+                    "gru_hidden": 128,          # whatever you trained with
+                    "num_layers": 3,            # whatever you trained with
+                    "dropout": 0.2,
+                    "bidirectional": False,
+                    "use_token_resmlp": True,
+                    "token_resmlp_hidden": 256,
+                    "use_residual_gru": True,
+                    "use_attn_pool": True,
+                },
             },
         }
+
         check_loss = (avg_tr + avg_va * 2) / 3  # weighted toward val
         if check_loss < best_check_loss:
             best_check_loss = check_loss
