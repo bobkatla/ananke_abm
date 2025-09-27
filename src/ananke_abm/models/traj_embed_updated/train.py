@@ -29,6 +29,16 @@ from ananke_abm.models.traj_embed_updated.model.crf_semi import SemiMarkovCRF, b
 from ananke_abm.models.traj_embed_updated.model.train_masks import build_endpoint_mask, endpoint_time_mask
 
 
+# Const to avoid magic numbers
+EPS = 1e-6
+K_TIME_TOKEN_CLOCK = 4
+K_TIME_TOKEN_ALLOC = 0
+K_DUR_TOKEN = 4
+GRU_HIDDEN = 128
+NUM_LAYERS = 8
+DROPOUT = 0.2
+BIDIRECTIONAL = False
+
 # -------------------
 # utils & dataset
 # -------------------
@@ -223,14 +233,14 @@ def train_traj_embed(
 
     enc = TrajEncoderGRU(
         d_p=pep_cfg.d_p,
-        K_time_token_clock=4,
-        K_time_token_alloc=0,    # optional; set >0 to include alloc-position Fourier tokens
-        K_dur_token=4,
+        K_time_token_clock=K_TIME_TOKEN_CLOCK,
+        K_time_token_alloc=K_TIME_TOKEN_ALLOC,    # optional; set >0 to include alloc-position Fourier tokens
+        K_dur_token=K_DUR_TOKEN,
         m_latent=vae_cfg.latent_dim,
-        bidirectional=True,
-        gru_hidden=128,
-        num_layers=3,
-        dropout=0.2
+        bidirectional=BIDIRECTIONAL,
+        gru_hidden=GRU_HIDDEN,
+        num_layers=NUM_LAYERS,
+        dropout=DROPOUT
     ).to(device)
 
     if crf_mode == "linear":
@@ -415,23 +425,23 @@ def train_traj_embed(
             "purposes": purposes,
             "purpose_to_idx": {p: i for i, p in enumerate(purposes)},
             "configs": {
-                "time": vars(TimeConfig()),
-                "basis": vars(BasisConfig()),
-                "pep": vars(PurposeEmbeddingConfig()),
-                "dec": vars(DecoderConfig()),
-                "vae": vars(VAEConfig()),
-                "crf": vars(CRFConfig()),
+                "time": vars(time_cfg),
+                "basis": vars(basis_cfg),
+                "pep": vars(pep_cfg),
+                "dec": vars(dec_cfg),
+                "vae": vars(vae_cfg),
+                "crf": vars(crf_cfg),
                 # NEW: persist encoder arch so validate.py can rebuild the same module
                 "enc_arch": {
-                    "d_p": PurposeEmbeddingConfig().d_p,                # or pep_cfg.d_p
-                    "K_time_token_clock": 4,
-                    "K_time_token_alloc": 0,
-                    "K_dur_token": 4,
-                    "m_latent": VAEConfig().latent_dim,
-                    "gru_hidden": 128,          # whatever you trained with
-                    "num_layers": 3,            # whatever you trained with
-                    "dropout": 0.2,
-                    "bidirectional": True,
+                    "d_p": pep_cfg.d_p,
+                    "K_time_token_clock": K_TIME_TOKEN_CLOCK,
+                    "K_time_token_alloc": K_TIME_TOKEN_ALLOC,
+                    "K_dur_token": K_DUR_TOKEN,
+                    "m_latent": vae_cfg.latent_dim,
+                    "gru_hidden": GRU_HIDDEN,
+                    "num_layers": NUM_LAYERS,
+                    "dropout": DROPOUT,
+                    "bidirectional": BIDIRECTIONAL,
                     "use_token_resmlp": True,
                     "token_resmlp_hidden": 256,
                     "use_residual_gru": True,
