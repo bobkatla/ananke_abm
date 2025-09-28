@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Dict
 
 # ---- TIME & GRIDS ----
 @dataclass
@@ -48,10 +49,26 @@ class CRFConfig:
     semi_Dmax_minutes: int = 300   # max segment duration for semi-CRF
 
 
+# ---- ALPHA PRIOR ----
+@dataclass
+class AlphaPriorConfig:
+    # Per-purpose initial alpha; names must match the "purpose" strings from purposes.csv
+    alpha_init_per_purpose: Dict[str, float] = field(default_factory=lambda: {
+        "Home": 1.6,
+        "Work": 1.1,
+        "Education": 1.1,
+        "Shopping": 0.9,
+        "Social": 0.8,
+        "Accompanying": 0.9,
+        "Other": 0.7,
+    })
+    # L2 strength for pullback to init (phase-1 regularizer)
+    alpha_l2: float = 1e-3
+
 # ---- DECODER MISC ----
 @dataclass
 class DecoderConfig:
     # Keep m_latent for temporary back-compat with existing code; should match VAEConfig.latent_dim
     m_latent: int = 32
-    alpha_prior: float = 1.0         # weight for log λ_p(clock(t)) bias in utilities
-
+    alpha_prior: float = 1.0         # weight for log λ_p(clock(t)) bias in utilities (deprecated; use alpha_cfg instead)
+    alpha_cfg: AlphaPriorConfig = field(default_factory=AlphaPriorConfig)

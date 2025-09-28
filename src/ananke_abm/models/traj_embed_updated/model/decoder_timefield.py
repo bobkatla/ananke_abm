@@ -1,9 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
-from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid, fourier_time_features
+from ananke_abm.models.traj_embed_updated.model.utils_bases import (
+    make_alloc_grid,
+    fourier_time_features,
+)
 
 
 class TimeFieldDecoder(nn.Module):
@@ -26,6 +29,11 @@ class TimeFieldDecoder(nn.Module):
     Notes:
       - Φ_alloc is a Fourier basis over the ALLOCATION axis (not forced to be 24h periodic).
       - The 24h periodicity is injected through log λ_p(clock(t)), supplied by PDS.
+
+    Phase 1 changes:
+      - Per-purpose learnable α vector with initialization from names (idx2purpose mapping).
+      - L2 pullback regularizer: L2(α - α_init) scaled by alpha_l2.
+      - Backward-compatible: if no per-purpose init is provided, falls back to scalar alpha_prior.
     """
 
     def __init__(
@@ -36,6 +44,12 @@ class TimeFieldDecoder(nn.Module):
         K_decoder_time: int,
         alpha_prior: float = 1.0,
         time_cfg: Optional[Dict] = None,
+        # --- Phase 1 optional additions (kept optional for back-compat) ---
+        idx2purpose: Optional[List[str]] = None,
+        alpha_init_per_purpose: Optional[Dict[str, float]] = None,
+        alpha_l2: float = 1e-3,
+        alpha_clamp_min: float = -3.0,
+        alpha_clamp_max: float = 3.0,
     ):
         super().__init__()
         self.P = P
@@ -43,9 +57,7 @@ class TimeFieldDecoder(nn.Module):
         self.d_p = d_p
         self.K = K_decoder_time
 
-        # Per-purpose scale for the prior bias (learnable)
-        self.alpha_per_p = nn.Parameter(torch.ones(P) * alpha_prior)
-
+        # --- Decoder coefficient head (latent+purpose -> allocation Fourier coeffs) ---
         in_dim = m_latent + d_p
         out_dim = 1 + 2 * K_decoder_time  # DC + K cos + K sin
         self.coeff_mlp = nn.Sequential(
@@ -54,17 +66,42 @@ class TimeFieldDecoder(nn.Module):
             nn.Linear(128, out_dim),
         )
 
+        # --- Cache Fourier bases for train/eval grids (stored on CPU; moved to device at call) ---
         if time_cfg is not None:
-            # --- Caching Patch for Fourier Basis ---
-            for grid_type, step_mins in [("train", time_cfg["TRAIN_GRID_MINS"]), ("eval", time_cfg["VALID_GRID_MINS"])]:
+            for grid_type, step_mins in [
+                ("train", time_cfg["TRAIN_GRID_MINS"]),
+                ("eval",  time_cfg["VALID_GRID_MINS"]),
+            ]:
                 _, t_alloc01 = make_alloc_grid(
                     T_alloc_minutes=time_cfg["ALLOCATION_HORIZON_MINS"],
                     step_minutes=step_mins,
-                    device="cpu", # store on cpu, move to device in forward
+                    device="cpu",  # store on cpu, move to device in forward
                 )
-                basis = fourier_time_features(t_alloc01, self.K)
+                basis = fourier_time_features(t_alloc01, self.K)   # [L, 2K+1]
                 self.register_buffer(f"Phi_{grid_type}", basis)
-            # --- End Caching Patch ---
+
+        # -------------------------------------------------------------------------
+        # Phase 1: Per-purpose α with pullback to initialization
+        # -------------------------------------------------------------------------
+        # Determine initialization vector for α in purpose index order.
+        self.alpha_l2 = float(alpha_l2)
+        self._alpha_min = float(alpha_clamp_min)
+        self._alpha_max = float(alpha_clamp_max)
+
+        if (alpha_init_per_purpose is not None) and (idx2purpose is not None):
+            # Build α_init from provided map and index-to-name list
+            alpha_init_vec = torch.tensor(
+                [float(alpha_init_per_purpose.get(name, alpha_prior)) for name in idx2purpose],
+                dtype=torch.float32,
+            )
+        else:
+            # Back-compat: uniform init from scalar alpha_prior
+            alpha_init_vec = torch.full((P,), float(alpha_prior), dtype=torch.float32)
+
+        self.register_buffer("alpha_init", alpha_init_vec)         # [P], non-trainable reference
+        self.alpha = nn.Parameter(alpha_init_vec.clone())          # [P], trainable
+        # Track for logging (not used in loss directly)
+        self.register_buffer("_last_alpha_reg", torch.tensor(0.0))
 
     # ---- coefficient head ----
     def time_coeff(self, z: torch.Tensor, e_p: torch.Tensor) -> torch.Tensor:
@@ -82,12 +119,37 @@ class TimeFieldDecoder(nn.Module):
         C = self.coeff_mlp(inp)                                    # [B,P,2K+1]
         return C
 
-    # ---- NEW: grid-based unaries for CRF ----
+    # ---- Phase 1: regularizer for α ----
+    def regularization_loss(self) -> torch.Tensor:
+        """
+        L2 pullback: ||alpha - alpha_init||_2^2 scaled by alpha_l2.
+        Call from the trainer and add to total loss.
+        """
+        reg = F.mse_loss(self.alpha, self.alpha_init, reduction="sum")
+        # store for optional logging
+        self._last_alpha_reg = reg.detach()
+        return self.alpha_l2 * reg
+
+    # ---- internal: apply per-purpose α to clock prior grid ----
+    def _apply_clock_bias(self, log_lambda_clock: torch.Tensor) -> torch.Tensor:
+        """
+        log_lambda_clock: [P,L] or [B,P,L]
+        Returns α * log_lambda_clock with α broadcast over time (and batch if present).
+        """
+        alpha = torch.clamp(self.alpha, self._alpha_min, self._alpha_max)  # [P]
+        if log_lambda_clock.dim() == 2:        # [P, L]
+            return alpha[:, None] * log_lambda_clock
+        elif log_lambda_clock.dim() == 3:      # [B, P, L]
+            return alpha[None, :, None] * log_lambda_clock
+        else:
+            raise ValueError("log_lambda_clock must be [P,L] or [B,P,L]")
+
+    # ---- grid-based unaries for CRF ----
     def utilities_on_grid(
         self,
         z: torch.Tensor,                 # [B, m]
         e_p: torch.Tensor,               # [P, d_p]
-        loglam_alloc: torch.Tensor,      # [P, L] log λ_p(clock(t)) evaluated on this grid
+        loglam_alloc: torch.Tensor,      # [P, L] or [B, P, L] log λ_p(clock(t)) evaluated on this grid
         grid_type: str = "train",        # "train" or "eval"
         endpoint_mask: Optional[torch.Tensor] = None,  # [L, P] bool; only first/last rows matter
         neg_large: float = -1e4,
@@ -98,15 +160,18 @@ class TimeFieldDecoder(nn.Module):
         Returns:
             theta: [B, P, L] log-unaries (no softmax)
         """
-        Phi = getattr(self, f"Phi_{grid_type}").to(z.device)
+        Phi = getattr(self, f"Phi_{grid_type}").to(z.device)       # [L, 2K+1]
         L = Phi.shape[0]
 
         C = self.time_coeff(z, e_p)                                # [B,P,2K+1]
-        # u = C · Φ^T
-        theta = torch.einsum("bpk,lk->bpl", C, Phi)                # [B,P,L]
+        theta_latent = torch.einsum("bpk,lk->bpl", C, Phi)         # [B,P,L]
 
-        # add prior bias (broadcast over batch)
-        theta = theta + self.alpha_per_p.view(1, -1, 1) * loglam_alloc.unsqueeze(0)  # [B,P,L]
+        # add prior bias (broadcast over batch or already [B,P,L])
+        clock_bias = self._apply_clock_bias(loglam_alloc)          # [B,P,L] or [P,L]
+        if clock_bias.dim() == 2:                                  # [P,L] -> [B,P,L]
+            clock_bias = clock_bias.unsqueeze(0).expand_as(theta_latent)
+
+        theta = theta_latent + clock_bias                          # [B,P,L]
 
         # unified endpoint constraint (apply only at first/last positions)
         if endpoint_mask is not None:
@@ -148,9 +213,12 @@ class TimeFieldDecoder(nn.Module):
 
         C = self.time_coeff(z, e_p)                                # [B,P,2K+1]
         u = torch.matmul(C, Phi.T)                                 # [B,P,Q]
-        u = u + self.alpha_per_p.view(1, -1, 1) * log_lambda_p_t.unsqueeze(0)
 
-        # Legacy endpoint logic (separate open/close/home). Prefer unified mask in CRF path.
+        # per-purpose α on arbitrary nodes
+        alpha = torch.clamp(self.alpha, self._alpha_min, self._alpha_max)  # [P]
+        u = u + alpha.view(1, -1, 1) * log_lambda_p_t.unsqueeze(0)
+
+        # Legacy endpoint logic (prefer CRF path)
         if masks is not None:
             big_neg = -1e9
             big_pos = 1e9
@@ -189,7 +257,7 @@ class TimeFieldDecoder(nn.Module):
         q: torch.Tensor,           # [B,P,Q]
         y: torch.Tensor,           # [B,P,Q]
         w: torch.Tensor,           # [Q]
-        class_weights: torch.Tensor | None = None,   # [P]
+        class_weights: Optional[torch.Tensor] = None,   # [P]
     ):
         """Deprecated: time-integrated cross-entropy with quadrature weights."""
         eps = 1e-8

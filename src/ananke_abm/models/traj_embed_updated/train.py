@@ -143,6 +143,21 @@ def train_traj_embed(
     acts = pd.read_csv(activities_csv)
     purp = pd.read_csv(purposes_csv)
     purposes = purp["purpose"].tolist()
+    # Purpose index order used everywhere (decoder alpha will align to this)
+    idx2purpose = purposes[:]  # keep the same order
+
+    # Phase 1: per-purpose alpha initial values and L2 strength
+    alpha_init_per_purpose = {
+        "Home": 1.6,
+        "Work": 1.1,
+        "Education": 1.1,
+        "Shopping": 0.9,
+        "Social": 0.8,
+        "Accompanying": 0.9,
+        "Other": 0.7,
+    }
+    alpha_l2_strength = 1e-3
+
     priors = derive_priors_from_activities(
         acts,
         purp,
@@ -227,8 +242,12 @@ def train_traj_embed(
         m_latent=vae_cfg.latent_dim,
         d_p=pep_cfg.d_p,
         K_decoder_time=basis_cfg.K_decoder_time,
-        alpha_prior=dec_cfg.alpha_prior,
+        alpha_prior=dec_cfg.alpha_prior,     # kept for back-compat fallback
         time_cfg=vars(time_cfg),
+        # --- Phase 1 additions ---
+        idx2purpose=idx2purpose,
+        alpha_init_per_purpose=alpha_init_per_purpose,
+        alpha_l2=alpha_l2_strength,
     ).to(device)
 
     enc = TrajEncoderGRU(
@@ -350,6 +369,8 @@ def train_traj_embed(
 
             kl  = kl_gaussian_standard(mu, logvar, reduction="mean")
             loss = nll + beta_weight * kl
+            # Phase 1: add L2 pullback on per-purpose alpha
+            loss = loss + dec.regularization_loss()
 
             # step
             opt.zero_grad(set_to_none=True)
@@ -399,12 +420,18 @@ def train_traj_embed(
                 
                 kl  = kl_gaussian_standard(mu, logvar, reduction="mean")
                 loss = nll + beta_weight * kl
+                loss = loss + dec.regularization_loss()
                 total_va += float(loss.item()); nll_va += float(nll.item()); kl_va += float(kl.item()); n_batches_val += 1
 
         avg_tr = total_tr / max(n_batches_train, 1)
         avg_va = total_va / max(n_batches_val, 1)
         if epoch % 10 == 0 or epoch == epochs:
             click.echo(f"[{epoch:03d}] train={avg_tr:.4f}  val={avg_va:.4f}  (nll={nll_va/max(n_batches_val,1):.4f}, kl={kl_va/max(n_batches_val,1):.4f}, beta={beta_weight:.3f})")
+            with torch.no_grad():
+                a = dec.alpha.detach().cpu().tolist()
+                alpha_log = {p: round(a[i], 3) for i, p in enumerate(idx2purpose)}
+            click.echo(f"alpha per-purpose: {alpha_log}")
+
 
         history["epoch"].append(epoch)
         history["train_total"].append(avg_tr)
