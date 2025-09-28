@@ -13,9 +13,11 @@ import torch
 @option("-gp", "--gen_prefix", type=str, default="gen")
 @option("-gc", "--gen_csv", type=str, default=None)
 @option("-vc", "--val_csv", type=str, default=None)
+@option("-sj", "--summary_json", type=str, required=True)
+@option("-us", "--use_samples", type=str, default=None, help="If provided, evaluate this synthetic CSV instead of decoding")
 @option("-es", "--eval_step_minutes", type=int, default=5)
 @option("-d", "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-def gval_traj(ckpt, activities_csv, purposes_csv, crf_mode, batch_size, num_gen, gen_prefix, gen_csv, val_csv, eval_step_minutes, device):
+def gval_traj(ckpt, activities_csv, purposes_csv, crf_mode, batch_size, num_gen, gen_prefix, gen_csv, val_csv, summary_json, use_samples, eval_step_minutes, device):
     crf_config = CRFConfig()
     gen_n_val_traj(ckpt,
                    activities_csv,
@@ -29,4 +31,6 @@ def gval_traj(ckpt, activities_csv, purposes_csv, crf_mode, batch_size, num_gen,
                    device,
                    crf_mode=crf_mode,
                    semi_Dmax_minutes=getattr(crf_config, "semi_Dmax_minutes", 300),
+                   summary_json=summary_json,
+                   use_samples=use_samples,
                    )

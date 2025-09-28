@@ -20,7 +20,8 @@ uv run ananke gval-traj \
 --gen_csv "src\output\traj_embed\inference\small_linear\gen_activities.csv" \
 --val_csv "src\output\traj_embed\inference\small_linear\gen_validation.csv" \
 --eval_step_minutes 5 \
---crf_mode "linear"
+--crf_mode "linear" \
+--summary_json "src\output\traj_embed\inference\small_linear\summary.json"
 
 uv run ananke visualize-combined-traj \
 --traj_csv "src\output\traj_embed\inference\small_linear\gen_activities.csv" \

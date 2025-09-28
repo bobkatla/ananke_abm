@@ -1,11 +1,14 @@
 # ananke_abm/models/traj_embed_updated/validate.py
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
+import os
+import tempfile
 
 import numpy as np
 import pandas as pd
 import torch
 import click
+import json
 
 # --- configs & model pieces ---
 from ananke_abm.models.traj_embed_updated.configs import DecoderConfig
@@ -19,21 +22,12 @@ from ananke_abm.models.traj_embed_updated.model.crf_semi import (
     SemiMarkovCRF, build_duration_logprob_table
 )
 from ananke_abm.models.traj_embed_updated.model.train_masks import build_endpoint_mask, endpoint_time_mask
+from ananke_abm.models.traj_embed_updated.eval_utils import (
+    activities_csv_to_segments,
+    summarize as summarize_metrics,
+)
+from ananke_abm.models.traj_embed_updated.synthesize import synthesize, set_seed, sanitize_theta
 
-
-# -------------------
-# Small utilities
-# -------------------
-def set_seed(seed: int = 42):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-
-def sanitize_theta(theta: torch.Tensor) -> torch.Tensor:
-    """Numerically stabilizes CRF emissions (shift-invariant)."""
-    theta_max = torch.max(theta, dim=1, keepdim=True).values
-    theta_stable = theta - theta_max
-    return torch.clamp(theta_stable, min=-30.0, max=30.0)
 
 
 class ScheduleDataset(torch.utils.data.Dataset):
@@ -214,6 +208,8 @@ def gen_n_val_traj(
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     crf_mode: str = "linear",        # "linear" | "semi"
     semi_Dmax_minutes: int = 300,    # only used when crf_mode="semi"
+    summary_json: Optional[str] = None,
+    use_samples: Optional[str] = None,
 ):
     """
     Validate & generate using the trained model.
@@ -228,6 +224,33 @@ def gen_n_val_traj(
     set_seed(42)
 
     device = torch.device(device)
+
+    # If evaluating pre-generated samples, short-circuit heavy model setup
+    if use_samples:
+        click.echo("Using pre-generated samples for evaluation (skipping model decode).")
+        gen_df = pd.read_csv(use_samples)
+
+        # Per-trajectory validation on provided samples
+        full_seqs, bigrams = build_truth_sets(activities_csv)
+        home_label = "Home"
+        val_df = validate_sequences(gen_df, full_seqs, bigrams, home_label=home_label)
+        if val_csv:
+            Path(val_csv).parent.mkdir(parents=True, exist_ok=True)
+            val_df.to_csv(val_csv, index=False)
+            click.echo(f"Wrote per-trajectory validation to: {val_csv}")
+
+        # Summary JSON
+        real_segments = activities_csv_to_segments(activities_csv)
+        syn_segments = activities_csv_to_segments(use_samples)
+        # Determine purposes from union of both sets
+        purposes: List[str] = sorted({s["purpose"] for person in (real_segments + syn_segments) for s in person})
+        summary = summarize_metrics(real_segments, syn_segments, purposes, step_minutes=int(eval_step_minutes))
+        if summary_json:
+            Path(summary_json).parent.mkdir(parents=True, exist_ok=True)
+            with open(summary_json, "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
+            click.echo(f"Wrote summary JSON to: {summary_json}")
+        return
 
     # --- load checkpoint & configs (with robust fallbacks) ---
     ck = torch.load(ckpt, map_location=device, weights_only=False)
@@ -327,7 +350,11 @@ def gen_n_val_traj(
         except Exception:
             pass
 
-    pds.eval(); enc.eval(); dec.eval(); lin_crf.eval(); semi_crf.eval()
+    pds.eval()
+    enc.eval()
+    dec.eval()
+    lin_crf.eval()
+    semi_crf.eval()
 
     # --- grids & priors on grid ---
     t_alloc_minutes_eval, t_alloc01_eval = make_alloc_grid(
@@ -372,7 +399,9 @@ def gen_n_val_traj(
     with torch.no_grad():
         e_p = pds()
         for p_pad, t_pad, d_pad, lengths in dl:
-            p_pad = p_pad.to(device); t_pad = t_pad.to(device); d_pad = d_pad.to(device)
+            p_pad = p_pad.to(device)
+            t_pad = t_pad.to(device)
+            d_pad = d_pad.to(device)
 
             # encode with μ (deterministic at validation preview)
             z, s, mu, logvar = enc(
@@ -408,11 +437,14 @@ def gen_n_val_traj(
                     if len(yb) == 0:
                         segs_b.append([])
                         continue
-                    cur = yb[0]; s = 0; segs = []
+                    cur = yb[0]
+                    s = 0
+                    segs = []
                     for i in range(1, len(yb)):
                         if yb[i] != cur:
                             segs.append((int(cur), int(s), int(i - s)))
-                            cur = yb[i]; s = i
+                            cur = yb[i]
+                            s = i
                     segs.append((int(cur), int(s), int(len(yb) - s)))
                     segs_b.append(segs)
 
@@ -442,45 +474,35 @@ def gen_n_val_traj(
 
     click.echo(f"Validation (grid NLL): nll={np.mean(nlls):.4f}")
 
-    # --------- Generation from prior ----------
-    Tm = T_alloc_minutes
-    with torch.no_grad():
-        S = int(num_gen)
-        s = torch.randn(S, latent_dim, device=device)
-        z_samp = s / (s.norm(dim=-1, keepdim=True) + 1e-8)
+    # --------- Synthesize (via helper) ----------
+    # Use the shared synthesize() to generate samples. If no gen_csv provided, write to a temp file.
+    tmp_path = None
+    out_csv = gen_csv
+    if out_csv is None or len(str(out_csv)) == 0:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+        tmp_path = tmp.name
+        tmp.close()
+        out_csv = tmp_path
 
-        e_p = pds()
-        theta_gen = dec.utilities_on_grid(
-            z_samp, e_p, loglam_eval,
-            grid_type="eval",
-            endpoint_mask=None
-        )
-        theta_gen = sanitize_theta(theta_gen)
+    synthesize(
+        ckpt=ckpt,
+        purposes_csv=purposes_csv,
+        activities_csv=activities_csv,
+        num_gen=num_gen,
+        batch_size=batch_size,
+        eval_step_minutes=eval_step_minutes,
+        crf_mode=crf_mode,
+        gen_csv=out_csv,
+        seed=42,
+        device=str(device),
+    )
 
-        if crf_mode == "linear":
-            y_hat_gen = lin_crf.viterbi(theta_gen, endpoint_mask=endpoint_mask_eval)  # [S,L]
-            decoded_gen = labels_to_segments(y_hat_gen, t_alloc01_eval)
-        else:
-            y_hat_segments = semi_crf.viterbi(
-                theta=theta_gen,
-                dur_logprob=dur_logprob,
-                endpoint_mask=endpoint_mask_eval,
-                Dmax_bins=dur_logprob.shape[1],
-            )
-            decoded_gen = []
-            for segs in y_hat_segments:
-                out = []
-                for (p, s_bin, d_bins) in segs:
-                    t0 = float(t_alloc01_eval[s_bin].item())
-                    t1 = float(t_alloc01_eval[min(s_bin + d_bins, L_eval - 1)].item())
-                    out.append((p, t0, max(t1 - t0, 0.0)))
-                decoded_gen.append(out)
-
-    gen_df = decoded_to_activities_df(decoded_gen, purposes, Tm, start_persid=0, prefix=gen_prefix)
-    if gen_csv:
-        Path(gen_csv).parent.mkdir(parents=True, exist_ok=True)
-        gen_df.to_csv(gen_csv, index=False)
-        click.echo(f"Wrote generated activities to: {gen_csv}")
+    gen_df = pd.read_csv(out_csv)
+    if tmp_path is not None:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
     # --------- Per-trajectory validation on generated CSV ----------
     full_seqs, bigrams = build_truth_sets(activities_csv)
@@ -493,3 +515,24 @@ def gen_n_val_traj(
 
     click.echo("=== Generated sample sequences (first 10 check) ===")
     click.echo(val_df.head(10).to_string(index=False))
+
+    # --------- Summary JSON ----------
+    real_segments = activities_csv_to_segments(activities_csv)
+    # Convert in-memory gen_df into segments list
+    syn_segments = []
+    for _, g in gen_df.sort_values(["persid", "stopno"]).groupby("persid"):
+        person = []
+        for _i, r in g.iterrows():
+            person.append({
+                "purpose": str(r["purpose"]),
+                "startime": int(r["startime"]),
+                "total_duration": int(r["total_duration"]),
+            })
+        syn_segments.append(person)
+
+    summary = summarize_metrics(real_segments, syn_segments, purposes, step_minutes=int(eval_step_minutes))
+    if summary_json:
+        Path(summary_json).parent.mkdir(parents=True, exist_ok=True)
+        with open(summary_json, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        click.echo(f"Wrote summary JSON to: {summary_json}")
