@@ -11,29 +11,11 @@ from ananke_abm.models.traj_embed_updated.model.utils_bases import (
 
 class TimeFieldDecoder(nn.Module):
     """
-    Continuous time-field decoder.
+    Time-field decoder:
+      u_p(t; z) = C_p(z, e_p) · Φ_alloc(t) + α_p * log λ_p(clock(t)) + masks
 
-    Core idea:
-        u_p(t; z) = C_p(z, e_p) · Φ_alloc(t)  +  α_p * log λ_p(clock(t))  + masks
-
-    Two usage modes:
-      1) Grid-based unaries for CRF (preferred in new pipeline):
-           theta = utilities_on_grid(z, e_p, loglam_alloc, grid_type="train")
-         where:
-           - loglam_alloc: precomputed log λ_p(clock(t)) on the specified grid, shape [P, L]
-           - grid_type: "train" or "eval" to select the precomputed basis
-
-      2) Legacy continuous nodes (kept for back-compat and previews):
-           u = utilities(z, e_p, t_nodes01, log_lambda_p_t, masks=None, Phi=None)
-
-    Notes:
-      - Φ_alloc is a Fourier basis over the ALLOCATION axis (not forced to be 24h periodic).
-      - The 24h periodicity is injected through log λ_p(clock(t)), supplied by PDS.
-
-    Phase 1 changes:
-      - Per-purpose learnable α vector with initialization from names (idx2purpose mapping).
-      - L2 pullback regularizer: L2(α - α_init) scaled by alpha_l2.
-      - Backward-compatible: if no per-purpose init is provided, falls back to scalar alpha_prior.
+    Phase 1: per-purpose α with L2 pullback to init.
+    Phase 3: L2 on latent allocation-Fourier coefficients (prefer prior for shape).
     """
 
     def __init__(
@@ -44,12 +26,16 @@ class TimeFieldDecoder(nn.Module):
         K_decoder_time: int,
         alpha_prior: float = 1.0,
         time_cfg: Optional[Dict] = None,
-        # --- Phase 1 optional additions (kept optional for back-compat) ---
+        *,
+        # Phase 1
         idx2purpose: Optional[List[str]] = None,
         alpha_init_per_purpose: Optional[Dict[str, float]] = None,
         alpha_l2: float = 1e-3,
         alpha_clamp_min: float = -3.0,
         alpha_clamp_max: float = 3.0,
+        # Phase 3
+        coeff_l2_global: float = 0.0,
+        coeff_l2_per_purpose: Optional[Dict[str, float]] = None,
     ):
         super().__init__()
         self.P = P
@@ -57,7 +43,7 @@ class TimeFieldDecoder(nn.Module):
         self.d_p = d_p
         self.K = K_decoder_time
 
-        # --- Decoder coefficient head (latent+purpose -> allocation Fourier coeffs) ---
+        # ----- coefficient head (latent + purpose -> allocation Fourier coeffs) -----
         in_dim = m_latent + d_p
         out_dim = 1 + 2 * K_decoder_time  # DC + K cos + K sin
         self.coeff_mlp = nn.Sequential(
@@ -66,7 +52,7 @@ class TimeFieldDecoder(nn.Module):
             nn.Linear(128, out_dim),
         )
 
-        # --- Cache Fourier bases for train/eval grids (stored on CPU; moved to device at call) ---
+        # ----- cache Fourier bases for train/eval grids -----
         if time_cfg is not None:
             for grid_type, step_mins in [
                 ("train", time_cfg["TRAIN_GRID_MINS"]),
@@ -75,33 +61,47 @@ class TimeFieldDecoder(nn.Module):
                 _, t_alloc01 = make_alloc_grid(
                     T_alloc_minutes=time_cfg["ALLOCATION_HORIZON_MINS"],
                     step_minutes=step_mins,
-                    device="cpu",  # store on cpu, move to device in forward
+                    device="cpu",
                 )
                 basis = fourier_time_features(t_alloc01, self.K)   # [L, 2K+1]
                 self.register_buffer(f"Phi_{grid_type}", basis)
 
         # -------------------------------------------------------------------------
-        # Phase 1: Per-purpose α with pullback to initialization
+        # Phase 1: per-purpose α with pullback to initialization
         # -------------------------------------------------------------------------
-        # Determine initialization vector for α in purpose index order.
         self.alpha_l2 = float(alpha_l2)
         self._alpha_min = float(alpha_clamp_min)
         self._alpha_max = float(alpha_clamp_max)
 
         if (alpha_init_per_purpose is not None) and (idx2purpose is not None):
-            # Build α_init from provided map and index-to-name list
             alpha_init_vec = torch.tensor(
                 [float(alpha_init_per_purpose.get(name, alpha_prior)) for name in idx2purpose],
                 dtype=torch.float32,
             )
         else:
-            # Back-compat: uniform init from scalar alpha_prior
             alpha_init_vec = torch.full((P,), float(alpha_prior), dtype=torch.float32)
 
-        self.register_buffer("alpha_init", alpha_init_vec)         # [P], non-trainable reference
+        self.register_buffer("alpha_init", alpha_init_vec)         # [P], non-trainable
         self.alpha = nn.Parameter(alpha_init_vec.clone())          # [P], trainable
-        # Track for logging (not used in loss directly)
+
+        # -------------------------------------------------------------------------
+        # Phase 3: coefficient L2 regularization
+        # -------------------------------------------------------------------------
+        # Build per-purpose weights for coeff L2 (default = coeff_l2_global)
+        if coeff_l2_per_purpose is not None and idx2purpose is not None:
+            coeff_w = torch.tensor(
+                [float(coeff_l2_per_purpose.get(name, coeff_l2_global)) for name in idx2purpose],
+                dtype=torch.float32,
+            )
+        else:
+            coeff_w = torch.full((P,), float(coeff_l2_global), dtype=torch.float32)
+
+        self.register_buffer("coeff_l2_per_p", coeff_w)            # [P], non-trainable
+        # Stash last reg terms for logging
         self.register_buffer("_last_alpha_reg", torch.tensor(0.0))
+        self.register_buffer("_last_coeff_reg", torch.tensor(0.0))
+        # Pending coeff reg tensor for current forward (consumed by regularization_loss)
+        self._pending_coeff_reg: Optional[torch.Tensor] = None
 
     # ---- coefficient head ----
     def time_coeff(self, z: torch.Tensor, e_p: torch.Tensor) -> torch.Tensor:
@@ -110,7 +110,7 @@ class TimeFieldDecoder(nn.Module):
             z:  [B, m]
             e_p:[P, d_p]
         Returns:
-            C:  [B, P, 2K+1] time-basis coefficients per purpose
+            C:  [B, P, 2K+1] allocation time-basis coefficients per purpose
         """
         B = z.shape[0]
         z_tiled = z.unsqueeze(1).expand(B, self.P, self.m)         # [B,P,m]
@@ -120,21 +120,27 @@ class TimeFieldDecoder(nn.Module):
         return C
 
     # ---- Phase 1: regularizer for α ----
-    def regularization_loss(self) -> torch.Tensor:
-        """
-        L2 pullback: ||alpha - alpha_init||_2^2 scaled by alpha_l2.
-        Call from the trainer and add to total loss.
-        """
+    def _alpha_pullback(self) -> torch.Tensor:
         reg = F.mse_loss(self.alpha, self.alpha_init, reduction="sum")
-        # store for optional logging
         self._last_alpha_reg = reg.detach()
         return self.alpha_l2 * reg
+
+    def regularization_loss(self) -> torch.Tensor:
+        """
+        Returns Phase-1 alpha pullback + Phase-3 coeff L2 (if a batch computed it).
+        Call this AFTER a forward that computed utilities_on_grid (sets _pending_coeff_reg).
+        """
+        reg = self._alpha_pullback()
+        if self._pending_coeff_reg is not None:
+            reg = reg + self._pending_coeff_reg
+            # clear after consumption to avoid accidental reuse
+            self._pending_coeff_reg = None
+        return reg
 
     # ---- internal: apply per-purpose α to clock prior grid ----
     def _apply_clock_bias(self, log_lambda_clock: torch.Tensor) -> torch.Tensor:
         """
-        log_lambda_clock: [P,L] or [B,P,L]
-        Returns α * log_lambda_clock with α broadcast over time (and batch if present).
+        log_lambda_clock: [P,L] or [B,P,L] -> returns α * log_lambda_clock
         """
         alpha = torch.clamp(self.alpha, self._alpha_min, self._alpha_max)  # [P]
         if log_lambda_clock.dim() == 2:        # [P, L]
@@ -149,14 +155,13 @@ class TimeFieldDecoder(nn.Module):
         self,
         z: torch.Tensor,                 # [B, m]
         e_p: torch.Tensor,               # [P, d_p]
-        loglam_alloc: torch.Tensor,      # [P, L] or [B, P, L] log λ_p(clock(t)) evaluated on this grid
+        loglam_alloc: torch.Tensor,      # [P, L] or [B, P, L] log λ_p(clock(t)) on this grid
         grid_type: str = "train",        # "train" or "eval"
         endpoint_mask: Optional[torch.Tensor] = None,  # [L, P] bool; only first/last rows matter
         neg_large: float = -1e4,
     ) -> torch.Tensor:
         """
         Produce unaries θ for CRF on a uniform allocation grid.
-
         Returns:
             theta: [B, P, L] log-unaries (no softmax)
         """
@@ -166,11 +171,18 @@ class TimeFieldDecoder(nn.Module):
         C = self.time_coeff(z, e_p)                                # [B,P,2K+1]
         theta_latent = torch.einsum("bpk,lk->bpl", C, Phi)         # [B,P,L]
 
-        # add prior bias (broadcast over batch or already [B,P,L])
-        clock_bias = self._apply_clock_bias(loglam_alloc)          # [B,P,L] or [P,L]
-        if clock_bias.dim() == 2:                                  # [P,L] -> [B,P,L]
-            clock_bias = clock_bias.unsqueeze(0).expand_as(theta_latent)
+        # Phase 3: compute coeff L2 reg for this batch (exclude DC term to avoid biasing level)
+        # per-purpose penalty = mean_{B,K} (C[...,1:]^2)  * coeff_l2_per_p[p]
+        C_no_dc = C[..., 1:]                                       # [B,P,2K]
+        per_p_mean = (C_no_dc ** 2).mean(dim=(0, 2))               # [P]
+        coeff_reg = (per_p_mean * self.coeff_l2_per_p).sum()       # scalar
+        self._pending_coeff_reg = coeff_reg
+        self._last_coeff_reg = coeff_reg.detach()
 
+        # add clock prior bias (broadcast)
+        clock_bias = self._apply_clock_bias(loglam_alloc)          # [B,P,L] or [P,L]
+        if clock_bias.dim() == 2:
+            clock_bias = clock_bias.unsqueeze(0).expand_as(theta_latent)
         theta = theta_latent + clock_bias                          # [B,P,L]
 
         # unified endpoint constraint (apply only at first/last positions)
@@ -186,26 +198,16 @@ class TimeFieldDecoder(nn.Module):
 
         return theta
 
-    # ---- LEGACY: arbitrary nodes path (kept for back-compat / previews) ----
+    # ---- LEGACY path kept intact (unchanged below) ----
     def utilities(
         self,
-        z: torch.Tensor,                     # [B,m]
-        e_p: torch.Tensor,                   # [P,d_p]
-        t: torch.Tensor,                     # [Q] normalized nodes in [0,1] (allocation axis)
-        log_lambda_p_t: torch.Tensor,        # [P,Q] prior log-densities at these nodes
+        z: torch.Tensor,
+        e_p: torch.Tensor,
+        t: torch.Tensor,
+        log_lambda_p_t: torch.Tensor,
         masks: Optional[Dict[str, torch.Tensor]] = None,
         Phi: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Compute utilities u_p(t; z) on arbitrary (normalized) nodes.
-        NOTE: This is DEPRECATED for training; prefer `utilities_on_grid` for CRF.
-
-        Legacy masks supported keys (will be removed):
-          - 'open_allowed'    : [P] bool (allowed at t=0)
-          - 'close_allowed'   : [P] bool (allowed at t=1)
-          - 'home_idx'        : int (force Home at t=0)
-          - 'home_idx_end'    : int (force Home at t=1)
-        """
         if Phi is None:
             Phi = fourier_time_features(t, self.K)                 # [Q, 2K+1]
         else:
@@ -214,11 +216,9 @@ class TimeFieldDecoder(nn.Module):
         C = self.time_coeff(z, e_p)                                # [B,P,2K+1]
         u = torch.matmul(C, Phi.T)                                 # [B,P,Q]
 
-        # per-purpose α on arbitrary nodes
-        alpha = torch.clamp(self.alpha, self._alpha_min, self._alpha_max)  # [P]
+        alpha = torch.clamp(self.alpha, self._alpha_min, self._alpha_max)
         u = u + alpha.view(1, -1, 1) * log_lambda_p_t.unsqueeze(0)
 
-        # Legacy endpoint logic (prefer CRF path)
         if masks is not None:
             big_neg = -1e9
             big_pos = 1e9
@@ -240,26 +240,18 @@ class TimeFieldDecoder(nn.Module):
                 u[:, idx, -1] = big_pos
         return u
 
-    # ---- Back-compat helpers (not used in CRF training) ----
-    def soft_assign(self, u: torch.Tensor):
-        """Softmax over purposes: (B,P,Q) -> (B,P,Q)."""
+    @staticmethod
+    def soft_assign(u: torch.Tensor):
         return F.softmax(u, dim=1)
 
     @staticmethod
     def tv_loss(q: torch.Tensor, w: torch.Tensor):
-        """Total-variation surrogate along time: sum_p Σ |Δ q_p|."""
-        diff = q[:, :, 1:] - q[:, :, :-1]     # [B,P,Q-1]
-        tv = diff.abs().sum(dim=(1, 2))       # [B]
+        diff = q[:, :, 1:] - q[:, :, :-1]
+        tv = diff.abs().sum(dim=(1, 2))
         return tv.mean()
 
     @staticmethod
-    def ce_loss(
-        q: torch.Tensor,           # [B,P,Q]
-        y: torch.Tensor,           # [B,P,Q]
-        w: torch.Tensor,           # [Q]
-        class_weights: Optional[torch.Tensor] = None,   # [P]
-    ):
-        """Deprecated: time-integrated cross-entropy with quadrature weights."""
+    def ce_loss(q: torch.Tensor, y: torch.Tensor, w: torch.Tensor, class_weights: Optional[torch.Tensor] = None):
         eps = 1e-8
         logq = torch.log(q + eps)
         ce = -(y * logq)
@@ -270,7 +262,6 @@ class TimeFieldDecoder(nn.Module):
 
     @staticmethod
     def emd1d_loss(q: torch.Tensor, y: torch.Tensor, w: torch.Tensor):
-        """Deprecated: 1D Wasserstein-1 between time distributions per purpose."""
         qw = q * w.view(1, 1, -1)
         yw = y * w.view(1, 1, -1)
         qsum = qw.sum(dim=-1, keepdim=True) + 1e-8
@@ -284,10 +275,9 @@ class TimeFieldDecoder(nn.Module):
 
     @staticmethod
     def durlen_loss(q: torch.Tensor, mu_d: torch.Tensor, sigma_d: torch.Tensor, w: torch.Tensor):
-        """Deprecated: duration-length surrogate using TV."""
         qw = q * w.view(1, 1, -1)
-        M = qw.sum(dim=-1)                               # [B,P]
-        TV = (q[:, :, 1:] - q[:, :, :-1]).abs().sum(dim=-1)  # [B,P]
+        M = qw.sum(dim=-1)
+        TV = (q[:, :, 1:] - q[:, :, :-1]).abs().sum(dim=-1)
         barL = M / torch.clamp(TV / 2.0, min=1e-6)
         mu = mu_d.view(1, -1)
         sig2 = (sigma_d.view(1, -1) ** 2 + 1e-6)
@@ -296,12 +286,8 @@ class TimeFieldDecoder(nn.Module):
 
     @staticmethod
     def argmax_decode(u: torch.Tensor, t_dense: torch.Tensor):
-        """
-        Deterministic decoding on a dense grid (legacy argmax).
-        Returns list of length B; each element is a list of (p_idx, t0, d).
-        """
-        q = torch.softmax(u, dim=1)           # [B,P,L]
-        p_star = q.argmax(dim=1)              # [B,L]
+        q = torch.softmax(u, dim=1)
+        p_star = q.argmax(dim=1)
         B, L = p_star.shape
         out = []
         for b in range(B):

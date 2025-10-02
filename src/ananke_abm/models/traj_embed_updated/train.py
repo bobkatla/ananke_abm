@@ -244,12 +244,15 @@ def train_traj_embed(
         m_latent=vae_cfg.latent_dim,
         d_p=pep_cfg.d_p,
         K_decoder_time=basis_cfg.K_decoder_time,
-        alpha_prior=dec_cfg.alpha_prior,     # kept for back-compat fallback
+        alpha_prior=dec_cfg.alpha_prior,   # fallback for alpha init if per-purpose not supplied
         time_cfg=vars(time_cfg),
-        # --- Phase 1 additions ---
+        # Phase 1
         idx2purpose=idx2purpose,
         alpha_init_per_purpose=alpha_init_per_purpose,
         alpha_l2=alpha_l2_strength,
+        # Phase 3
+        coeff_l2_global=dec_cfg.reg_cfg.coeff_l2_global,
+        coeff_l2_per_purpose=dec_cfg.reg_cfg.coeff_l2_per_purpose,
     ).to(device)
 
     enc = TrajEncoderGRU(
