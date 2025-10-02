@@ -17,6 +17,7 @@ from ananke_abm.models.traj_embed_updated.configs import (
     DecoderConfig,
     VAEConfig,
     CRFConfig,
+    LossBalanceConfig,
 )
 from ananke_abm.models.traj_embed_updated.model.pds_loader import derive_priors_from_activities
 from ananke_abm.models.traj_embed_updated.model.purpose_space import PurposeDistributionSpace
@@ -138,6 +139,7 @@ def train_traj_embed(
     dec_cfg   = DecoderConfig()
     vae_cfg   = VAEConfig()
     crf_cfg   = CRFConfig()
+    loss_cfg  = LossBalanceConfig()
 
     # --- data & priors (24h clock prior; durations by allocation) ---
     acts = pd.read_csv(activities_csv)
@@ -288,6 +290,10 @@ def train_traj_embed(
     va_subset = torch.utils.data.Subset(ds, va_idx)
 
     purpose_to_idx = {p: i for i, p in enumerate(purposes)}
+    loss_w_vec = torch.tensor(
+        [float(loss_cfg.loss_weights_per_purpose.get(p, 1.0)) for p in purposes],
+        dtype=torch.float32, device=device
+    )  # [P]
 
     def loader(subset, shuffle):
         return torch.utils.data.DataLoader(
@@ -358,6 +364,13 @@ def train_traj_embed(
                 y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)  # [B,L]
                 # y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
                 nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train) / max(theta.shape[-1], 1)  # normalize by length
+                # ---- Phase 2: class-balanced scaling (training only) ----
+                with torch.no_grad():
+                    # weights per token via w[label]; shape [B,L]
+                    w_tokens = loss_w_vec[y_grid]  # [B,L]
+                    # If your grid is fully covered (30h filled), simple mean:
+                    w_factor = w_tokens.mean()     # scalar
+                nll = nll * w_factor
             elif crf_mode == "semi":
                 y_segs = segments_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train)
                 nll = crf.nll(
@@ -366,6 +379,16 @@ def train_traj_embed(
                     dur_logprob=dur_logprob_train,                 # [P, Dmax_bins] on TRAIN grid
                     endpoint_mask=endpoint_mask_train,       # [L,P] on TRAIN grid
                 ) / max(theta.shape[-1], 1)  # normalize by length
+                # ---- Phase 2: class-balanced scaling (training only) ----
+                with torch.no_grad():
+                    # average weight across all segments in batch
+                    tot_w, tot_cnt = 0.0, 0
+                    for segs in y_segs:
+                        for (p_idx, t0_bin, d_bins) in segs:
+                            tot_w += float(loss_w_vec[p_idx])
+                            tot_cnt += 1
+                    w_factor = torch.tensor(tot_w / max(tot_cnt, 1), device=device, dtype=torch.float32)
+                nll = nll * w_factor
 
             kl  = kl_gaussian_standard(mu, logvar, reduction="mean")
             loss = nll + beta_weight * kl
