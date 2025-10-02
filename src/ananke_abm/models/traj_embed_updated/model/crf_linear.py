@@ -110,30 +110,38 @@ class LinearChainCRF(nn.Module):
 
         raise AssertionError(f"endpoint_mask has invalid shape {tuple(endpoint_mask.shape)} for theta {tuple(theta.shape)}")
 
-
-    def _forward_logZ(self, theta: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
+    def _forward_logZ(self, theta: torch.Tensor, A: torch.Tensor,
+                    pairwise_logits: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Log-partition via forward algorithm in log-space.
         Args:
-            theta: [B,P,L], A: [P,P]
+            theta: [B,P,L]
+            A:     [P,P] (Potts base)
+            pairwise_logits: [L,P,P] or None (time-varying addition), transition into time t
         Returns:
             logZ: [B]
         """
         B, P, L = theta.shape
         alpha = theta[:, :, 0]  # [B,P]
         for t in range(1, L):
-            # prev → current: alpha_prev[k] + A[k,j]
-            prev = alpha.unsqueeze(2) + A.unsqueeze(0)      # [B,P,P]
+            if pairwise_logits is None:
+                T_t = A  # [P,P]
+            else:
+                # transition from t-1 -> t uses pairwise at index t
+                T_t = A + pairwise_logits[t]  # [P,P]
+            prev = alpha.unsqueeze(2) + T_t.unsqueeze(0)        # [B,P,P]
             alpha = theta[:, :, t] + torch.logsumexp(prev, dim=1)  # [B,P]
         logZ = torch.logsumexp(alpha, dim=1)  # [B]
         return logZ
 
     @staticmethod
-    def _path_score(theta: torch.Tensor, A: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def _path_score(theta: torch.Tensor, A: torch.Tensor, y: torch.Tensor,
+                    pairwise_logits: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Compute sequence score for given y.
         Args:
-            theta: [B,P,L], A: [P,P], y: [B,L] long
+            theta: [B,P,L], A: [P,P], y: [B,L]
+            pairwise_logits: [L,P,P] or None
         Returns:
             score: [B]
         """
@@ -144,22 +152,38 @@ class LinearChainCRF(nn.Module):
 
         # Pairwise transitions
         if L > 1:
-            y_prev = y[:, :-1]  # [B,L-1]
-            y_curr = y[:, 1:]   # [B,L-1]
-            trans = A[y_prev, y_curr]  # [B,L-1]
-            pair = trans.sum(dim=1)    # [B]
+            y_prev = y[:, :-1]                 # [B,L-1]
+            y_curr = y[:, 1:]                  # [B,L-1]
+            base = A[y_prev, y_curr]           # [B,L-1]
+            if pairwise_logits is not None:
+                # transitions into time t use pairwise_logits[t], for t=1..L-1
+                t_idx = torch.arange(1, L, device=theta.device)  # [L-1]
+                extra = pairwise_logits[t_idx, y_prev, y_curr]    # [B,L-1]
+                trans = base + extra
+            else:
+                trans = base
+            pair = trans.sum(dim=1)            # [B]
         else:
             pair = torch.zeros(B, device=theta.device, dtype=theta.dtype)
 
         return unary + pair
+    
+    @staticmethod
+    def _normalize_pairwise(pw: torch.Tensor, clip: float = 2.0) -> torch.Tensor:
+        # pw: [L,P,P]
+        pw = pw - pw.mean(dim=(1, 2), keepdim=True)                         # center per time step
+        pw = pw - torch.diag_embed(torch.diagonal(pw, dim1=1, dim2=2))      # zero diag
+        pw = torch.clamp(pw, min=-clip, max=clip)                           # clip
+        return pw
 
-    def nll(self, theta: torch.Tensor, y: torch.Tensor, endpoint_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def nll(self, theta: torch.Tensor, y: torch.Tensor,
+            endpoint_mask: Optional[torch.Tensor] = None,
+            pairwise_logits: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Negative log-likelihood (mean over batch).
-        Args:
-            theta: [B,P,L] log-unaries
-            y:     [B,L] int labels OR [B,P,L] one-hot (will argmax)
-            endpoint_mask: [L,P] bool (optional)
+        theta: [B,P,L], y: [B,L] or one-hot [B,P,L]
+        endpoint_mask: [L,P] bool (optional)
+        pairwise_logits: [L,P,P] or None
         """
         if y.dim() == 3:
             y = y.argmax(dim=1)
@@ -169,33 +193,46 @@ class LinearChainCRF(nn.Module):
         theta_l = theta.clone()
         self._apply_endpoint_mask_inplace(theta_l, endpoint_mask, self.neg_large)
         A = self._pairwise_matrix(device=theta.device, dtype=theta.dtype)
+        if pairwise_logits is not None:
+            pw = pairwise_logits.to(device=theta.device, dtype=theta.dtype)
+            pw = self._normalize_pairwise(pw, clip=2.0)                         # PATCH
 
-        logZ = self._forward_logZ(theta_l, A)             # [B]
-        score = self._path_score(theta_l, A, y)           # [B]
+            # IMPORTANT: use theta_l (masked), not theta
+            logZ  = self._forward_logZ(theta_l, A, pairwise_logits=pw)          # PATCH
+            score = self._path_score(theta_l, A, y, pairwise_logits=pw)         # PATCH
+            return (logZ - score).mean()
+
+        logZ = self._forward_logZ(theta_l, A, pairwise_logits=pairwise_logits)           # [B]
+        score = self._path_score(theta_l, A, y, pairwise_logits=pairwise_logits)         # [B]
         nll = (logZ - score).mean()
         return nll
 
-    def viterbi(self, theta: torch.Tensor, endpoint_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def viterbi(self, theta: torch.Tensor,
+                endpoint_mask: Optional[torch.Tensor] = None,
+                pairwise_logits: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         MAP sequence via Viterbi.
-        Args:
-            theta: [B,P,L]
-            endpoint_mask: [L,P] bool (optional)
-        Returns:
-            y_hat: [B,L] long
+        theta: [B,P,L], endpoint_mask: [L,P] bool (optional)
+        pairwise_logits: [L,P,P] or None
         """
         B, P, L = theta.shape
         theta_l = theta.clone()
         self._apply_endpoint_mask_inplace(theta_l, endpoint_mask, self.neg_large)
         A = self._pairwise_matrix(device=theta.device, dtype=theta.dtype)
+        # PATCH: normalize pairwise if provided
+        pw = None
+        if pairwise_logits is not None:
+            pw = pairwise_logits.to(device=theta.device, dtype=theta.dtype)
+            pw = self._normalize_pairwise(pw, clip=2.0)
 
         delta = theta_l[:, :, 0]                    # [B,P]
         backp = torch.full((B, P, L), -1, dtype=torch.long, device=theta.device)
 
         for t in range(1, L):
-            prev = delta.unsqueeze(2) + A.unsqueeze(0)    # [B,P,P]
-            best_prev_val, best_prev_idx = prev.max(dim=1)  # [B,P]
-            delta = best_prev_val + theta_l[:, :, t]        # [B,P]
+            T_t = A if pw is None else (A + pw[t])   # PATCH
+            prev = delta.unsqueeze(2) + T_t.unsqueeze(0)                       # [B,P,P]
+            best_prev_val, best_prev_idx = prev.max(dim=1)                     # [B,P]
+            delta = best_prev_val + theta_l[:, :, t]                           # [B,P]
             backp[:, :, t] = best_prev_idx
 
         # backtrace

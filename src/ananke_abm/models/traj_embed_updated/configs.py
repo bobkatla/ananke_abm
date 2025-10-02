@@ -99,3 +99,11 @@ class LossBalanceConfig:
         "Accompanying": 1.6,
         "Other": 1.2,
     })
+
+@dataclass
+class PairwiseConfig:
+    enabled: bool = False
+    rank: int = 2              # low-rank factorization (2–4 is plenty)
+    K_clock: int = 6           # Fourier pairs for time features on the grid
+    scale: float = 1.0         # global scale on learned pairwise logits
+    use_potts_base: bool = True  # keep your eta Potts as a base term

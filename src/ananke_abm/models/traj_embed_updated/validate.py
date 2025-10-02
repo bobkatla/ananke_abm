@@ -27,7 +27,7 @@ from ananke_abm.models.traj_embed_updated.eval_utils import (
     summarize as summarize_metrics,
 )
 from ananke_abm.models.traj_embed_updated.synthesize import synthesize, set_seed, sanitize_theta
-
+from ananke_abm.models.traj_embed_updated.model.pairwise_time_bilinear import TimeVaryingPairwise
 
 
 class ScheduleDataset(torch.utils.data.Dataset):
@@ -264,6 +264,7 @@ def gen_n_val_traj(
     cfg_dec   = ck.get("configs", {}).get("dec", {})
     cfg_vae   = ck.get("configs", {}).get("vae", {"latent_dim": DecoderConfig.m_latent})
     cfg_crf   = ck.get("configs", {}).get("crf", {"eta": 4.0, "learn_eta": False})
+    cfg_pair = ck.get("configs", {}).get("pairwise", {"enabled": False, "rank": 2, "K_clock": 6, "scale": 1.0})
 
     # Create a time_cfg dict for decoder init, respecting CLI override for eval grid
     time_cfg_from_ckpt = ck.get("configs", {}).get("time", {})
@@ -367,6 +368,27 @@ def gen_n_val_traj(
     with torch.no_grad():
         loglam_eval = pds.lambda_log_on_alloc_grid(t_alloc_minutes_eval, T_clock_minutes=T_clock_minutes)  # [P,L]
 
+    # --- time-varying pairwise on eval grid (if present) ---
+    pairwise_mod = None
+    pairwise_eval = None
+    if bool(cfg_pair.get("enabled", False)) and crf_mode == "linear":
+        pairwise_mod = TimeVaryingPairwise(
+            P=len(purposes),
+            rank=int(cfg_pair.get("rank", 2)),
+            K_clock=int(cfg_pair.get("K_clock", 6)),
+            scale=float(cfg_pair.get("scale", 1.0)),
+        ).to(device)
+        # load weights if saved
+        pw_state = ck.get("model_state", {}).get("pairwise", None)
+        if pw_state is not None:
+            try:
+                pairwise_mod.load_state_dict(pw_state, strict=True)
+            except Exception:
+                pass
+        pairwise_mod.eval()
+        with torch.no_grad():
+            pairwise_eval = pairwise_mod(t_alloc01_eval)  # [L_eval, P, P]
+
     # --- endpoint masks ---
     purp_df = pd.read_csv(purposes_csv)
     ep_masks = build_endpoint_mask(purp_df, purposes, can_open_col="can_open_day", can_close_col="can_close_day")
@@ -422,8 +444,8 @@ def gen_n_val_traj(
                 # rasterize labels to grid for NLL
                 fallback_idx = 0
                 y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_eval, fallback_idx=fallback_idx)
-                nll = (lin_crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_eval)) / max(theta.shape[-1], 1) 
-                y_hat = lin_crf.viterbi(theta, endpoint_mask=endpoint_mask_eval)  # [B,L]
+                nll = (lin_crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_eval, pairwise_logits=pairwise_eval)) / max(theta.shape[-1], 1)
+                y_hat = lin_crf.viterbi(theta, endpoint_mask=endpoint_mask_eval, pairwise_logits=pairwise_eval)
                 decoded_preview.extend(labels_to_segments(y_hat, t_alloc01_eval))
             else:
                 # build gold segments for NLL under semi-CRF

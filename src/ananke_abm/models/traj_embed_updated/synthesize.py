@@ -15,6 +15,7 @@ from ananke_abm.models.traj_embed_updated.model.crf_semi import (
     SemiMarkovCRF, build_duration_logprob_table
 )
 from ananke_abm.models.traj_embed_updated.model.train_masks import build_endpoint_mask, endpoint_time_mask
+from ananke_abm.models.traj_embed_updated.model.pairwise_time_bilinear import TimeVaryingPairwise
 
 
 def set_seed(seed: int = 0):
@@ -94,6 +95,7 @@ def synthesize(ckpt: str,
     cfg_dec   = ck.get("configs", {}).get("dec", {})
     cfg_vae   = ck.get("configs", {}).get("vae", {"latent_dim": DecoderConfig.m_latent})
     cfg_crf   = ck.get("configs", {}).get("crf", {"eta": 4.0, "learn_eta": False})
+    cfg_pair = ck.get("configs", {}).get("pairwise", {"enabled": False, "rank": 2, "K_clock": 6, "scale": 1.0})
 
     time_cfg_from_ckpt = ck.get("configs", {}).get("time", {})
     time_cfg = {
@@ -152,6 +154,25 @@ def synthesize(ckpt: str,
 
     pds.eval(); dec.eval(); lin_crf.eval(); semi_crf.eval()
 
+    # --- Time-varying pairwise (if present/enabled) ---
+    pairwise_mod = None
+    pairwise_eval = None
+    if bool(cfg_pair.get("enabled", False)) and crf_mode == "linear":
+        pairwise_mod = TimeVaryingPairwise(
+            P=P,
+            rank=int(cfg_pair.get("rank", 2)),
+            K_clock=int(cfg_pair.get("K_clock", 6)),
+            scale=float(cfg_pair.get("scale", 1.0)),
+        ).to(device_t)
+        # load weights if saved
+        pw_state = ck.get("model_state", {}).get("pairwise", None)
+        if pw_state is not None:
+            try:
+                pairwise_mod.load_state_dict(pw_state, strict=True)
+            except Exception:
+                pass
+        pairwise_mod.eval()
+
     # --- Grid and priors ---
     t_alloc_minutes_eval, t_alloc01_eval = make_alloc_grid(
         T_alloc_minutes=T_alloc_minutes,
@@ -162,6 +183,9 @@ def synthesize(ckpt: str,
     L_eval = t_alloc01_eval.numel()
     with torch.no_grad():
         loglam_eval = pds.lambda_log_on_alloc_grid(t_alloc_minutes_eval, T_clock_minutes=T_clock_minutes)  # [P,L]
+    
+    with torch.no_grad():
+        pairwise_eval = pairwise_mod(t_alloc01_eval) if pairwise_mod is not None else None  # [L_eval,P,P] or None
 
     # --- Endpoint mask ---
     purp_df = pd.read_csv(purposes_csv)
@@ -200,7 +224,9 @@ def synthesize(ckpt: str,
             theta_gen = sanitize_theta(theta_gen)
 
             if crf_mode == "linear":
-                y_hat_gen = lin_crf.viterbi(theta_gen, endpoint_mask=endpoint_mask_eval)  # [cur,L]
+                y_hat_gen = lin_crf.viterbi(
+                    theta_gen, endpoint_mask=endpoint_mask_eval, pairwise_logits=pairwise_eval
+                )  # [cur,L]
                 # Convert labels to segments using normalized grid positions as in validate
                 t = t_alloc01_eval.detach().cpu().numpy()
                 for b in range(y_hat_gen.shape[0]):

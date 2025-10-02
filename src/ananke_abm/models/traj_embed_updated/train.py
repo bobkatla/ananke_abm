@@ -18,7 +18,9 @@ from ananke_abm.models.traj_embed_updated.configs import (
     VAEConfig,
     CRFConfig,
     LossBalanceConfig,
+    PairwiseConfig,
 )
+from ananke_abm.models.traj_embed_updated.model.pairwise_time_bilinear import TimeVaryingPairwise
 from ananke_abm.models.traj_embed_updated.model.pds_loader import derive_priors_from_activities
 from ananke_abm.models.traj_embed_updated.model.purpose_space import PurposeDistributionSpace
 from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid, merge_primary_slivers, segments_from_padded_to_grid
@@ -140,6 +142,7 @@ def train_traj_embed(
     vae_cfg   = VAEConfig()
     crf_cfg   = CRFConfig()
     loss_cfg  = LossBalanceConfig()
+    pair_cfg = PairwiseConfig()
 
     # --- data & priors (24h clock prior; durations by allocation) ---
     acts = pd.read_csv(activities_csv)
@@ -201,6 +204,17 @@ def train_traj_embed(
             ) # [P, L]
     L_train = loglam_grids["train"].shape[1]
     L_eval  = loglam_grids["eval"].shape[1]
+
+    t_alloc_minutes_train, t_alloc01_train = make_alloc_grid(
+        T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS,
+        step_minutes=time_cfg.TRAIN_GRID_MINS,
+        device=device,
+    )
+    t_alloc_minutes_eval,  t_alloc01_eval  = make_alloc_grid(
+        T_alloc_minutes=time_cfg.ALLOCATION_HORIZON_MINS,
+        step_minutes=time_cfg.VALID_GRID_MINS,
+        device=device,
+    )
 
     if crf_mode == "semi":
         dur_logprob_train = build_duration_logprob_table(
@@ -281,9 +295,26 @@ def train_traj_embed(
             learn_eta=crf_cfg.learn_eta,
         ).to(device)
 
+    # --- time-varying pairwise transitions ---
+    pairwise_mod = None
+    pairwise_eval = None
+    if pair_cfg.enabled and crf_mode == "linear":
+        pairwise_mod = TimeVaryingPairwise(
+            P=P, rank=pair_cfg.rank, K_clock=pair_cfg.K_clock, scale=pair_cfg.scale
+        ).to(device)
+        with torch.no_grad():
+            pairwise_mod.U.mul_(0.1)
+            pairwise_mod.V.mul_(0.1)
+            pairwise_mod.W.mul_(0.1)
+        with torch.no_grad():
+            pairwise_eval = pairwise_mod(t_alloc01_eval)   # [L_eval, P, P]
+
+
     params = list(pds.parameters()) + list(enc.parameters()) + list(dec.parameters())
     if crf_cfg.learn_eta:
         params += list(crf.parameters())
+    if pairwise_mod is not None:
+        params += list(pairwise_mod.parameters())
     opt = optim.Adam(params, lr=lr, weight_decay=1e-4)
 
     # --- dataset / loaders ---
@@ -366,7 +397,8 @@ def train_traj_embed(
                 fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
                 y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_train, fallback_idx=fallback_idx)  # [B,L]
                 # y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
-                nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train) / max(theta.shape[-1], 1)  # normalize by length
+                pairwise_train = pairwise_mod(t_alloc01_train) if pairwise_mod is not None else None
+                nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_train, pairwise_logits=pairwise_train) / max(theta.shape[-1], 1)
                 # ---- Phase 2: class-balanced scaling (training only) ----
                 with torch.no_grad():
                     # weights per token via w[label]; shape [B,L]
@@ -434,7 +466,8 @@ def train_traj_embed(
                     fallback_idx = 0 #ep_masks.open_allowed.argmax() if ep_masks.open_allowed.any() else 0
                     y_grid = rasterize_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_eval, fallback_idx=fallback_idx)
                     # y_grid = merge_primary_slivers(y_grid, is_primary, tau_bins)
-                    nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_eval) / max(theta.shape[-1], 1)  # normalize by length
+                    pairwise_cur = pairwise_eval if pairwise_mod is not None else None
+                    nll = crf.nll(theta, y_grid, endpoint_mask=endpoint_mask_eval, pairwise_logits=pairwise_cur) / max(theta.shape[-1], 1)
                 elif crf_mode == "semi":
                     y_segs = segments_from_padded_to_grid(p_pad, t_pad, d_pad, lengths, L=L_eval)
                     nll = crf.nll(
@@ -473,6 +506,7 @@ def train_traj_embed(
                 "enc": enc.state_dict(),
                 "dec": dec.state_dict(),
                 "crf": crf.state_dict(),
+                "pairwise": (pairwise_mod.state_dict() if pairwise_mod is not None else None),
             },
             "priors": priors,
             "purposes": purposes,
@@ -484,6 +518,7 @@ def train_traj_embed(
                 "dec": vars(dec_cfg),
                 "vae": vars(vae_cfg),
                 "crf": vars(crf_cfg),
+                "pairwise": vars(pair_cfg),
                 # NEW: persist encoder arch so validate.py can rebuild the same module
                 "enc_arch": {
                     "d_p": pep_cfg.d_p,
