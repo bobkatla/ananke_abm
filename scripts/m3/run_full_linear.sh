@@ -31,12 +31,13 @@ uv run ananke gval-traj \
 --gen_csv "src\output\traj_embed\inference\full_linear\gen_activities.csv" \
 --val_csv "src\output\traj_embed\inference\full_linear\gen_validation.csv" \
 --eval_step_minutes 5 \
---crf_mode "linear"
+--crf_mode "linear" \
+--summary_json "src\output\traj_embed\inference\small_linear\summary.json"
 
 uv run ananke visualize-combined-traj \
 --traj_csv "src\output\traj_embed\inference\full_linear\gen_activities.csv" \
 --buffer_csv "src\output\traj_embed\inference\full_linear\buffer_grid.csv" \
 --out_dir "src\output\traj_embed\img\gen_full_linear" \
---y_work_max 0.04 \
---y_edu_max 0.004 \
+--y_work_max 0.05 \
+--y_edu_max 0.005 \
 --dpi 300
