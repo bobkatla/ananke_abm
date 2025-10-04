@@ -435,6 +435,9 @@ def train_traj_embed(
             loss.backward()
             nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
+            if crf_cfg.learn_eta and hasattr(crf, "log_eta") and crf.log_eta is not None:
+                with torch.no_grad():
+                    crf.log_eta.data.clamp_(min=np.log(0.1), max=np.log(1.5))
 
             total_tr += float(loss.item()); nll_tr += float(nll.item()); kl_tr += float(kl.item())
             n_batches_train += 1

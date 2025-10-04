@@ -169,7 +169,7 @@ class LinearChainCRF(nn.Module):
         return unary + pair
     
     @staticmethod
-    def _normalize_pairwise(pw: torch.Tensor, clip: float = 2.0) -> torch.Tensor:
+    def _normalize_pairwise(pw: torch.Tensor, clip: float = 1.0) -> torch.Tensor:
         # pw: [L,P,P]
         pw = pw - pw.mean(dim=(1, 2), keepdim=True)                         # center per time step
         pw = pw - torch.diag_embed(torch.diagonal(pw, dim1=1, dim2=2))      # zero diag

@@ -43,7 +43,7 @@ class VAEConfig:
 # ---- CRF DECODER (resource allocation on a grid) ----
 @dataclass
 class CRFConfig:
-    eta: float = 0.5                 # Potts switching penalty (off-diagonal)
+    eta: float = 0.4                 # Potts switching penalty (off-diagonal)
     learn_eta: bool = True          # make eta learnable if True
     use_transition_mask: bool = False  # enable bigram feasibility masks
     semi_Dmax_minutes: int = 300   # max segment duration for semi-CRF
@@ -102,8 +102,8 @@ class LossBalanceConfig:
 
 @dataclass
 class PairwiseConfig:
-    enabled: bool = False
-    rank: int = 2              # low-rank factorization (2–4 is plenty)
-    K_clock: int = 6           # Fourier pairs for time features on the grid
-    scale: float = 1.0         # global scale on learned pairwise logits
+    enabled: bool = True
+    rank: int = 1              # low-rank factorization (2–4 is plenty)
+    K_clock: int = 1           # Fourier pairs for time features on the grid
+    scale: float = 0.01         # global scale on learned pairwise logits
     use_potts_base: bool = True  # keep your eta Potts as a base term
