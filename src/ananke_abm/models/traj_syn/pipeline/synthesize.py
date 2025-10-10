@@ -16,51 +16,9 @@ from ananke_abm.models.traj_syn.crf.crf_semi import (
 )
 from ananke_abm.models.traj_syn.core.train_masks import build_endpoint_mask, endpoint_time_mask
 from ananke_abm.models.traj_syn.eval.pairwise_time_bilinear import TimeVaryingPairwise
-
-
-def set_seed(seed: int = 0):
-    np.random.seed(int(seed))
-    torch.manual_seed(int(seed))
-
-
-def sanitize_theta(theta: torch.Tensor) -> torch.Tensor:
-    theta_max = torch.max(theta, dim=1, keepdim=True).values
-    theta_stable = theta - theta_max
-    return torch.clamp(theta_stable, min=-30.0, max=30.0)
-
-
-def decoded_to_activities_df(decoded, purposes, T_minutes: int,
-                             start_persid: int = 0, prefix: str = "gen") -> pd.DataFrame:
-    rows = []
-    for s_idx, segs in enumerate(decoded):
-        persid = f"{prefix}_{start_persid + s_idx:06d}"
-        if not segs:
-            rows.append({"persid": persid, "stopno": 1, "purpose": "Home",
-                         "startime": 0, "total_duration": int(T_minutes)})
-            continue
-
-        d = np.array([max(0.0, float(dur)) for (_, _, dur) in segs], dtype=np.float64)
-        if d.sum() <= 0:
-            d = np.ones_like(d) / len(d)
-        d = d / d.sum()
-
-        dur_m = np.rint(d * T_minutes).astype(int)
-        delta = int(T_minutes - dur_m.sum())
-        dur_m[-1] += delta
-        start_m = np.concatenate([[0], np.cumsum(dur_m[:-1])])
-
-        for stopno, ((p_idx, _t0, _d), st, du) in enumerate(zip(segs, start_m, dur_m), start=1):
-            if du <= 0:
-                continue
-            rows.append({
-                "persid": persid,
-                "stopno": stopno,
-                "purpose": purposes[p_idx],
-                "startime": int(st),
-                "total_duration": int(du),
-            })
-
-    return pd.DataFrame(rows, columns=["persid", "stopno", "purpose", "startime", "total_duration"])
+from ananke_abm.models.traj_syn.eval.traj_decode_utils import decoded_to_activities_df
+from ananke_abm.models.traj_syn.core.data_utils.randomness import set_seed
+from ananke_abm.models.traj_syn.core.data_utils.sanitize import sanitize_theta
 
 
 def synthesize(ckpt: str,
@@ -72,7 +30,7 @@ def synthesize(ckpt: str,
          crf_mode: str,
          gen_csv: str,
          seed: int,
-         device: str):
+         device:str = "gpu" if torch.cuda.is_available() else "cpu"):
     """
     Load checkpoint, sample synthetic schedules, decode with CRF, and write gen_csv.
     No evaluation/metrics are performed here.

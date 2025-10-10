@@ -7,7 +7,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.nn.utils.rnn import pad_sequence
 
 # --- configs & model pieces ---
 from ananke_abm.models.traj_syn.configs import (
@@ -30,6 +29,9 @@ from ananke_abm.models.traj_syn.vae.encoder import TrajEncoderGRU, kl_gaussian_s
 from ananke_abm.models.traj_syn.crf.crf_linear import LinearChainCRF
 from ananke_abm.models.traj_syn.crf.crf_semi import SemiMarkovCRF, build_duration_logprob_table
 from ananke_abm.models.traj_syn.core.train_masks import build_endpoint_mask, endpoint_time_mask
+from ananke_abm.models.traj_syn.core.data_utils.randomness import set_seed
+from ananke_abm.models.traj_syn.core.data_utils.sanitize import sanitize_theta
+from ananke_abm.models.traj_syn.core.data_utils.ScheduleDataset import ScheduleDataset, collate_fn
 
 
 # Const to avoid magic numbers
@@ -42,79 +44,18 @@ NUM_LAYERS = 2
 DROPOUT = 0.2
 BIDIRECTIONAL = False
 
-# -------------------
-# utils & dataset
-# -------------------
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-class ScheduleDataset(torch.utils.data.Dataset):
-    """
-    Reads activities and forms per-person sequences of (purpose, start_norm, dur_norm),
-    normalized by the ALLOCATION horizon (e.g., 30h).
-    """
-    def __init__(self, activities_csv: str, T_alloc_minutes: int):
-        acts = pd.read_csv(activities_csv)
-        self.T = float(T_alloc_minutes)
-        self.seqs = []
-        for _, g in acts.groupby("persid"):
-            g = g.sort_values(["startime", "stopno"])
-            day = [
-                (str(r["purpose"]), float(r["startime"] / self.T), float(r["total_duration"] / self.T))
-                for _, r in g.iterrows()
-            ]
-            self.seqs.append(day)
-
-    def __len__(self): return len(self.seqs)
-    def __getitem__(self, idx): return self.seqs[idx]
-
 
 def split_indices(n, val_ratio=0.2, seed=42):
+    """Split n items into train/val indices."""
     idx = list(range(n))
     rng = random.Random(seed)
     rng.shuffle(idx)
     n_val = int(round(n * val_ratio))
     return idx[n_val:], idx[:n_val]
 
-
-def collate_fn(batch, purpose_to_idx):
-    """
-    Pack a batch of variable-length sequences into padded tensors.
-    Returns:
-        p_pad: [B, Lmax] long
-        t_pad: [B, Lmax] float in [0,1] (allocation-normalized start)
-        d_pad: [B, Lmax] float in [0,1] (allocation-normalized duration)
-        lengths: list[int] valid lengths
-    """
-    p_lists, t_lists, d_lists, lens = [], [], [], []
-    for seq in batch:
-        p_idx = [purpose_to_idx[p] for p, _, _ in seq]
-        t0 = [t for _, t, _ in seq]
-        dd = [d for _, _, d in seq]
-        p_lists.append(torch.tensor(p_idx, dtype=torch.long))
-        t_lists.append(torch.tensor(t0, dtype=torch.float32))
-        d_lists.append(torch.tensor(dd, dtype=torch.float32))
-        lens.append(len(seq))
-    p_pad = pad_sequence(p_lists, batch_first=True, padding_value=0)
-    t_pad = pad_sequence(t_lists, batch_first=True, padding_value=0.0)
-    d_pad = pad_sequence(d_lists, batch_first=True, padding_value=0.0)
-    return p_pad, t_pad, d_pad, lens
-
-
 # -------------------
 # training script
 # -------------------
-def sanitize_theta(theta: torch.Tensor) -> torch.Tensor:
-    """Numerically stabilizes CRF emissions."""
-    theta_max = torch.max(theta, dim=1, keepdim=True).values
-    theta_stable = theta - theta_max
-    return torch.clamp(theta_stable, min=-30.0)
-
 def train_traj_embed(
     activities_csv: str,
     purposes_csv: str,
