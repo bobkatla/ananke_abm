@@ -1,7 +1,6 @@
 from typing import List, Dict, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 
 # =========================

@@ -10,7 +10,7 @@ import torch.optim as optim
 from torch.nn.utils.rnn import pad_sequence
 
 # --- configs & model pieces ---
-from ananke_abm.models.traj_embed_updated.configs import (
+from ananke_abm.models.traj_syn.configs import (
     TimeConfig,
     BasisConfig,
     PurposeEmbeddingConfig,
@@ -20,16 +20,16 @@ from ananke_abm.models.traj_embed_updated.configs import (
     LossBalanceConfig,
     PairwiseConfig,
 )
-from ananke_abm.models.traj_embed_updated.model.pairwise_time_bilinear import TimeVaryingPairwise
-from ananke_abm.models.traj_embed_updated.model.pds_loader import derive_priors_from_activities
-from ananke_abm.models.traj_embed_updated.model.purpose_space import PurposeDistributionSpace
-from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid, merge_primary_slivers, segments_from_padded_to_grid
-from ananke_abm.models.traj_embed_updated.model.rasterize import rasterize_from_padded_to_grid
-from ananke_abm.models.traj_embed_updated.model.decoder_timefield import TimeFieldDecoder
-from ananke_abm.models.traj_embed_updated.model.encoder import TrajEncoderGRU, kl_gaussian_standard
-from ananke_abm.models.traj_embed_updated.model.crf_linear import LinearChainCRF
-from ananke_abm.models.traj_embed_updated.model.crf_semi import SemiMarkovCRF, build_duration_logprob_table
-from ananke_abm.models.traj_embed_updated.model.train_masks import build_endpoint_mask, endpoint_time_mask
+from ananke_abm.models.traj_syn.eval.pairwise_time_bilinear import TimeVaryingPairwise
+from ananke_abm.models.traj_syn.core.pds_loader import derive_priors_from_activities
+from ananke_abm.models.traj_syn.vae.purpose_space import PurposeDistributionSpace
+from ananke_abm.models.traj_syn.core.utils_bases import make_alloc_grid, segments_from_padded_to_grid
+from ananke_abm.models.traj_syn.core.rasterize import rasterize_from_padded_to_grid
+from ananke_abm.models.traj_syn.vae.decoder_timefield import TimeFieldDecoder
+from ananke_abm.models.traj_syn.vae.encoder import TrajEncoderGRU, kl_gaussian_standard
+from ananke_abm.models.traj_syn.crf.crf_linear import LinearChainCRF
+from ananke_abm.models.traj_syn.crf.crf_semi import SemiMarkovCRF, build_duration_logprob_table
+from ananke_abm.models.traj_syn.core.train_masks import build_endpoint_mask, endpoint_time_mask
 
 
 # Const to avoid magic numbers

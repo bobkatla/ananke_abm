@@ -6,16 +6,16 @@ import pandas as pd
 import torch
 import click
 
-from ananke_abm.models.traj_embed_updated.configs import DecoderConfig
-from ananke_abm.models.traj_embed_updated.model.purpose_space import PurposeDistributionSpace
-from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid
-from ananke_abm.models.traj_embed_updated.model.decoder_timefield import TimeFieldDecoder
-from ananke_abm.models.traj_embed_updated.model.crf_linear import LinearChainCRF
-from ananke_abm.models.traj_embed_updated.model.crf_semi import (
+from ananke_abm.models.traj_syn.configs import DecoderConfig
+from ananke_abm.models.traj_syn.vae.purpose_space import PurposeDistributionSpace
+from ananke_abm.models.traj_syn.core.utils_bases import make_alloc_grid
+from ananke_abm.models.traj_syn.vae.decoder_timefield import TimeFieldDecoder
+from ananke_abm.models.traj_syn.crf.crf_linear import LinearChainCRF
+from ananke_abm.models.traj_syn.crf.crf_semi import (
     SemiMarkovCRF, build_duration_logprob_table
 )
-from ananke_abm.models.traj_embed_updated.model.train_masks import build_endpoint_mask, endpoint_time_mask
-from ananke_abm.models.traj_embed_updated.model.pairwise_time_bilinear import TimeVaryingPairwise
+from ananke_abm.models.traj_syn.core.train_masks import build_endpoint_mask, endpoint_time_mask
+from ananke_abm.models.traj_syn.eval.pairwise_time_bilinear import TimeVaryingPairwise
 
 
 def set_seed(seed: int = 0):

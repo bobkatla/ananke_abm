@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd

@@ -1,7 +1,7 @@
 # ananke_abm/models/traj_embed_updated/model/pairwise_time_bilinear.py
 import torch
 import torch.nn as nn
-from ananke_abm.models.traj_embed_updated.model.utils_bases import fourier_time_features
+from ananke_abm.models.traj_syn.core.utils_bases import fourier_time_features
 
 class TimeVaryingPairwise(nn.Module):
     """

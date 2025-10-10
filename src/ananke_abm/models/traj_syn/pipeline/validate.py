@@ -11,23 +11,23 @@ import click
 import json
 
 # --- configs & model pieces ---
-from ananke_abm.models.traj_embed_updated.configs import DecoderConfig
-from ananke_abm.models.traj_embed_updated.model.purpose_space import PurposeDistributionSpace
-from ananke_abm.models.traj_embed_updated.model.utils_bases import make_alloc_grid
-from ananke_abm.models.traj_embed_updated.model.rasterize import rasterize_from_padded_to_grid
-from ananke_abm.models.traj_embed_updated.model.decoder_timefield import TimeFieldDecoder
-from ananke_abm.models.traj_embed_updated.model.encoder import TrajEncoderGRU
-from ananke_abm.models.traj_embed_updated.model.crf_linear import LinearChainCRF
-from ananke_abm.models.traj_embed_updated.model.crf_semi import (
+from ananke_abm.models.traj_syn.configs import DecoderConfig
+from ananke_abm.models.traj_syn.vae.purpose_space import PurposeDistributionSpace
+from ananke_abm.models.traj_syn.core.utils_bases import make_alloc_grid
+from ananke_abm.models.traj_syn.core.rasterize import rasterize_from_padded_to_grid
+from ananke_abm.models.traj_syn.vae.decoder_timefield import TimeFieldDecoder
+from ananke_abm.models.traj_syn.vae.encoder import TrajEncoderGRU
+from ananke_abm.models.traj_syn.crf.crf_linear import LinearChainCRF
+from ananke_abm.models.traj_syn.crf.crf_semi import (
     SemiMarkovCRF, build_duration_logprob_table
 )
-from ananke_abm.models.traj_embed_updated.model.train_masks import build_endpoint_mask, endpoint_time_mask
-from ananke_abm.models.traj_embed_updated.eval_utils import (
+from ananke_abm.models.traj_syn.core.train_masks import build_endpoint_mask, endpoint_time_mask
+from ananke_abm.models.traj_syn.eval.eval_utils import (
     activities_csv_to_segments,
     summarize as summarize_metrics,
 )
-from ananke_abm.models.traj_embed_updated.synthesize import synthesize, set_seed, sanitize_theta
-from ananke_abm.models.traj_embed_updated.model.pairwise_time_bilinear import TimeVaryingPairwise
+from ananke_abm.models.traj_syn.pipeline.synthesize import synthesize, set_seed, sanitize_theta
+from ananke_abm.models.traj_syn.eval.pairwise_time_bilinear import TimeVaryingPairwise
 
 
 class ScheduleDataset(torch.utils.data.Dataset):
