@@ -4,6 +4,7 @@ from ananke_abm.models.traj_syn.pipeline.train_full import train_traj_embed
 
 
 @command()
+@option("-trOpt", "--train_options", type=Choice(["full", "vae_only"]), default="full", help="Training options: full, vae_only")
 @option("-av", "--activities_csv", type=str, required=True)
 @option("-pv", "--purposes_csv", type=str, required=True)
 @option("--crf_mode", type=Choice(["linear", "semi"]), default="linear", help="CRF mode: linear aka frame-CRF or semi-CRF")
@@ -13,6 +14,11 @@ from ananke_abm.models.traj_syn.pipeline.train_full import train_traj_embed
 @option("--val_ratio", type=float, default=0.2)
 @option("-o", "--outdir", type=str, default="./runs")
 @option("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-def traj_embed(activities_csv, purposes_csv, crf_mode, epochs, batch_size, lr, val_ratio, outdir, device):
+def traj_embed(train_options, activities_csv, purposes_csv, crf_mode, epochs, batch_size, lr, val_ratio, outdir, device):
     """Train the TrajEmbed model."""
-    train_traj_embed(activities_csv, purposes_csv, epochs, batch_size, lr, val_ratio, outdir, device, crf_mode)
+    if train_options  == "full":
+        train_traj_embed(activities_csv, purposes_csv, epochs, batch_size, lr, val_ratio, outdir, device, crf_mode)
+    elif train_options == "vae_only":
+        NotImplementedError("VAE-only training is not yet implemented.")
+    else:
+        raise ValueError(f"Unknown training option: {train_options}")
