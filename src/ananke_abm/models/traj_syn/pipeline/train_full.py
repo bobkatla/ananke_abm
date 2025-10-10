@@ -171,11 +171,6 @@ def train_traj_embed(
         T_clock_minutes=time_cfg.T_clock_minutes,
     )
     assert len(priors) == len(purposes)
-    is_primary = torch.tensor(
-        purp["is_primary_ooh"].fillna(0).astype(int).to_numpy(),
-        dtype=torch.bool, device=device
-    )
-    tau_bins = max(1, int(round(60 / time_cfg.TRAIN_GRID_MINS)))
 
     # feature matrix phi_p = [Fourier_clock | mu_t | sigma_t | mu_d | sigma_d], standardized
     rows = []
