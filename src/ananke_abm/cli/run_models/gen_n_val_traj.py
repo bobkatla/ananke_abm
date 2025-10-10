@@ -1,6 +1,6 @@
 from click import command, option, Choice
-from ananke_abm.models.traj_embed_updated.validate import gen_n_val_traj
-from ananke_abm.models.traj_embed_updated.configs import CRFConfig
+from ananke_abm.models.traj_syn.pipeline.validate import gen_n_val_traj
+from ananke_abm.models.traj_syn.configs import CRFConfig
 import torch
 
 @command()

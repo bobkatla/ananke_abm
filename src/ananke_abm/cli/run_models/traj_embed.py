@@ -1,6 +1,6 @@
 from click import command, option, Choice
 import torch
-from ananke_abm.models.traj_embed_updated.train import train_traj_embed
+from ananke_abm.models.traj_syn.pipeline.train_full import train_traj_embed
 
 
 @command()
