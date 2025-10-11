@@ -1,6 +1,7 @@
 #!/bin/bash
 
 uv run ananke traj-embed \
+--train_options "full" \
 -av "src\data\traj_processed\small_activities_homebound_wd.csv" \
 -pv "src\data\traj_processed\purposes_new.csv" \
 -o "src\output\traj_embed\models\small_linear" \
