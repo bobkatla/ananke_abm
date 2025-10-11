@@ -35,9 +35,9 @@ class PurposeEmbeddingConfig:
 @dataclass
 class VAEConfig:
     latent_dim: int = 32             # dim(s); z = s / ||s||
-    beta: float = 0.25                # KL weight
+    beta: float = 1.00                # KL weight
     kl_anneal_start: int = 0         # optional linear anneal (epoch)
-    kl_anneal_end:   int = 50
+    kl_anneal_end:   int = 500
 
 
 # ---- CRF DECODER (resource allocation on a grid) ----
