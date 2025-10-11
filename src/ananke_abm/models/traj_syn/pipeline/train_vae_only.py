@@ -472,7 +472,8 @@ def main(
         # logging
         train_tot = tot / max(nb,1)
         val_tot   = tot_v / max(nb_v,1)
-        click.echo(f"[{epoch:03d}] train={train_tot:.4f}  val={val_tot:.4f}  (rec={rec_v/max(nb_v,1):.4f}, kl={kl_v/max(nb_v,1):.4f}, tod={tod_v/max(nb_v,1):.4f}, beta={beta:.3f})")
+        if epoch % 10 == 0 or epoch == epochs:
+            click.echo(f"[{epoch:03d}] train={train_tot:.4f}  val={val_tot:.4f}  (rec={rec_v/max(nb_v,1):.4f}, kl={kl_v/max(nb_v,1):.4f}, tod={tod_v/max(nb_v,1):.4f}, beta={beta:.3f})")
 
         history["epoch"].append(epoch)
         history["train_total"].append(train_tot)
@@ -484,7 +485,7 @@ def main(
         history["presence"].append(pres_sum / max(nb,1))
 
         # save checkpoint & diagnostics periodically
-        if epoch % 10 == 0 or epoch == epochs:
+        if epoch % 1000 == 0 or epoch == epochs:
             ckpt = {
                 "epoch": epoch,
                 "model_state": {"pds": pds.state_dict(), "enc": enc.state_dict(), "dec": dec.state_dict()},
