@@ -26,14 +26,11 @@ class TimeFieldDecoder(nn.Module):
         K_decoder_time: int,
         alpha_prior: float = 1.0,
         time_cfg: Optional[Dict] = None,
-        *,
-        # Phase 1
         idx2purpose: Optional[List[str]] = None,
         alpha_init_per_purpose: Optional[Dict[str, float]] = None,
         alpha_l2: float = 1e-3,
         alpha_clamp_min: float = -3.0,
         alpha_clamp_max: float = 3.0,
-        # Phase 3
         coeff_l2_global: float = 0.0,
         coeff_l2_per_purpose: Optional[Dict[str, float]] = None,
     ):
