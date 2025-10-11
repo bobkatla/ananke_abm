@@ -183,10 +183,12 @@ def main(
 
     # ---------- Entropy over day (from mean probs) ----------
     ent_per_purpose = entropy(mean_probs, axis=1).tolist()  # entropy across L per purpose
-    # Average confidence (1 - normalized entropy) as a rough “peakiness” score
-    max_ent = float(np.log(L_eval))
-    peakiness = [(1.0 - (e / max_ent)) if max_ent > 0 else 0.0 for e in ent_per_purpose]
-
+    row_sums = mean_probs.sum(axis=1, keepdims=True) + 1e-12
+    mean_probs_norm = mean_probs / row_sums
+    ent_per_purpose = entropy(mean_probs_norm, axis=1).tolist()
+    max_ent = float(np.log(mean_probs_norm.shape[1]))
+    peakiness = [(1.0 - (e / max_ent)) for e in ent_per_purpose]
+    
     # ---------- Minutes & shares ----------
     gen_minutes = minutes_by_purpose(gen_df)
     total_gen_minutes = sum(gen_minutes.values()) or 1
