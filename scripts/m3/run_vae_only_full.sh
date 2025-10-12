@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=fullMelbAct_linear
-#SBATCH --output=fullMelb_linear.out      # Standard output
-#SBATCH --error=fullMelb_linear.err       # Standard error
+#SBATCH --job-name=VAE_only_full
+#SBATCH --output=VAE_only_full.out      # Standard output
+#SBATCH --error=VAE_only_full.err       # Standard error
 #SBATCH --account=tx89
 #SBATCH --time=90:00:00
 #SBATCH --ntasks=3
