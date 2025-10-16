@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict, List
 
-from ananke_abm.models.traj_embed_updated.model.utils_bases import (
+from ananke_abm.models.traj_syn.core.utils_bases import (
     make_alloc_grid,
     fourier_time_features,
 )

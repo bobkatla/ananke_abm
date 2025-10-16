@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ananke_abm.models.traj_embed_updated.model.utils_bases import fourier_time_features
+from ananke_abm.models.traj_syn.core.utils_bases import fourier_time_features
 
 
 class PurposeDistributionSpace(nn.Module):

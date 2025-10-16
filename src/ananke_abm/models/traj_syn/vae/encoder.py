@@ -1,12 +1,12 @@
 # ananke_abm/models/traj_embed_updated/model/encoder.py
 from __future__ import annotations
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
-from ananke_abm.models.traj_embed_updated.model.utils_bases import fourier_time_features
+from ananke_abm.models.traj_syn.core.utils_bases import fourier_time_features
 
 
 def kl_gaussian_standard(mu: torch.Tensor, logvar: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
