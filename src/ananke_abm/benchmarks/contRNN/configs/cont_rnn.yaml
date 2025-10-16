@@ -1,0 +1,26 @@
+seed: 1337
+data:
+  csv_path: "src/data/traj_processed/activities_homebound_wd.csv"
+  out_dir: "src/data/encoded"
+  max_len: 20
+  day_minutes: 1800
+  splits: [0.8, 0.1, 0.1]
+model:
+  emb_dim: 256
+  rnn_hidden: 256
+  rnn_layers: 4
+  latent_dim: 6
+  dropout: 0.1
+loss:
+  alpha: 200.0
+  beta: 0.01
+  kl_anneal_epochs: 10
+train:
+  batch_size: 1024
+  lr: 1e-3
+  epochs: 200
+  teacher_forcing: 0.5
+  patience: 15
+  out_dir: "src/output/cont_rnn_melb"
+decode:
+  greedy: true
