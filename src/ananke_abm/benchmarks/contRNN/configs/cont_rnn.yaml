@@ -1,6 +1,6 @@
 seed: 1337
 data:
-  csv_path: "src/data/traj_processed/activities_homebound_wd.csv"
+  csv_path: "src/data/traj_processed/small_activities_homebound_wd.csv"
   out_dir: "src/data/encoded"
   max_len: 20
   day_minutes: 1800
@@ -20,7 +20,7 @@ train:
   lr: 1e-3
   epochs: 200
   teacher_forcing: 0.5
-  patience: 15
-  out_dir: "src/output/cont_rnn_melb"
+  patience: 100
+  out_dir: "src/output/cont_rnn_melb_small"
 decode:
   greedy: true

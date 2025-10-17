@@ -1,11 +1,11 @@
 import os
-import json
 import argparse
 import torch
+import yaml
 import pandas as pd
 
 from ananke_abm.benchmarks.contRNN.models.cont_rnn_vae import ContRNNVAE
-from ananke_abm.benchmarks.contRNN.utils.io import ensure_dir, load_vocab
+from ananke_abm.benchmarks.contRNN.utils.io import ensure_dir
 
 def greedy_decode_batch(model, n, vocab, device, max_len):
     """
@@ -15,7 +15,7 @@ def greedy_decode_batch(model, n, vocab, device, max_len):
       - activities via argmax, durations via sigmoid
     Returns full sequences including specials so we can strip/trim per sample.
     """
-    SOS = vocab["SOS"]; EOS = vocab["EOS"]
+    SOS = vocab["SOS"]
     z = torch.randn(n, model.latent_dim, device=device)
 
     # init decoder state
@@ -67,7 +67,8 @@ def strip_and_renorm(acts_row, durs_row, vocab, day_minutes=1800):
     - Convert to minutes
     - Build start times (0..day_minutes)
     """
-    SOS = vocab["SOS"]; EOS = vocab["EOS"]
+    SOS = vocab["SOS"]
+    EOS = vocab["EOS"]
     # strip specials
     keep_idx = [i for i, a in enumerate(acts_row) if a not in (SOS, EOS)]
     if len(keep_idx) == 0:
@@ -99,6 +100,7 @@ def strip_and_renorm(acts_row, durs_row, vocab, day_minutes=1800):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--config-file", required=True, help="Path to config file (YAML format)")
     ap.add_argument("--ckpt", required=True, help="Path to trained checkpoint (best.pt)")
     ap.add_argument("--n-sample", type=int, required=True)
     ap.add_argument("--encoded", default="data/encoded", help="Dir with vocab.json and meta.json")
@@ -108,18 +110,25 @@ def main():
     args = ap.parse_args()
 
     ensure_dir(os.path.dirname(args.csv_out) or ".")
-    vocab = load_vocab(os.path.join(args.encoded, "vocab.json"))
-    meta  = json.load(open(os.path.join(args.encoded, "meta.json")))
-    rev_vocab = {i:s for s,i in vocab.items()}
-    max_len = meta["max_len"]
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    ckpt = torch.load(args.ckpt, map_location=dev)
+    vocab = ckpt["vocab"]
+    max_len = ckpt["max_len"]
+    rev_vocab = {i:s for s,i in vocab.items()}
 
     # Build a model skeleton and load weights
     # These dims must match training; update if you changed config
-    emb_dim=256; rnn_hidden=256; rnn_layers=4; latent_dim=6; dropout=0.1
+    cfg = yaml.safe_load(open(args.config_file))
+    emb_dim=cfg["model"]["emb_dim"]
+    rnn_hidden=cfg["model"]["rnn_hidden"]
+    rnn_layers=cfg["model"]["rnn_layers"]
+    latent_dim=cfg["model"]["latent_dim"]
+    dropout=cfg["model"]["dropout"]
+
     model = ContRNNVAE(len(vocab), emb_dim, rnn_hidden, rnn_layers, latent_dim, dropout, max_len).to(dev)
-    ckpt = torch.load(args.ckpt, map_location=dev)
-    model.load_state_dict(ckpt["model"]); model.eval()
+    model.load_state_dict(ckpt["model"])
+    model.eval()
 
     rows = []
     remaining = args.n_sample
@@ -143,7 +152,6 @@ def main():
             persid = f"S{sample_base+i+1:08d}"
             hhid = ""  # unknown; keep blank or synthesize if needed
             stopno = 1
-            t = 0
             for act_id, (start_min, dur_min) in zip(a_ids, time_pairs):
                 purpose = rev_vocab[int(act_id)]
                 startime = int(start_min)
