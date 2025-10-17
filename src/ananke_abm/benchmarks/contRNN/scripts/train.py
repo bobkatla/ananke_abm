@@ -26,8 +26,8 @@ def main(cfg_path="configs/cont_rnn.yaml"):
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ds_tr = TensorDataset(train["acts"], train["durs"], train["mask"])
     ds_va = TensorDataset(val["acts"],   val["durs"],   val["mask"])
-    dl_tr = DataLoader(ds_tr, batch_size=cfg["train"]["batch_size"], shuffle=True, drop_last=False)
-    dl_va = DataLoader(ds_va, batch_size=cfg["train"]["batch_size"], shuffle=False, drop_last=False)
+    dl_tr = DataLoader(ds_tr, batch_size=cfg["train"]["batch_size"], shuffle=True, drop_last=False, num_workers=0, pin_memory=(dev.type=='cuda'))
+    dl_va = DataLoader(ds_va, batch_size=cfg["train"]["batch_size"], shuffle=False, drop_last=False, num_workers=0, pin_memory=(dev.type=='cuda'))
 
     mcfg = cfg["model"]
     tcfg = cfg["train"]
@@ -40,6 +40,7 @@ def main(cfg_path="configs/cont_rnn.yaml"):
     ).to(dev)
 
     opt = torch.optim.Adam(model.parameters(), lr=float(tcfg["lr"]))
+    scaler = torch.amp.GradScaler(enabled=(dev.type=='cuda'), device=dev.type)
     best_val = float("inf")
     best_epoch = -1
     out_dir = cfg["train"]["out_dir"]
@@ -48,41 +49,62 @@ def main(cfg_path="configs/cont_rnn.yaml"):
     kl_warm = lcfg.get("kl_anneal_epochs", 0)
     warm_up_alpha = 15
 
+    # --- setup AMP / scaler (CUDA only is simplest & robust) ---
     for epoch in range(1, tcfg["epochs"]+1):
         model.train()
         pbar = tqdm(dl_tr, desc=f"Train {epoch}")
-        loss_sum = 0.0
         for acts, durs, mask in pbar:
-            acts = acts.to(dev)
-            durs = durs.to(dev)
-            mask = mask.to(dev)
-            logits_act, logits_dur, mu, logvar = model(acts, durs)
-            ce, mse = masked_ce_mse(logits_act, logits_dur, acts, durs, mask)
-            kl = kl_normal(mu, logvar)
-            klw = beta * min(1.0, epoch/kl_warm) if kl_warm>0 else beta
-            alpha_t = alpha * min(1.0, epoch / warm_up_alpha)  # first ~15 epochs
-            loss = ce + alpha_t * mse + klw * kl
-            # loss = ce + alpha*mse + klw*kl
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            loss_sum += loss.item()
-            pbar.set_postfix(loss=f"{loss.item():.3f}", ce=f"{ce.item():.3f}", mse=f"{mse.item():.3f}", kl=f"{kl.item():.3f}")
+            acts = acts.to(dev, non_blocking=True)
+            durs = durs.to(dev, non_blocking=True)
+            mask = mask.to(dev, non_blocking=True)
 
-        # val
+            with torch.amp.autocast(enabled=(dev.type == 'cuda'), device_type=dev.type):
+                logits_act, logits_dur, mu, logvar = model(acts, durs)
+                # training: smoothing ON
+                ce, mse, stats = masked_ce_mse(
+                    logits_act, logits_dur, acts, durs, mask, label_smoothing=0.05
+                )
+                kl = kl_normal(mu, logvar)
+                klw = beta * min(1.0, epoch/kl_warm) if kl_warm>0 else beta
+                alpha_t = alpha * min(1.0, epoch / warm_up_alpha)
+                loss = ce + alpha_t * mse + klw * kl
+
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+
+            pbar.set_postfix(
+                loss=f"{loss.item():.3f}",
+                ce=f"{ce.item():.3f}",
+                mse=f"{mse.item():.3f}",
+                alpha_t=f"{alpha_t:.1f}",
+                klw=f"{klw:.3f}",
+                kl=f"{kl.item():.3f}",
+                n_tok=stats["n_tokens"]
+            )
+
+        # ----- validation -----
         model.eval()
+        # Use full teacher forcing for a stable validation objective
+        tf_train = model.tf
+        model.tf = 1.0
         with torch.no_grad():
             v_loss = 0.0
             for acts, durs, mask in dl_va:
-                acts = acts.to(dev); durs = durs.to(dev); mask = mask.to(dev)
+                acts = acts.to(dev, non_blocking=True)
+                durs = durs.to(dev, non_blocking=True)
+                mask = mask.to(dev, non_blocking=True)
                 logits_act, logits_dur, mu, logvar = model(acts, durs)
-                ce, mse = masked_ce_mse(logits_act, logits_dur, acts, durs, mask)
+                # validation: smoothing OFF; fixed α, β (paper-style selection)
+                ce, mse, _ = masked_ce_mse(logits_act, logits_dur, acts, durs, mask, label_smoothing=0.0)
                 kl = kl_normal(mu, logvar)
-                klw = beta
-                loss = ce + alpha*mse + klw*kl
-                v_loss += loss.item()
+                loss = ce + alpha * mse + beta * kl
+                v_loss += float(loss.item())
             v_loss /= max(1, len(dl_va))
-
+        model.tf = tf_train
+        
         if v_loss < best_val:
             print(f"Epoch {epoch}: val loss improved {best_val:.3f} -> {v_loss:.3f}")
             best_val = v_loss
