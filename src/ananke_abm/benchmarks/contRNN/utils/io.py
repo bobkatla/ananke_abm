@@ -9,9 +9,14 @@ def load_encoded(path_pt: str):
 
 def ensure_dir(d): os.makedirs(d, exist_ok=True)
 
-def save_ckpt(path, model, optim, epoch, best=False):
-    obj = {"model": model.state_dict(), "optim": optim.state_dict(), "epoch": epoch, "best": best}
-    torch.save(obj, path)
+def save_ckpt(path, model, optim, epoch, vocab, max_len, best=False):
+    ckpt_obj = {"model": model.state_dict(),
+            "optim": optim.state_dict(),
+            "epoch": epoch,
+            "best": best,
+            "vocab": vocab,                 # <- add this
+            "max_len": max_len}             # <- and this for safety
+    torch.save(ckpt_obj, path)
 
 def load_vocab(path):
     import json

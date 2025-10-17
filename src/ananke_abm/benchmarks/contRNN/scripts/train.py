@@ -84,8 +84,8 @@ def main(cfg_path="configs/cont_rnn.yaml"):
             print(f"Epoch {epoch}: val loss improved {best_val:.3f} -> {v_loss:.3f}")
             best_val = v_loss
             best_epoch = epoch
-            save_ckpt(os.path.join(out_dir,"best.pt"), model, opt, epoch, best=True)
-        save_ckpt(os.path.join(out_dir,"last.pt"), model, opt, epoch, best=False)
+            save_ckpt(os.path.join(out_dir,"best.pt"), model, opt, epoch, vocab, max_len, best=True)
+        save_ckpt(os.path.join(out_dir,"last.pt"), model, opt, epoch, vocab, max_len, best=False)
 
         # simple early stopping
         if epoch - best_epoch > cfg["train"]["patience"]:
