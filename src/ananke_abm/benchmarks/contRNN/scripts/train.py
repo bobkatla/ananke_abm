@@ -46,6 +46,7 @@ def main(cfg_path="configs/cont_rnn.yaml"):
     ensure_dir(out_dir)
     alpha, beta = lcfg["alpha"], lcfg["beta"]
     kl_warm = lcfg.get("kl_anneal_epochs", 0)
+    warm_up_alpha = 15
 
     for epoch in range(1, tcfg["epochs"]+1):
         model.train()
@@ -59,7 +60,9 @@ def main(cfg_path="configs/cont_rnn.yaml"):
             ce, mse = masked_ce_mse(logits_act, logits_dur, acts, durs, mask)
             kl = kl_normal(mu, logvar)
             klw = beta * min(1.0, epoch/kl_warm) if kl_warm>0 else beta
-            loss = ce + alpha*mse + klw*kl
+            alpha_t = alpha * min(1.0, epoch / warm_up_alpha)  # first ~15 epochs
+            loss = ce + alpha_t * mse + klw * kl
+            # loss = ce + alpha*mse + klw*kl
             opt.zero_grad()
             loss.backward()
             opt.step()
