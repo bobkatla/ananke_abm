@@ -45,6 +45,7 @@ dev = [
 
 [project.scripts]
 ananke = "ananke_abm.cli:main"
+rgen_schedule = "ananke_abm.models.gen_schedule.cli:main"
 
 [tool.uv.sources]
 torch = [
