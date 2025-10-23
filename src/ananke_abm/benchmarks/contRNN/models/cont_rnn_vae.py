@@ -1,7 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Tuple
 
 class ContRNNVAE(nn.Module):
     def __init__(self, vocab_size:int, emb_dim:int=256, rnn_hidden:int=256, rnn_layers:int=4,
@@ -48,7 +46,8 @@ class ContRNNVAE(nn.Module):
     def init_dec_state(self, z):
         B = z.size(0)
         hc = self.z_to_h(z)  # (B, 2*layers*H)
-        H = self.rnn_hidden; L = self.rnn_layers
+        H = self.rnn_hidden
+        L = self.rnn_layers
         hc = hc.view(B, 2, L, H).transpose(0,2)  # (layers, 2, B, H)
         h0 = hc[:,0]  # (layers,B,H)
         c0 = hc[:,1]
