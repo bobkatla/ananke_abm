@@ -3,7 +3,7 @@ import os
 import json
 import click
 from ananke_abm.models.gen_schedule.utils.cfg import ensure_dir
-from ananke_abm.models.gen_schedule.evals.metrics import tod_marginals, bigram_matrix, minutes_share
+from ananke_abm.models.gen_schedule.evals.metrics import tod_marginals, minutes_share, bigram_matrix_rowcond
 from ananke_abm.models.gen_schedule.viz.plots import plot_unaries_summary, plot_minutes_share, plot_tod_marginal, plot_bigram_delta
 
 def visualize(samples_npz_path, samples_meta_path, outdir_path, reference_grid_path):
@@ -31,7 +31,7 @@ def visualize(samples_npz_path, samples_meta_path, outdir_path, reference_grid_p
     # compute synth stats
     synth_minutes_share = minutes_share(generated_labels, P)
     synth_tod = tod_marginals(generated_labels, P)
-    synth_bigram = bigram_matrix(generated_labels, P)
+    synth_bigram = bigram_matrix_rowcond(generated_labels, P)
 
     # load reference stats if provided
     if reference_grid_path and os.path.exists(reference_grid_path):
@@ -39,7 +39,7 @@ def visualize(samples_npz_path, samples_meta_path, outdir_path, reference_grid_p
         reference_labels = ref_npz["Y"].astype(np.int64)
         ref_minutes_share = minutes_share(reference_labels, P)
         ref_tod = tod_marginals(reference_labels, P)
-        ref_bigram = bigram_matrix(reference_labels, P)
+        ref_bigram = bigram_matrix_rowcond(reference_labels, P)
     else:
         # fallback: compare synth to itself just to make plots work
         ref_minutes_share = synth_minutes_share
@@ -72,8 +72,8 @@ def visualize(samples_npz_path, samples_meta_path, outdir_path, reference_grid_p
     )
     # 4. Bigram delta heatmap
     plot_bigram_delta(
-        B_ref=ref_bigram,
-        B_syn=synth_bigram,
+        B_ref_rowcond=ref_bigram,
+        B_syn_rowcond=synth_bigram,
         purposes=purpose_names_ordered,
         outdir=os.path.join(outdir_path, "bigrams"),
     )

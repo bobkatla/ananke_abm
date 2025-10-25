@@ -78,15 +78,22 @@ def plot_tod_marginal(m_ref, m_syn, purposes, outdir):
         plt.savefig(os.path.join(outdir, f"tod_{p}_{purposes[p]}.png"))
         plt.close()
 
-def plot_bigram_delta(B_ref, B_syn, purposes, outdir):
+def plot_bigram_delta(B_ref_rowcond, B_syn_rowcond, purposes, outdir):
+    """
+    B_ref_rowcond, B_syn_rowcond: (P,P) row-normalized conditional bigram matrices
+      B[i,j] ~ P(next=j | current=i)
+    We'll plot absolute difference elementwise.
+    """
     os.makedirs(outdir, exist_ok=True)
-    D = np.abs(B_ref - B_syn)
+
+    D = np.abs(B_ref_rowcond - B_syn_rowcond)  # (P,P)
+
     plt.figure()
-    plt.imshow(D, interpolation="nearest", aspect="auto")
+    plt.imshow(D, cmap="viridis")
     plt.colorbar()
     plt.xticks(range(len(purposes)), purposes, rotation=45, ha="right")
     plt.yticks(range(len(purposes)), purposes)
-    plt.title("|Bigram Δ| (ref vs synth)")
+    plt.title("|Δ P(next | current)|  (row-normalized)")
     plt.tight_layout()
     plt.savefig(os.path.join(outdir, "bigram_delta.png"))
     plt.close()
