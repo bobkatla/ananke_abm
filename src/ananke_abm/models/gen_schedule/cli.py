@@ -65,7 +65,7 @@ def fit(config, output_dir, run, seed):
     n_train = n - n_val
     train_ds, val_ds = torch.utils.data.random_split(ds, [n_train, n_val], generator=torch.Generator().manual_seed(seed))
 
-    train_loader = DataLoader(train_ds, batch_size=cfg["train"]["batch_size"], shuffle=True, drop_last=True)
+    train_loader = DataLoader(train_ds, batch_size=cfg["train"]["batch_size"], shuffle=True, drop_last=False)
     val_loader = DataLoader(val_ds, batch_size=cfg["train"]["batch_size"], shuffle=False)
 
     model = ScheduleVAE(L=L, P=P, z_dim=cfg["model"]["z_dim"], emb_dim=cfg["model"]["emb_dim"]).to(device)
