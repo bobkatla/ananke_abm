@@ -4,7 +4,7 @@ import json
 import click
 from ananke_abm.models.gen_schedule.utils.cfg import ensure_dir
 from ananke_abm.models.gen_schedule.evals.metrics import tod_marginals, bigram_matrix, minutes_share
-from ananke_abm.models.gen_schedule.viz.plots import plot_unaries_mean, plot_minutes_share, plot_tod_marginal, plot_bigram_delta
+from ananke_abm.models.gen_schedule.viz.plots import plot_unaries_summary, plot_minutes_share, plot_tod_marginal, plot_bigram_delta
 
 def visualize(samples_npz_path, samples_meta_path, outdir_path, reference_grid_path):
     """
@@ -47,10 +47,14 @@ def visualize(samples_npz_path, samples_meta_path, outdir_path, reference_grid_p
         ref_bigram = synth_bigram
 
     # 1. Mean unaries (logits over time)
-    plot_unaries_mean(
-        U_mean_logits,                    # (L,P)
-        purpose_names_ordered,            # names aligned with P
-        os.path.join(outdir_path, "unaries")
+    U_mean_logits = synth_npz["U_mean_logits"].astype(np.float32)  # (T,P)
+    U_std_logits = synth_npz["U_std_logits"].astype(np.float32)    # (T,P)
+
+    plot_unaries_summary(
+        U_mean_logits=U_mean_logits,
+        U_std_logits=U_std_logits,
+        purposes=purpose_names_ordered,
+        outdir=os.path.join(outdir_path, "unaries"),
     )
     # 2. Minutes share bar chart
     plot_minutes_share(

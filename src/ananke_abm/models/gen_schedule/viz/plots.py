@@ -2,6 +2,41 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
+def plot_unaries_summary(U_mean_logits, U_std_logits, purposes, outdir):
+    """
+    U_mean_logits: (T, P) float32
+    U_std_logits:  (T, P) float32
+    purposes: list of length P with purpose names in index order
+    outdir: directory to save plots
+    """
+    os.makedirs(outdir, exist_ok=True)
+
+    T, P = U_mean_logits.shape
+    time_axis = np.arange(T)  # these are bins; you can convert to minutes if you want
+
+    for p in range(P):
+        mean_curve = U_mean_logits[:, p]
+        std_curve = U_std_logits[:, p]
+
+        upper = mean_curve + std_curve
+        lower = mean_curve - std_curve
+
+        plt.figure()
+        plt.fill_between(
+            time_axis,
+            lower,
+            upper,
+            alpha=0.2,
+            linewidth=0,
+        )
+        plt.plot(time_axis, mean_curve, linewidth=2)
+        plt.title(f"Decoder logits over time: {purposes[p]}")
+        plt.xlabel("time bin")
+        plt.ylabel("logit (mean ± 1 std)")
+        plt.tight_layout()
+        plt.savefig(os.path.join(outdir, f"unaries_{p}_{purposes[p]}.png"))
+        plt.close()
+
 def plot_unaries_mean(U_mean, purposes, outdir):
     os.makedirs(outdir, exist_ok=True)
     L,P = U_mean.shape

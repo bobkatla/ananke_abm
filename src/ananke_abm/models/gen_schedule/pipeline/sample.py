@@ -82,15 +82,42 @@ def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons):
     # Sampling loop (batched for memory safety)
     batch_size_generate = 1024
     all_generated_batches = []
-    logits_running_sum = None
-    logits_batch_count = 0
 
-    # also track latent stats
+    # running stats for logits across *individuals*
+    # We'll keep mean and M2 (for variance) over the population for each (t,p)
+    U_running_mean_flat = None          # shape (T*P,) float64
+    U_running_M2_flat = None            # shape (T*P,) float64
+    U_running_count = 0                 # scalar: how many individuals we've seen
+
+    # latent stats
     latent_sum = torch.zeros(latent_dim, dtype=torch.float64)
     latent_sq_sum = torch.zeros(latent_dim, dtype=torch.float64)
     latent_total_count = 0
 
     model_dtype = next(model.parameters()).dtype
+
+    def update_running_stats_batch(U_logits_batch_cpu_float64):
+        """
+        U_logits_batch_cpu_float64: (B, T, P) float64 on CPU
+        Updates global running mean / M2 / count over individuals.
+        """
+        nonlocal U_running_mean_flat, U_running_M2_flat, U_running_count
+
+        B, T, P = U_logits_batch_cpu_float64.shape
+        batch_flat = U_logits_batch_cpu_float64.reshape(B, T * P)  # (B, TP)
+
+        for b in range(B):
+            x = batch_flat[b]  # (TP,)
+            if U_running_count == 0:
+                U_running_mean_flat = x.clone()                     # init mean
+                U_running_M2_flat = torch.zeros_like(x, dtype=torch.float64)
+                U_running_count = 1
+            else:
+                U_running_count += 1
+                delta = x - U_running_mean_flat
+                U_running_mean_flat = U_running_mean_flat + delta / U_running_count
+                delta2 = x - U_running_mean_flat
+                U_running_M2_flat = U_running_M2_flat + delta * delta2
 
     with torch.no_grad():
         remaining = num_samples
@@ -101,28 +128,45 @@ def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons):
             # sample latent
             Z = torch.randn(current_bs, latent_dim, device=device, dtype=model_dtype)
 
-            # forward decode (we only need decoder, but calling decoder directly is fine)
-            U_logits = model.decoder(Z)  # (current_bs, num_time_bins, P)
+            # decode to logits
+            U_logits = model.decoder(Z)  # (B, num_time_bins, P)
 
-            # argmax to get discrete schedule
-            y_labels = torch.argmax(U_logits, dim=-1)  # (current_bs, num_time_bins)
+            # argmax to get discrete schedules
+            y_labels = torch.argmax(U_logits, dim=-1)  # (B, num_time_bins)
             all_generated_batches.append(y_labels.cpu().numpy().astype(np.int64))
 
-            # accumulate mean logits across individuals for sanity-plot (unaries)
-            batch_mean_logits = U_logits.mean(dim=0).cpu().numpy()  # (num_time_bins, P)
-            if logits_running_sum is None:
-                logits_running_sum = batch_mean_logits.copy()
-            else:
-                logits_running_sum += batch_mean_logits
-            logits_batch_count += 1
+            # update logits running stats (convert to float64 on CPU)
+            update_running_stats_batch(U_logits.cpu().to(torch.float64))
 
             # accumulate latent stats
             latent_sum += Z.sum(dim=0).cpu().to(torch.float64)
-            latent_sq_sum += (Z**2).sum(dim=0).cpu().to(torch.float64)
+            latent_sq_sum += (Z ** 2).sum(dim=0).cpu().to(torch.float64)
             latent_total_count += current_bs
 
-    generated_labels = np.concatenate(all_generated_batches, axis=0)  # (num_samples, num_time_bins)
-    U_mean_logits = logits_running_sum / max(1, logits_batch_count)   # (num_time_bins, P)
+        # stack all generated label sequences
+        generated_labels = np.concatenate(all_generated_batches, axis=0)  # (num_samples, num_time_bins)
+
+        # finalize logits stats
+        # reshape running mean / var back to (T,P)
+        if U_running_count > 0:
+            U_mean_logits = U_running_mean_flat.reshape(num_time_bins, P)  # (T,P)
+            if U_running_count > 1:
+                U_var_logits = (U_running_M2_flat / (U_running_count - 1)).reshape(num_time_bins, P)
+            else:
+                U_var_logits = torch.zeros(num_time_bins, P, dtype=torch.float64)
+            U_std_logits = torch.sqrt(torch.clamp(U_var_logits, min=0.0))
+        else:
+            U_mean_logits = torch.zeros(num_time_bins, P, dtype=torch.float64)
+            U_std_logits = torch.zeros(num_time_bins, P, dtype=torch.float64)
+
+        U_mean_logits = U_mean_logits.numpy().astype(np.float32)
+        U_std_logits = U_std_logits.numpy().astype(np.float32)
+
+    # summarize latent sampling stats
+    latent_mean = (latent_sum / max(1, latent_total_count)).numpy()
+    latent_var = (latent_sq_sum / max(1, latent_total_count)).numpy() - latent_mean ** 2
+    latent_std = np.sqrt(np.maximum(latent_var, 1e-12))
+    Z_stats = np.stack([latent_mean, latent_std], axis=0).astype(np.float32)  # (2, latent_dim)
 
     # summarize latent sampling stats
     latent_mean = (latent_sum / max(1, latent_total_count)).numpy()
@@ -162,6 +206,7 @@ def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons):
         npz_path,
         Y_generated=generated_labels.astype(np.int64),
         U_mean_logits=U_mean_logits.astype(np.float32),
+        U_std_logits=U_std_logits.astype(np.float32),
         Z_stats=Z_stats.astype(np.float32),
     )
 
