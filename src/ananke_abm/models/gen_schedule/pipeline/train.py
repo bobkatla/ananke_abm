@@ -8,8 +8,9 @@ from tqdm import tqdm
 from ananke_abm.models.gen_schedule.utils.cfg import load_config, ensure_dir
 from ananke_abm.models.gen_schedule.utils.seed import set_seed
 from ananke_abm.models.gen_schedule.utils.ckpt import save_checkpoint
-from ananke_abm.models.gen_schedule.models.vae import ScheduleVAE, kl_gaussian
+from ananke_abm.models.gen_schedule.models.factory import build_model
 from ananke_abm.models.gen_schedule.losses.reg import time_total_variation
+from ananke_abm.models.gen_schedule.losses.kl import kl_gaussian
 
 
 class GridDataset(Dataset):
@@ -85,12 +86,7 @@ def train(config, output_dir, run, seed):
         drop_last=False,
     )
 
-    model = ScheduleVAE(
-        L=num_time_bins,
-        P=num_purposes,
-        z_dim=cfg["model"]["z_dim"],
-        emb_dim=cfg["model"]["emb_dim"],
-    ).to(device)
+    model = build_model(cfg, meta).to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),

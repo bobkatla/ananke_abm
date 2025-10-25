@@ -1,9 +1,5 @@
-
 data:
   npz: src/output/rgen_phase1/train_10min.npz
-model:
-  z_dim: 12
-  emb_dim: 32
 train:
   epochs: 300
   batch_size: 32
@@ -13,4 +9,22 @@ train:
   beta_target: 1.0
   beta_warm_frac: 0.3
   lambda_tv: 0.01
+  lambda_home: 0.1
   val_frac: 0.1
+
+# model:
+#   method: "baseline_cnn"
+#   z_dim: 12
+#   emb_dim: 32
+#   cnn_channels: [64, 64]
+#   cnn_kernel: 5
+#   cnn_dropout: 0.1
+
+model:
+  method: "baseline_rnn"
+  z_dim: 16
+  emb_dim: 64
+  rnn_hidden_dim: 64
+  rnn_layers: 1
+  rnn_dropout: 0.1
+  use_emb_layernorm: true

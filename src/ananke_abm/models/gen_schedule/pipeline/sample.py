@@ -4,7 +4,7 @@ import json
 import numpy as np
 import torch
 from ananke_abm.models.gen_schedule.utils.seed import set_seed
-from ananke_abm.models.gen_schedule.models.vae import ScheduleVAE
+from ananke_abm.models.gen_schedule.models.factory import build_model
 
 
  # -------------- CSV preview reconstruction --------------
@@ -68,9 +68,7 @@ def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons):
 
     # Init model
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = ScheduleVAE(L=num_time_bins, P=P,
-                        z_dim=cfg["model"]["z_dim"],
-                        emb_dim=cfg["model"]["emb_dim"]).to(device)
+    model = build_model(cfg, meta).to(device)
     model.load_state_dict(ckpt_obj["model"])
     model.eval()
 

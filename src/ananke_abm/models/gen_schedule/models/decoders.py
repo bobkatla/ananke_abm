@@ -1,20 +1,56 @@
-
 import torch
 import torch.nn as nn
 
-class TimeBasisDecoder(nn.Module):
-    def __init__(self, L: int, P: int, z_dim: int=12, H: int=32):
+
+class ScheduleDecoderIndependent(nn.Module):
+    """
+    Decoder that maps latent z -> per-time, per-purpose logits.
+
+    We assume the same structure as the Phase 1 decoder:
+    - A learned global time basis of shape (T, H)
+    - A latent-conditioned factor of shape (B, P, H)
+    - Combine to produce logits (B, T, P)
+
+    Args:
+        L: number of time bins
+        P: number of purposes/classes
+        z_dim: latent dim
+        emb_dim: internal width / factor dim H
+    """
+
+    def __init__(self, L, P, z_dim, emb_dim):
         super().__init__()
-        self.L, self.P, self.H = L, P, H
-        self.B_time = nn.Parameter(torch.randn(L, H) * 0.05)
-        self.mlp = nn.Sequential(
-            nn.Linear(z_dim, 128), nn.ReLU(),
-            nn.Linear(128, P*H)
+        self.L = L
+        self.P = P
+        self.z_dim = z_dim
+        self.emb_dim = emb_dim
+
+        # time basis: (L, H)
+        self.time_basis = nn.Parameter(torch.randn(L, emb_dim) * 0.01)
+
+        # map z -> per-purpose factors (B, P, H)
+        self.latent_to_factor = nn.Sequential(
+            nn.Linear(z_dim, emb_dim * P),
         )
-        self.bias_p = nn.Parameter(torch.zeros(P))
+
+        # per-purpose bias
+        self.bias = nn.Parameter(torch.zeros(P))
 
     def forward(self, z):
-        B = z.size(0)
-        C = self.mlp(z).view(B, self.P, self.H)  # (B,P,H)
-        U = torch.einsum("lh,bph->blp", self.B_time, C) + self.bias_p
-        return U
+        """
+        z: (B, z_dim)
+        returns logits: (B, L, P)
+        """
+        B = z.shape[0]
+
+        # latent factors
+        latent_factors = self.latent_to_factor(z)  # (B, P*H)
+        latent_factors = latent_factors.view(B, self.P, self.emb_dim)  # (B,P,H)
+
+        # combine time basis (L,H) with per-purpose factors (B,P,H)
+        # we want logits[b,t,p] = <time_basis[t,:], latent_factors[b,p,:]> + bias[p]
+        # => einsum over H
+        logits = torch.einsum("th,bph->btp", self.time_basis, latent_factors)  # (B,L,P)
+
+        logits = logits + self.bias.view(1, 1, self.P)
+        return logits
