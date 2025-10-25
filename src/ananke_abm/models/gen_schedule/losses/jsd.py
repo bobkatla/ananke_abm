@@ -1,17 +1,13 @@
+from scipy.spatial.distance import jensenshannon
 import numpy as np
 
-def _safe_norm(p):
-    p = np.asarray(p, dtype=np.float64)
-    s = p.sum()
-    if s <= 0: 
-        return np.ones_like(p)/len(p)
-    return p / s
-
 def jsd(p, q, eps=1e-12):
-    p = _safe_norm(p)
-    q = _safe_norm(q)
-    m = 0.5*(p+q)
-    def ent(x):
-        x = np.clip(x, eps, 1.0)
-        return -np.sum(x*np.log(x))
-    return 0.5*(ent(p) - ent(m)) + 0.5*(ent(q) - ent(m))
+    # scipy expects non-negative vectors; they'll get normalized internally.
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    # tiny epsilon to avoid all-zeros corner cases
+    p = np.clip(p, eps, None)
+    q = np.clip(q, eps, None)
+    js_distance = jensenshannon(p, q, base=np.e)  # base=np.e so logs match our nats
+    js_divergence = js_distance ** 2
+    return float(js_divergence)
