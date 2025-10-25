@@ -1,0 +1,236 @@
+import os
+import json
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from ananke_abm.models.gen_schedule.utils.cfg import load_config, ensure_dir
+from ananke_abm.models.gen_schedule.utils.seed import set_seed
+from ananke_abm.models.gen_schedule.utils.ckpt import save_checkpoint
+from ananke_abm.models.gen_schedule.models.vae import ScheduleVAE, kl_gaussian
+from ananke_abm.models.gen_schedule.losses.reg import time_total_variation
+
+
+class GridDataset(Dataset):
+    def __init__(self, npz_path):
+        d = np.load(npz_path)
+        self.Y = d["Y"].astype(np.int64)
+    def __len__(self):
+        return self.Y.shape[0]
+    def __getitem__(self, i):
+        y = self.Y[i]
+        return torch.from_numpy(y)
+
+def start_end_home_loss(logits_batch, home_class_index):
+    # logits_batch: (B, T, P)
+    # we want high prob of home at t=0 and t=T-1
+    B, T, P = logits_batch.shape
+    if T < 2:
+        return torch.tensor(0.0, device=logits_batch.device, dtype=logits_batch.dtype)
+    logp0 = F.log_softmax(logits_batch[:, 0, :], dim=-1)      # (B,P)
+    logpT = F.log_softmax(logits_batch[:, -1, :], dim=-1)     # (B,P)
+    loss0 = -logp0[:, home_class_index].mean()
+    lossT = -logpT[:, home_class_index].mean()
+    return (loss0 + lossT) * 0.5
+
+        
+def train(config, output_dir, run, seed):
+    cfg = load_config(config)
+    set_seed(seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    outdir = os.path.join(output_dir, run)
+    ensure_dir(outdir)
+    ensure_dir(os.path.join(outdir, "checkpoints"))
+    ensure_dir(os.path.join(outdir, "plots"))
+
+    data_npz_path = cfg["data"]["npz"]
+    meta_path = data_npz_path.replace(".npz", "_meta.json")
+    with open(meta_path, "r", encoding="utf-8") as f_meta:
+        meta = json.load(f_meta)
+
+    purpose_map = meta["purpose_map"]                  # {purpose_name: index}
+    home_idx = purpose_map.get("Home", None)
+    if home_idx is None:
+        # fallback: most common first label in dataset
+        tmp_ref = np.load(data_npz_path)["Y"].astype(np.int64)
+        vals, counts = np.unique(tmp_ref[:, 0], return_counts=True)
+        home_idx = int(vals[np.argmax(counts)])
+
+    num_purposes = len(purpose_map)
+    num_time_bins = meta["L"]
+
+    full_dataset = GridDataset(data_npz_path)
+    num_total = len(full_dataset)
+    num_val = max(1, int(num_total * cfg["train"]["val_frac"]))
+    num_train = num_total - num_val
+
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_dataset,
+        [num_train, num_val],
+        generator=torch.Generator().manual_seed(seed),
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=min(cfg["train"]["batch_size"], max(1, num_train)),
+        shuffle=True,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=min(cfg["train"]["batch_size"], max(1, num_val)),
+        shuffle=False,
+        drop_last=False,
+    )
+
+    model = ScheduleVAE(
+        L=num_time_bins,
+        P=num_purposes,
+        z_dim=cfg["model"]["z_dim"],
+        emb_dim=cfg["model"]["emb_dim"],
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg["train"]["lr"],
+        weight_decay=cfg["train"]["weight_decay"],
+    )
+
+    best_val_loss = np.inf
+    last_ckpt_path = os.path.join(outdir, "checkpoints", "last.pt")
+    best_ckpt_path = os.path.join(outdir, "checkpoints", "best_val.pt")
+
+    num_epochs = cfg["train"]["epochs"]
+    warmup_epochs = int(max(1, num_epochs * cfg["train"]["beta_warm_frac"]))
+    beta_target = cfg["train"]["beta_target"]
+
+    lambda_tv = cfg["train"]["lambda_tv"]
+    lambda_home = cfg["train"].get("lambda_home", 0.1)
+
+    for epoch in range(1, num_epochs + 1):
+        model.train()
+        beta = beta_target * min(1.0, epoch / max(1, warmup_epochs))
+
+        total_train_loss = 0.0
+        total_train_ce = 0.0
+        total_train_kl = 0.0
+        total_train_tv = 0.0
+        total_train_home = 0.0
+        num_train_batches = 0
+
+        for batch_labels in tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}"):
+            batch_labels = batch_labels.to(device)  # (B,T)
+            logits_batch, mu, logvar = model(batch_labels)  # logits_batch: (B,T,P)
+
+            ce_loss = F.cross_entropy(
+                logits_batch.permute(0, 2, 1),  # (B,P,T)
+                batch_labels,                   # (B,T)
+                reduction="mean"
+            )
+
+            kl_loss = kl_gaussian(mu, logvar)
+            tv_loss = time_total_variation(logits_batch)
+
+            home_loss = start_end_home_loss(logits_batch, home_idx)
+
+            loss = ce_loss + beta * kl_loss + lambda_tv * tv_loss + lambda_home * home_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["train"]["grad_clip"])
+            optimizer.step()
+
+            total_train_loss += float(loss.item())
+            total_train_ce += float(ce_loss.item())
+            total_train_kl += float(kl_loss.item())
+            total_train_tv += float(tv_loss.item())
+            total_train_home += float(home_loss.item())
+            num_train_batches += 1
+
+        if num_train_batches > 0:
+            avg_train_loss = total_train_loss / num_train_batches
+            avg_train_ce = total_train_ce / num_train_batches
+            avg_train_kl = total_train_kl / num_train_batches
+            avg_train_tv = total_train_tv / num_train_batches
+            avg_train_home = total_train_home / num_train_batches
+        else:
+            avg_train_loss = 0.0
+            avg_train_ce = 0.0
+            avg_train_kl = 0.0
+            avg_train_tv = 0.0
+            avg_train_home = 0.0
+
+        model.eval()
+        total_val_loss = 0.0
+        total_val_ce = 0.0
+        total_val_kl = 0.0
+        total_val_tv = 0.0
+        total_val_home = 0.0
+        num_val_batches = 0
+
+        with torch.no_grad():
+            for batch_labels in val_loader:
+                batch_labels = batch_labels.to(device)
+                logits_batch, mu, logvar = model(batch_labels)
+
+                ce_loss = F.cross_entropy(
+                    logits_batch.permute(0, 2, 1),
+                    batch_labels,
+                    reduction="mean"
+                )
+                kl_loss = kl_gaussian(mu, logvar)
+                tv_loss = time_total_variation(logits_batch)
+                home_loss = start_end_home_loss(logits_batch, home_idx)
+
+                val_loss = ce_loss + beta * kl_loss + lambda_tv * tv_loss + lambda_home * home_loss
+
+                total_val_loss += float(val_loss.item())
+                total_val_ce += float(ce_loss.item())
+                total_val_kl += float(kl_loss.item())
+                total_val_tv += float(tv_loss.item())
+                total_val_home += float(home_loss.item())
+                num_val_batches += 1
+
+        if num_val_batches > 0:
+            avg_val_loss = total_val_loss / num_val_batches
+            avg_val_ce = total_val_ce / num_val_batches
+            avg_val_kl = total_val_kl / num_val_batches
+            avg_val_tv = total_val_tv / num_val_batches
+            avg_val_home = total_val_home / num_val_batches
+        else:
+            avg_val_loss = 0.0
+            avg_val_ce = 0.0
+            avg_val_kl = 0.0
+            avg_val_tv = 0.0
+            avg_val_home = 0.0
+
+        save_checkpoint(
+            {"model": model.state_dict(), "meta": meta, "cfg": cfg},
+            last_ckpt_path,
+        )
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            save_checkpoint(
+                {"model": model.state_dict(), "meta": meta, "cfg": cfg},
+                best_ckpt_path,
+            )
+
+        log_record = {
+            "epoch": epoch,
+            "beta": beta,
+            "train_loss": avg_train_loss,
+            "train_ce": avg_train_ce,
+            "train_kl": avg_train_kl,
+            "train_tv": avg_train_tv,
+            "train_home": avg_train_home,
+            "val_loss": avg_val_loss,
+            "val_ce": avg_val_ce,
+            "val_kl": avg_val_kl,
+            "val_tv": avg_val_tv,
+            "val_home": avg_val_home,
+            "num_train_batches": num_train_batches,
+            "num_val_batches": num_val_batches,
+        }
+        print(json.dumps(log_record))
