@@ -12,8 +12,8 @@ train:
   lambda_home: 0.1
   val_frac: 0.1
   # population calibration losses
-  lambda_tod: 0.0
-  lambda_presence: 0.0
+  lambda_tod: 0.1
+  lambda_presence: 0.1
 
 model:
   method: "auto_pds"

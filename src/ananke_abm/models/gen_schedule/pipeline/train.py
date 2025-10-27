@@ -11,6 +11,10 @@ from ananke_abm.models.gen_schedule.utils.ckpt import save_checkpoint
 from ananke_abm.models.gen_schedule.models.factory import build_model
 from ananke_abm.models.gen_schedule.losses.reg import time_total_variation
 from ananke_abm.models.gen_schedule.losses.kl import kl_gaussian
+from ananke_abm.models.gen_schedule.losses.utils_loss_pds import (
+    loss_time_of_day_marginal,
+    loss_presence_rate,
+)
 
 
 class GridDataset(Dataset):
@@ -59,9 +63,6 @@ def train(config, output_dir, run, seed):
         vals, counts = np.unique(tmp_ref[:, 0], return_counts=True)
         home_idx = int(vals[np.argmax(counts)])
 
-    num_purposes = len(purpose_map)
-    num_time_bins = meta["L"]
-
     full_dataset = GridDataset(data_npz_path)
     num_total = len(full_dataset)
     num_val = max(1, int(num_total * cfg["train"]["val_frac"]))
@@ -105,6 +106,21 @@ def train(config, output_dir, run, seed):
     lambda_tv = cfg["train"]["lambda_tv"]
     lambda_home = cfg["train"].get("lambda_home", 0.1)
 
+    if cfg["model"]["method"] == "auto_pds":
+        pds_npz = np.load(cfg["model"]["pds_path"])
+        m_tod_emp = torch.tensor(
+            pds_npz["m_tod"], dtype=torch.float32
+        )                        # (P,T)
+        presence_emp = torch.tensor(
+            pds_npz["presence_rate"], dtype=torch.float32
+        )                        # (P,)
+        # move to device once
+        m_tod_emp_PT = m_tod_emp.to(device)           # (P,T)
+        presence_emp_P = presence_emp.to(device)      # (P,)
+    else:
+        m_tod_emp_PT = None
+        presence_emp_P = None
+
     for epoch in range(1, num_epochs + 1):
         model.train()
         beta = beta_target * min(1.0, epoch / max(1, warmup_epochs))
@@ -125,13 +141,20 @@ def train(config, output_dir, run, seed):
                 batch_labels,                   # (B,T)
                 reduction="mean"
             )
-
             kl_loss = kl_gaussian(mu, logvar)
             tv_loss = time_total_variation(logits_batch)
-
             home_loss = start_end_home_loss(logits_batch, home_idx)
 
             loss = ce_loss + beta * kl_loss + lambda_tv * tv_loss + lambda_home * home_loss
+
+            if cfg["model"]["method"] == "auto_pds":
+                # m_tod_emp_PT and presence_emp_P were prepared once outside loop
+                L_tod = loss_time_of_day_marginal(logits_batch, m_tod_emp_PT)
+                L_presence = loss_presence_rate(logits_batch, presence_emp_P)
+
+                loss = loss \
+                    + cfg["train"]["lambda_tod"] * L_tod \
+                    + cfg["train"]["lambda_presence"] * L_presence
 
             optimizer.zero_grad()
             loss.backward()
