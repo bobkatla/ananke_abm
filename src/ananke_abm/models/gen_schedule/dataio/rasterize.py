@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import pandas as pd
 import numpy as np
@@ -56,4 +55,7 @@ def prepare_from_csv(csv_path: str, out_path: str, grid_min: int=10, horizon_min
 
     m = compute_empirical_tod(Y, P=len(purpose_map))
     np.save(out_path.replace(".npz", "_tod.npy"), m)
+    # save purpose map
+    with open(out_path.replace(".npz", "_purpose_map.json"), "w", encoding="utf-8") as f:
+        json.dump(purpose_map, f, indent=2)
     return out_path, meta
