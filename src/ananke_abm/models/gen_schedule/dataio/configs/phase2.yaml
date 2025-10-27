@@ -11,20 +11,15 @@ train:
   lambda_tv: 0.01
   lambda_home: 0.1
   val_frac: 0.1
+  # population calibration losses
+  lambda_tod: 0.0
+  lambda_presence: 0.0
 
 model:
-  method: "baseline_cnn"
+  method: "auto_pds"
   z_dim: 16
   emb_dim: 128
   cnn_channels: [64, 64]
   cnn_kernel: 5
   cnn_dropout: 0.1
-
-# model:
-#   method: "baseline_rnn"
-#   z_dim: 16
-#   emb_dim: 64
-#   rnn_hidden_dim: 64
-#   rnn_layers: 1
-#   rnn_dropout: 0.1
-#   use_emb_layernorm: true
+  pds_path: src/output/rgen/runs/exp_phase2/phase2_pds.npz
