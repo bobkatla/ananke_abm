@@ -1,11 +1,5 @@
 #!/bin/bash
 
-# 1) Prepare 10-min grid from your small dev CSV
-uv run rgen_schedule prepare \
-  --activities "src/data/traj_processed/small_activities_homebound_wd.csv" \
-  --grid 10 \
-  --out src/output/rgen/train_10min.npz
-
 # 2) Fit Phase 1
 uv run rgen_schedule fit \
   --config src/ananke_abm/models/gen_schedule/dataio/configs/phase1.yaml \
