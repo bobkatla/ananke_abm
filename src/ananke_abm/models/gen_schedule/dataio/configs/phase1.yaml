@@ -12,19 +12,19 @@ train:
   lambda_home: 0.1
   val_frac: 0.1
 
-# model:
-#   method: "baseline_cnn"
-#   z_dim: 12
-#   emb_dim: 32
-#   cnn_channels: [64, 64]
-#   cnn_kernel: 5
-#   cnn_dropout: 0.1
-
 model:
-  method: "baseline_rnn"
-  z_dim: 16
-  emb_dim: 64
-  rnn_hidden_dim: 64
-  rnn_layers: 1
-  rnn_dropout: 0.1
-  use_emb_layernorm: true
+  method: "baseline_cnn"
+  z_dim: 12
+  emb_dim: 32
+  cnn_channels: [64, 64]
+  cnn_kernel: 5
+  cnn_dropout: 0.1
+
+# model:
+#   method: "baseline_rnn"
+#   z_dim: 16
+#   emb_dim: 64
+#   rnn_hidden_dim: 64
+#   rnn_layers: 1
+#   rnn_dropout: 0.1
+#   use_emb_layernorm: true

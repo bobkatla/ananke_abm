@@ -1,4 +1,5 @@
 import click
+from ananke_abm.models.gen_schedule.models.pds import compute_pds_cli
 
 
 @click.group()
@@ -72,3 +73,6 @@ def viz_population(samples_npz_path, samples_meta_path, outdir_path, reference_g
     from ananke_abm.models.gen_schedule.pipeline.viz import visualize
     visualize(samples_npz_path, samples_meta_path, outdir_path, reference_grid_path)
     click.echo(f"Visualization complete. Plots saved to {outdir_path}.")
+
+
+main.add_command(compute_pds_cli)
