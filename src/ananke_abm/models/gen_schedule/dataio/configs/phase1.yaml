@@ -1,5 +1,5 @@
 data:
-  npz: src/output/rgen_phase1/train_10min.npz
+  npz: src/output/rgen/train_10min.npz
 train:
   epochs: 300
   batch_size: 32
@@ -14,8 +14,8 @@ train:
 
 model:
   method: "baseline_cnn"
-  z_dim: 12
-  emb_dim: 32
+  z_dim: 16
+  emb_dim: 128
   cnn_channels: [64, 64]
   cnn_kernel: 5
   cnn_dropout: 0.1
