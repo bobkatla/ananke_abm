@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import json
 import os
+import torch
+from ananke_abm.models.gen_schedule.dataio.splits import read_n_split_data
 
 PURPOSE_COL = "purpose"
 
@@ -31,7 +33,14 @@ def compute_empirical_tod(Y, P):
             m[t,p] = np.mean(col==p)
     return m
 
-def prepare_from_csv(csv_path: str, out_path: str, grid_min: int=10, horizon_min: int=1800):
+def prepare_from_csv(
+        csv_path: str,
+        out_path: str,
+        grid_min: int=10, 
+        horizon_min: int=1800,
+        val_frac: float=0.2,
+        seed: int=42,
+        ):
     df = pd.read_csv(csv_path)
     if "startime" in df.columns and "starttime" not in df.columns:
         df = df.rename(columns={"startime":"starttime"})
@@ -43,11 +52,22 @@ def prepare_from_csv(csv_path: str, out_path: str, grid_min: int=10, horizon_min
     for pid, grp in df.groupby("persid"):
         grp = grp.sort_values("stopno")
         y = rasterize_person(grp, purpose_map, grid_min, horizon_min)
-        seqs.append(y); pers.append(pid)
+        seqs.append(y)
+        pers.append(pid)
     Y = np.stack(seqs, axis=0)
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     np.savez_compressed(out_path, Y=Y.astype(np.int64))
+    # split
+    train_dataset, val_dataset = read_n_split_data(
+        val_frac=val_frac,
+        data_npz_path=out_path,
+        seed=seed,
+    )
+    torch.save({
+        "train_dataset": train_dataset,
+        "val_dataset": val_dataset,
+    }, out_path.replace(".npz", "_splits.pt"))
     meta = {"grid_min": grid_min, "horizon_min": horizon_min, "L": int(L),
             "purpose_map": purpose_map, "inv_purpose_map": inv_map, "N": int(Y.shape[0])}
     with open(out_path.replace(".npz", "_meta.json"), "w", encoding="utf-8") as f:

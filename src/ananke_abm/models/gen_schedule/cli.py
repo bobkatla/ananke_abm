@@ -11,9 +11,11 @@ def main():
 @click.option("--activities", type=click.Path(exists=True), required=True)
 @click.option("--grid", type=int, default=10)
 @click.option("--out", type=click.Path(), required=True)
-def prepare(activities, grid, out):
+@click.option("--val-frac", type=float, default=0.2)
+@click.option("--seed", type=int, default=42)
+def prepare(activities, grid, out, val_frac, seed):
     from ananke_abm.models.gen_schedule.dataio.rasterize import prepare_from_csv
-    prepare_from_csv(activities, out, grid_min=grid)
+    prepare_from_csv(activities, out, grid_min=grid, val_frac=val_frac, seed=seed)
     click.echo(f"Prepared grid at {out}")
 
 

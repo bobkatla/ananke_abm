@@ -4,7 +4,9 @@
 uv run rgen_schedule prepare \
   --activities "src/data/traj_processed/small_activities_homebound_wd.csv" \
   --grid 10 \
-  --out src/output/rgen/train_10min.npz
+  --out src/output/rgen/train_10min.npz \
+  --val-frac 0.1 \
+  --seed 123
 
 uv run rgen_schedule compute-pds \
   --grid src/output/rgen/train_10min.npz \

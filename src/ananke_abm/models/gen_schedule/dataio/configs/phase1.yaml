@@ -10,7 +10,6 @@ train:
   beta_warm_frac: 0.3
   lambda_tv: 0.01
   lambda_home: 0.1
-  val_frac: 0.1
 
 model:
   method: "baseline_cnn"
