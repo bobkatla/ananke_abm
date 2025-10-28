@@ -11,6 +11,7 @@ from ananke_abm.models.gen_schedule.utils.ckpt import save_checkpoint
 from ananke_abm.models.gen_schedule.models.factory import build_model
 from ananke_abm.models.gen_schedule.losses.reg import time_total_variation
 from ananke_abm.models.gen_schedule.losses.kl import kl_gaussian
+from ananke_abm.models.gen_schedule.losses.home_loss import start_end_home_loss
 from ananke_abm.models.gen_schedule.losses.utils_loss_pds import (
     loss_time_of_day_marginal,
     loss_presence_rate,
@@ -26,18 +27,6 @@ class GridDataset(Dataset):
     def __getitem__(self, i):
         y = self.Y[i]
         return torch.from_numpy(y)
-
-def start_end_home_loss(logits_batch, home_class_index):
-    # logits_batch: (B, T, P)
-    # we want high prob of home at t=0 and t=T-1
-    B, T, P = logits_batch.shape
-    if T < 2:
-        return torch.tensor(0.0, device=logits_batch.device, dtype=logits_batch.dtype)
-    logp0 = F.log_softmax(logits_batch[:, 0, :], dim=-1)      # (B,P)
-    logpT = F.log_softmax(logits_batch[:, -1, :], dim=-1)     # (B,P)
-    loss0 = -logp0[:, home_class_index].mean()
-    lossT = -logpT[:, home_class_index].mean()
-    return (loss0 + lossT) * 0.5
 
         
 def train(config, output_dir, run, seed):
