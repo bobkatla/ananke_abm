@@ -3,8 +3,9 @@ import json
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+from ananke_abm.models.gen_schedule.dataio.splits import read_n_split_data
 from ananke_abm.models.gen_schedule.utils.cfg import load_config, ensure_dir
 from ananke_abm.models.gen_schedule.utils.seed import set_seed
 from ananke_abm.models.gen_schedule.utils.ckpt import save_checkpoint
@@ -16,17 +17,6 @@ from ananke_abm.models.gen_schedule.losses.utils_loss_pds import (
     loss_time_of_day_marginal,
     loss_presence_rate,
 )
-
-
-class GridDataset(Dataset):
-    def __init__(self, npz_path):
-        d = np.load(npz_path)
-        self.Y = d["Y"].astype(np.int64)
-    def __len__(self):
-        return self.Y.shape[0]
-    def __getitem__(self, i):
-        y = self.Y[i]
-        return torch.from_numpy(y)
 
         
 def train(config, output_dir, run, seed):
@@ -52,26 +42,21 @@ def train(config, output_dir, run, seed):
         vals, counts = np.unique(tmp_ref[:, 0], return_counts=True)
         home_idx = int(vals[np.argmax(counts)])
 
-    full_dataset = GridDataset(data_npz_path)
-    num_total = len(full_dataset)
-    num_val = max(1, int(num_total * cfg["train"]["val_frac"]))
-    num_train = num_total - num_val
-
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_dataset,
-        [num_train, num_val],
-        generator=torch.Generator().manual_seed(seed),
+    train_dataset, val_dataset = read_n_split_data(
+        val_frac=cfg["data"]["val_frac"],
+        data_npz_path=data_npz_path,
+        seed=seed,
     )
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=min(cfg["train"]["batch_size"], max(1, num_train)),
+        batch_size=min(cfg["train"]["batch_size"], max(1, len(train_dataset))),
         shuffle=True,
         drop_last=False,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=min(cfg["train"]["batch_size"], max(1, num_val)),
+        batch_size=min(cfg["train"]["batch_size"], max(1, len(val_dataset))),
         shuffle=False,
         drop_last=False,
     )
