@@ -44,7 +44,7 @@ def fit(config, output_dir, seed):
               help="Max number of generated individuals to export into the human-readable preview CSV.")
 @click.option("--decode-mode", type=click.Choice(["argmax", "crf"]), default="argmax", show_default=True,
               help="Decoding mode to convert model logits to discrete activity purposes.")
-@click.option("--crf-path", type=click.Path(exists=True), default="",
+@click.option("--crf-path", type=click.Path(exists=True), default=None,
               help="Path to trained CRF model checkpoint (required if decode-mode is 'crf').")
 def sample_population(ckpt_path, num_samples, outprefix, seed, csv_max_persons, decode_mode, crf_path):
     from ananke_abm.models.gen_schedule.pipeline.sample import sample
