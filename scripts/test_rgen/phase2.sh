@@ -3,8 +3,8 @@
 # Fit
 uv run rgen_schedule fit \
   --config src/ananke_abm/models/gen_schedule/dataio/configs/phase2.yaml \
-  --output-dir src/output/rgen/runs \
-  --run exp_phase2 --seed 123
+  --output-dir src/output/rgen/runs/exp_phase2 \
+  --seed 123
 
 # Sample schedules (argmax decode) from the trained decoder
 uv run rgen_schedule sample-population \
