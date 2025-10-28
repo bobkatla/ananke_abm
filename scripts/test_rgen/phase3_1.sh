@@ -21,7 +21,7 @@ uv run rgen_schedule viz-population \
   --reference src/output/rgen/train_10min.npz \
   --outdir src/output/rgen/runs/exp_phase2/plots_crf
 
-# uv run rgen_schedule sample-population \
+uv run rgen_schedule sample-population \
   --ckpt src/output/rgen/runs/exp_phase1/checkpoints/last.pt \
   --num-samples 20000 \
   --outprefix src/output/rgen/runs/exp_phase1/samples_10min_crf \
