@@ -43,7 +43,7 @@ def train(config, output_dir, run, seed):
         home_idx = int(vals[np.argmax(counts)])
 
     train_dataset, val_dataset = read_n_split_data(
-        val_frac=cfg["data"]["val_frac"],
+        val_frac=cfg["train"]["val_frac"],
         data_npz_path=data_npz_path,
         seed=seed,
     )
