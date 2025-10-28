@@ -3,7 +3,7 @@ import json
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from ananke_abm.models.gen_schedule.utils.cfg import load_config, ensure_dir
 from ananke_abm.models.gen_schedule.utils.seed import set_seed
