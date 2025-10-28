@@ -3,9 +3,8 @@ import json
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
-from ananke_abm.models.gen_schedule.dataio.splits import read_n_split_data
 from ananke_abm.models.gen_schedule.utils.cfg import load_config, ensure_dir
 from ananke_abm.models.gen_schedule.utils.seed import set_seed
 from ananke_abm.models.gen_schedule.utils.ckpt import save_checkpoint
@@ -19,12 +18,12 @@ from ananke_abm.models.gen_schedule.losses.utils_loss_pds import (
 )
 
         
-def train(config, output_dir, run, seed):
+def train(config, output_dir, seed):
     cfg = load_config(config)
     set_seed(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    outdir = os.path.join(output_dir, run)
+    outdir = output_dir
     ensure_dir(outdir)
     ensure_dir(os.path.join(outdir, "checkpoints"))
     ensure_dir(os.path.join(outdir, "plots"))
@@ -42,12 +41,10 @@ def train(config, output_dir, run, seed):
         vals, counts = np.unique(tmp_ref[:, 0], return_counts=True)
         home_idx = int(vals[np.argmax(counts)])
 
-    train_dataset, val_dataset = read_n_split_data(
-        val_frac=cfg["train"]["val_frac"],
-        data_npz_path=data_npz_path,
-        seed=seed,
-    )
-
+    splits_path = cfg["data"]["split_pt"]
+    split_obj = torch.load(splits_path, weights_only=False)
+    train_dataset = split_obj["train_dataset"]
+    val_dataset = split_obj["val_dataset"]
     train_loader = DataLoader(
         train_dataset,
         batch_size=min(cfg["train"]["batch_size"], max(1, len(train_dataset))),

@@ -1,5 +1,6 @@
 data:
   npz: src/output/rgen/train_10min.npz
+  split_pt: src/output/rgen/train_10min_splits.pt
 train:
   epochs: 1000
   batch_size: 32

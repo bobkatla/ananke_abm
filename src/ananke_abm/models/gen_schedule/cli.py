@@ -22,12 +22,11 @@ def prepare(activities, grid, out, val_frac, seed):
 @main.command("fit")
 @click.option("--config", type=click.Path(exists=True), required=True)
 @click.option("--output-dir", type=click.Path(), default="runs")
-@click.option("--run", type=str, required=True)
 @click.option("--seed", type=int, default=123)
-def fit(config, output_dir, run, seed):
+def fit(config, output_dir, seed):
     from ananke_abm.models.gen_schedule.pipeline.train import train
-    train(config, output_dir, run, seed)
-    click.echo(f"Training complete for run {run} in {output_dir}")
+    train(config, output_dir, seed)
+    click.echo(f"Training complete in {output_dir}")
 
 
 @main.command("sample-population")
