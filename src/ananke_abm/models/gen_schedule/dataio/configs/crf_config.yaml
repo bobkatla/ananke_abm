@@ -1,0 +1,13 @@
+# crf_config.yaml
+
+crf:
+  train_npz: "src/output/rgen/crf_data/crf_train.npz"
+  val_npz:   "src/output/rgen/crf_data/crf_val.npz"
+  save_path: "src/output/rgen/crf_data/crf_linear.pt"
+
+  num_epochs: 80
+  batch_size: 32
+  lr: 1e-3
+  weight_decay: 1e-4
+
+  log_every: 10
