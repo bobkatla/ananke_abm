@@ -45,7 +45,18 @@ def decode_person_to_segments(seq_row, person_id_prefix, grid_minutes, inverse_p
     return out_rows
 
 
-def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons):
+def crf_decode_batch(logits_batch, crf_model):
+    """
+    logits_batch: (B, T, P) torch.FloatTensor on same device as crf_model
+    returns (B, T) long
+    """
+    assert crf_model is not None, "crf_model must be provided for CRF decoding"
+    with torch.no_grad():
+        return crf_model.decode(logits_batch)
+
+
+def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons,
+           decode_mode="argmax", crf_path=None):
     """
     Generate a synthetic population from a trained checkpoint and save:
     - <prefix>.npz              : machine artifact with generated_labels and mean logits
@@ -71,6 +82,19 @@ def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons):
     model = build_model(cfg, meta).to(device)
     model.load_state_dict(ckpt_obj["model"])
     model.eval()
+
+    # Optional CRF model (only if decode_mode == "crf")
+    crf_model = None
+    if decode_mode == "crf":
+        if crf_path is None or crf_path == "":
+            raise ValueError("decode_mode='crf' requires crf_path")
+        from ananke_abm.models.gen_schedule.models.crf.model import TransitionCRF
+        crf_ckpt = torch.load(crf_path, map_location="cpu")
+        crf_model = TransitionCRF(num_purposes=P).to(device)
+        crf_model.load_state_dict(crf_ckpt["A_state_dict"])
+        crf_model.eval()
+        for p in crf_model.parameters():
+            p.requires_grad_(False)
 
     # Reproducibility
     set_seed(seed)
@@ -129,9 +153,17 @@ def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons):
             # decode to logits
             U_logits = model.decoder(Z)  # (B, num_time_bins, P)
 
-            # argmax to get discrete schedules
-            y_labels = torch.argmax(U_logits, dim=-1)  # (B, num_time_bins)
-            all_generated_batches.append(y_labels.cpu().numpy().astype(np.int64))
+            # choose decoding method
+            if decode_mode == "argmax":
+                y_labels = torch.argmax(U_logits, dim=-1)  # (B, num_time_bins)
+            elif decode_mode == "crf":
+                y_labels = crf_decode_batch(U_logits, crf_model)  # (B, num_time_bins)
+            else:
+                raise ValueError(f"Unknown decode_mode: {decode_mode}")
+
+            all_generated_batches.append(
+                y_labels.cpu().numpy().astype(np.int64)
+            )
 
             # update logits running stats (convert to float64 on CPU)
             update_running_stats_batch(U_logits.cpu().to(torch.float64))
@@ -219,10 +251,14 @@ def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons):
         "latent_dim": latent_dim,
         "num_samples": int(num_samples),
         "seed": int(seed),
+        "vae_ckpt": ckpt_path,
+        "decode_mode": decode_mode,
+        "crf_path": crf_path,
+        "pds_method": cfg["model"].get("method", "auto_pds"),
     }
     with open(meta_json_path, "w", encoding="utf-8") as f_meta:
         json.dump(meta_out, f_meta, indent=2)
 
-    click.echo(f"Saved machine artifact to {npz_path}")
-    click.echo(f"Saved metadata to {meta_json_path}")
-    click.echo(f"Saved human-readable preview CSV to {preview_csv_path}")
+    click.echo(f"[sample:{decode_mode}] Saved machine artifact to {npz_path}")
+    click.echo(f"[sample:{decode_mode}] Saved metadata to {meta_json_path}")
+    click.echo(f"[sample:{decode_mode}] Saved human-readable preview CSV to {preview_csv_path}")

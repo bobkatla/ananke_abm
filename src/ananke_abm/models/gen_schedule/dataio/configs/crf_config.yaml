@@ -5,7 +5,7 @@ crf:
   val_npz:   "src/output/rgen/crf_data/crf_val.npz"
   save_path: "src/output/rgen/crf_data/crf_linear.pt"
 
-  num_epochs: 80
+  num_epochs: 1000
   batch_size: 32
   lr: 1e-3
   weight_decay: 1e-4

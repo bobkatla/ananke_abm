@@ -10,7 +10,8 @@ uv run rgen_schedule fit \
 uv run rgen_schedule sample-population \
   --ckpt src/output/rgen/runs/exp_phase1/checkpoints/last.pt \
   --num-samples 20000 \
-  --outprefix src/output/rgen/runs/exp_phase1/samples_10min
+  --outprefix src/output/rgen/runs/exp_phase1/samples_10min \
+  --decode-mode argmax \
 
 # 4) Evaluate the sampled schedules against the reference
 uv run rgen_schedule eval-population \
