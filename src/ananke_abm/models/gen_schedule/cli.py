@@ -46,9 +46,11 @@ def fit(config, output_dir, seed):
               help="Decoding mode to convert model logits to discrete activity purposes.")
 @click.option("--crf-path", type=click.Path(exists=True), default=None,
               help="Path to trained CRF model checkpoint (required if decode-mode is 'crf').")
-def sample_population(ckpt_path, num_samples, outprefix, seed, csv_max_persons, decode_mode, crf_path):
+@click.option("--enforce-nonhome", is_flag=True, default=False, show_default=True,
+              help="If set with decode-mode 'crf', ensures at least one non-Home activity in each schedule.")
+def sample_population(ckpt_path, num_samples, outprefix, seed, csv_max_persons, decode_mode, crf_path, enforce_nonhome):
     from ananke_abm.models.gen_schedule.pipeline.sample import sample
-    sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons, decode_mode, crf_path)
+    sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons, decode_mode, crf_path, enforce_nonhome)
     click.echo(f"Sampled {num_samples} individuals to {outprefix}.npz and related files.")
 
 

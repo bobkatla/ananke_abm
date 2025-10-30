@@ -45,18 +45,18 @@ def decode_person_to_segments(seq_row, person_id_prefix, grid_minutes, inverse_p
     return out_rows
 
 
-def crf_decode_batch(logits_batch, crf_model):
+def crf_decode_batch(logits_batch, crf_model, enforce_nonhome):
     """
     logits_batch: (B, T, P) torch.FloatTensor on same device as crf_model
     returns (B, T) long
     """
     assert crf_model is not None, "crf_model must be provided for CRF decoding"
     with torch.no_grad():
-        return crf_model.decode(logits_batch)
+        return crf_model.decode(logits_batch, enforce_nonhome=enforce_nonhome)
 
 
 def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons,
-           decode_mode="argmax", crf_path=None):
+           decode_mode="argmax", crf_path=None, enforce_nonhome=False):
     """
     Generate a synthetic population from a trained checkpoint and save:
     - <prefix>.npz              : machine artifact with generated_labels and mean logits
@@ -90,7 +90,8 @@ def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons,
             raise ValueError("decode_mode='crf' requires crf_path")
         from ananke_abm.models.gen_schedule.models.crf.model import TransitionCRF
         crf_ckpt = torch.load(crf_path, map_location="cpu")
-        crf_model = TransitionCRF(num_purposes=P).to(device)
+        home_idx = crf_ckpt.get("home_idx", None)
+        crf_model = TransitionCRF(num_purposes=P, home_idx=home_idx).to(device)
         crf_model.load_state_dict(crf_ckpt["A_state_dict"])
         crf_model.eval()
         for p in crf_model.parameters():
@@ -157,7 +158,7 @@ def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons,
             if decode_mode == "argmax":
                 y_labels = torch.argmax(U_logits, dim=-1)  # (B, num_time_bins)
             elif decode_mode == "crf":
-                y_labels = crf_decode_batch(U_logits, crf_model)  # (B, num_time_bins)
+                y_labels = crf_decode_batch(U_logits, crf_model, enforce_nonhome=enforce_nonhome)  # (B, num_time_bins)
             else:
                 raise ValueError(f"Unknown decode_mode: {decode_mode}")
 
