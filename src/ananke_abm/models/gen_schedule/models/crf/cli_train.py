@@ -26,6 +26,14 @@ def train_crf_cmd(cfg_path):
     weight_decay = cfg["crf"]["weight_decay"]
     log_every    = cfg["crf"].get("log_every", 10)
 
+    # --- NEW: load meta to get home_idx ---
+    meta_json_path = cfg["crf"]["meta_json"]
+    with open(meta_json_path, "r", encoding="utf-8") as f:
+        crf_meta = json.load(f)
+    home_idx = int(crf_meta.get("home_idx", -1))
+    if home_idx < 0:
+        raise ValueError("home_idx not found in crf_meta.json; run prepare-crf-data again.")
+
     # load CRF training data produced by prepare-crf-data
     train_arr = np.load(train_npz)
     val_arr   = np.load(val_npz)
@@ -44,7 +52,8 @@ def train_crf_cmd(cfg_path):
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, drop_last=False)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    crf = TransitionCRF(num_purposes=P).to(device)
+    # --- NEW: pass home_idx (and keep a bias term for states) ---
+    crf = TransitionCRF(num_purposes=P, home_idx=home_idx, use_bias=True).to(device)
 
     optimizer = optim.Adam(crf.parameters(), lr=float(lr), weight_decay=float(weight_decay))
 
@@ -78,11 +87,7 @@ def train_crf_cmd(cfg_path):
         mean_val   = float(np.mean(val_losses))   if val_losses   else 0.0
 
         if epoch % log_every == 0 or epoch == 1 or epoch == num_epochs:
-            msg = {
-                "epoch": epoch,
-                "train_nll": mean_train,
-                "val_nll": mean_val,
-            }
+            msg = {"epoch": epoch, "train_nll": mean_train, "val_nll": mean_val}
             click.echo(json.dumps(msg))
 
         # best-by-val checkpoint
@@ -93,6 +98,7 @@ def train_crf_cmd(cfg_path):
                     "A_state_dict": crf.state_dict(),
                     "P": P,
                     "T": T,
+                    "home_idx": home_idx,
                 },
                 save_path
             )

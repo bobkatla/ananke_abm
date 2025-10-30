@@ -68,6 +68,13 @@ def prepare_crf_data(vae_ckpt, split_pt, outdir, batch_size):
         Y=Y_val.astype(np.int64),
     )
 
+     # Resolve home_idx
+    purpose_map = meta["purpose_map"]
+    if "Home" in purpose_map:
+        home_idx = int(purpose_map["Home"])
+    else:
+        raise ValueError("Purpose map does not contain 'Home' purpose.")
+    
     # Meta useful for downstream sanity/debug
     meta_out = {
         "P": P,
@@ -77,6 +84,7 @@ def prepare_crf_data(vae_ckpt, split_pt, outdir, batch_size):
         "horizon_min": meta["horizon_min"],
         "vae_ckpt": vae_ckpt,
         "split_pt": split_pt,
+        "home_idx": home_idx,
     }
     with open(os.path.join(outdir, "crf_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta_out, f, indent=2)
