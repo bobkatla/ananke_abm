@@ -43,9 +43,15 @@ def compare_samples(ref_npz, sample_dir, purpose_map, outdir):
     # Optional reference ToD marginals (precomputed alongside ref_npz)
     ref_tod_path = ref_npz.replace(".npz", "_tod.npy")
     ref_tod = np.load(ref_tod_path) if os.path.exists(ref_tod_path) else None
-    # load purpose_map for reports
+
+    # load purpose_map for reports and axis labels
     with open(purpose_map, "r", encoding="utf-8") as f:
-        purpose_map_dict = json.load(f)
+        purpose_map_dict = json.load(f)     # {name: idx}
+    # Build index->name list in index order
+    P_from_map = max(purpose_map_dict.values()) + 1
+    idx_to_name = [""] * P_from_map
+    for name, idx in purpose_map_dict.items():
+        idx_to_name[idx] = name
 
     # ---------- Find sample npz files ----------
     npz_files = sorted([os.path.join(sample_dir, f)
@@ -82,8 +88,8 @@ def compare_samples(ref_npz, sample_dir, purpose_map, outdir):
     for si in sample_infos:
         rpt = make_report(
             Y_synth=si["Y"],
-            Y_ref=Y_ref,          # N_ref may differ; distributional metrics are fine
-            purpose_map=purpose_map_dict,     # optional; metrics do not require names
+            Y_ref=Y_ref,                 # N_ref may differ; distributional metrics are fine
+            purpose_map=purpose_map_dict,
             ref_tod=ref_tod
         )
         reports[si["name"]] = rpt
@@ -105,8 +111,11 @@ def compare_samples(ref_npz, sample_dir, purpose_map, outdir):
             "minutes_share_abs_error_mean": float(np.mean(ms_abs)),
             "minutes_share_abs_error_max": float(np.max(ms_abs)),
         }
+        # also store per-purpose abs errors with human-readable names
         for pidx, val in enumerate(ms_abs):
-            row[f"ms_abs_p{pidx}"] = val
+            pname = idx_to_name[pidx] if pidx < len(idx_to_name) else f"p{pidx}"
+            safe_col = f"ms_abs_{pname}"
+            row[safe_col] = val
         agg_rows.append(row)
 
     # ---------- Save aggregate CSV ----------
@@ -151,7 +160,8 @@ def compare_samples(ref_npz, sample_dir, purpose_map, outdir):
     any_rpt = next(iter(reports.values()))
     ms_ref = any_rpt["minutes_share"]["ref"]
     P = len(ms_ref)
-    purpose_labels = [f"p{p}" for p in range(P)]
+    # If purpose_map had extra/unused indices, trim to P
+    purpose_labels = idx_to_name[:P]
 
     width = 0.8 / max(1, len(models_sorted))
     x = np.arange(P)
@@ -183,7 +193,7 @@ def compare_samples(ref_npz, sample_dir, purpose_map, outdir):
     plt.savefig(os.path.join(outdir, "cmp_minutes_share_ref_vs_models.png"), dpi=150)
     plt.close()
 
-    # 6) Macro table as PNG (handle mixed dtypes: model is str, metrics are numeric)
+    # 6) Macro table as PNG
     display_cols = [
         "bigram_L1",
         "tod_jsd_macro",

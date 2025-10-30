@@ -21,7 +21,7 @@ uv run rgen_schedule viz-population \
   --samples src/output/rgen/runs/exp_phase2/samples_10min_crf_nonhome.npz \
   --samples-meta src/output/rgen/runs/exp_phase2/samples_10min_crf_nonhome_meta.json \
   --reference src/output/rgen/train_10min.npz \
-  --outdir src/output/rgen/runs/exp_phase2/plots_crf
+  --outdir src/output/rgen/runs/exp_phase2/plots_crf_nonhome
 
 # Sample using CRF decoding from the trained decoder (phase1 model)
 # uv run rgen_schedule sample-population \
