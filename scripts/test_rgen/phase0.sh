@@ -1,15 +1,15 @@
 #!/bin/bash
 
-# 1) Prepare 10-min grid from your small dev CSV
+# 1) Prepare 5-min grid from your small dev CSV
 uv run rgen_schedule prepare \
-  --activities "src/data/traj_processed/small_activities_homebound_wd.csv" \
-  --grid 10 \
-  --out src/output/rgen/train_10min.npz \
+  --activities "src/data/schedule_processed/24h_0.05_activities_homebound_wd.csv" \
+  --grid 5 \
+  --out src/output/new_rgen/train_5min.npz \
   --val-frac 0.1 \
   --seed 123
 
 uv run rgen_schedule compute-pds \
-  --grid src/output/rgen/train_10min.npz \
-  --out src/output/rgen/runs/exp_phase2/phase2 \
-  --grid-min 10 \
-  --purpose-json src/output/rgen/train_10min_purpose_map.json
+  --grid src/output/new_rgen/train_5min.npz \
+  --out src/output/new_rgen/runs/exp_phase2/phase2 \
+  --grid-min 5 \
+  --purpose-json src/output/new_rgen/train_5min_purpose_map.json

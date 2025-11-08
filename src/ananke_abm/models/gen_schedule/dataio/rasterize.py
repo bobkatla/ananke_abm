@@ -12,7 +12,7 @@ def build_purpose_map(df: pd.DataFrame):
     uniq = sorted(df[PURPOSE_COL].unique().tolist())
     return {p:i for i,p in enumerate(uniq)}
 
-def rasterize_person(person_df, purpose_map, grid_min: int, horizon_min: int=1800):
+def rasterize_person(person_df, purpose_map, grid_min: int, horizon_min: int=1440):
     L = horizon_min // grid_min
     arr = np.zeros(L, dtype=np.int64)
     for _,r in person_df.iterrows():
@@ -37,7 +37,7 @@ def prepare_from_csv(
         csv_path: str,
         out_path: str,
         grid_min: int=10, 
-        horizon_min: int=1800,
+        horizon_min: int=1440,
         val_frac: float=0.2,
         seed: int=42,
         ):
