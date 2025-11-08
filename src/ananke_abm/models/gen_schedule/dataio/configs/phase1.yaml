@@ -1,8 +1,10 @@
 data:
-  npz: src/output/rgen/train_10min.npz
-  split_pt: src/output/rgen/train_10min_splits.pt
+  npz: src/output/new_rgen/train_5min.npz
+  split_pt: src/output/new_rgen/train_5min_splits.pt
 train:
-  epochs: 1000
+  epochs: 200
+  min_epochs: 50
+  patience: 50
   batch_size: 32
   lr: 0.001
   weight_decay: 0.0001
@@ -15,7 +17,7 @@ train:
 model:
   method: "baseline_cnn"
   z_dim: 16
-  emb_dim: 128
+  emb_dim: 256
   cnn_channels: [64, 64]
   cnn_kernel: 5
   cnn_dropout: 0.1

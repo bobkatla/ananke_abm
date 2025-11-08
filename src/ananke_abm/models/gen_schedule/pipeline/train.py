@@ -71,6 +71,8 @@ def train(config, output_dir, seed):
     best_ckpt_path = os.path.join(outdir, "checkpoints", "best_val.pt")
 
     num_epochs = cfg["train"]["epochs"]
+    min_epochs = cfg["train"]["min_epochs"]
+    patience = cfg["train"]["patience"]
     warmup_epochs = int(max(1, num_epochs * cfg["train"]["beta_warm_frac"]))
     beta_target = cfg["train"]["beta_target"]
 
@@ -92,6 +94,7 @@ def train(config, output_dir, seed):
         m_tod_emp_PT = None
         presence_emp_P = None
 
+    wait_epoch = 0
     for epoch in range(1, num_epochs + 1):
         model.train()
         beta = beta_target * min(1.0, epoch / max(1, warmup_epochs))
@@ -200,12 +203,17 @@ def train(config, output_dir, seed):
             {"model": model.state_dict(), "meta": meta, "cfg": cfg},
             last_ckpt_path,
         )
+        wait_epoch += 1
+        if epoch >= min_epochs and wait_epoch >= patience:
+            print(f"No improvement for {patience} epochs, stopping training.")
+            break
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             save_checkpoint(
                 {"model": model.state_dict(), "meta": meta, "cfg": cfg},
                 best_ckpt_path,
             )
+            wait_epoch = 0
 
         log_record = {
             "epoch": epoch,
