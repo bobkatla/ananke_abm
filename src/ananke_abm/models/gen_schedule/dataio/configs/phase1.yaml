@@ -2,9 +2,9 @@ data:
   npz: src/output/new_rgen/train_5min.npz
   split_pt: src/output/new_rgen/train_5min_splits.pt
 train:
-  epochs: 300
-  min_epochs: 120
-  patience: 50
+  epochs: 500
+  min_epochs: 1000
+  patience: 1000
   batch_size: 1024
   lr: 0.001
   weight_decay: 0.0001
