@@ -1,6 +1,7 @@
 import os
 import json
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -93,6 +94,8 @@ def train(config, output_dir, seed):
     else:
         m_tod_emp_PT = None
         presence_emp_P = None
+
+    store_logs = []
 
     wait_epoch = 0
     for epoch in range(1, num_epochs + 1):
@@ -231,4 +234,7 @@ def train(config, output_dir, seed):
             "num_train_batches": num_train_batches,
             "num_val_batches": num_val_batches,
         }
-        print(json.dumps(log_record))
+        store_logs.append(log_record)
+    
+    log_df = pd.DataFrame(store_logs)
+    log_df.to_csv(os.path.join(outdir, "training_log.csv"), index=False)
