@@ -107,6 +107,8 @@ def train(config, output_dir, seed):
         total_train_kl = 0.0
         total_train_tv = 0.0
         total_train_home = 0.0
+        total_train_tod = 0.0
+        total_train_presence = 0.0
         num_train_batches = 0
 
         for batch_labels in tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}"):
@@ -132,6 +134,8 @@ def train(config, output_dir, seed):
                 loss = loss \
                     + cfg["train"]["lambda_tod"] * L_tod \
                     + cfg["train"]["lambda_presence"] * L_presence
+                total_train_tod += float(L_tod.item())
+                total_train_presence += float(L_presence.item())
 
             optimizer.zero_grad()
             loss.backward()
@@ -151,12 +155,16 @@ def train(config, output_dir, seed):
             avg_train_kl = total_train_kl / num_train_batches
             avg_train_tv = total_train_tv / num_train_batches
             avg_train_home = total_train_home / num_train_batches
+            avg_train_tod = total_train_tod / num_train_batches
+            avg_train_presence = total_train_presence / num_train_batches
         else:
             avg_train_loss = 0.0
             avg_train_ce = 0.0
             avg_train_kl = 0.0
             avg_train_tv = 0.0
             avg_train_home = 0.0
+            avg_train_tod = 0.0
+            avg_train_presence = 0.0
 
         model.eval()
         total_val_loss = 0.0
@@ -164,6 +172,8 @@ def train(config, output_dir, seed):
         total_val_kl = 0.0
         total_val_tv = 0.0
         total_val_home = 0.0
+        total_val_tod = 0.0
+        total_val_presence = 0.0
         num_val_batches = 0
 
         with torch.no_grad():
@@ -182,6 +192,17 @@ def train(config, output_dir, seed):
 
                 val_loss = ce_loss + beta * kl_loss + lambda_tv * tv_loss + lambda_home * home_loss
 
+                if cfg["model"]["method"] == "auto_pds":
+                    # m_tod_emp_PT and presence_emp_P were prepared once outside loop
+                    L_tod = loss_time_of_day_marginal(logits_batch, m_tod_emp_PT)
+                    L_presence = loss_presence_rate(logits_batch, presence_emp_P)
+
+                    val_loss = val_loss \
+                        + cfg["train"]["lambda_tod"] * L_tod \
+                        + cfg["train"]["lambda_presence"] * L_presence
+                    total_val_tod += float(L_tod.item())
+                    total_val_presence += float(L_presence.item())
+
                 total_val_loss += float(val_loss.item())
                 total_val_ce += float(ce_loss.item())
                 total_val_kl += float(kl_loss.item())
@@ -195,12 +216,16 @@ def train(config, output_dir, seed):
             avg_val_kl = total_val_kl / num_val_batches
             avg_val_tv = total_val_tv / num_val_batches
             avg_val_home = total_val_home / num_val_batches
+            avg_val_tod = total_val_tod / num_val_batches
+            avg_val_presence = total_val_presence / num_val_batches
         else:
             avg_val_loss = 0.0
             avg_val_ce = 0.0
             avg_val_kl = 0.0
             avg_val_tv = 0.0
             avg_val_home = 0.0
+            avg_val_tod = 0.0
+            avg_val_presence = 0.0
 
         save_checkpoint(
             {"model": model.state_dict(), "meta": meta, "cfg": cfg},
@@ -210,7 +235,8 @@ def train(config, output_dir, seed):
         if epoch >= min_epochs and wait_epoch >= patience:
             print(f"No improvement for {patience} epochs, stopping training.")
             break
-        if avg_val_loss < best_val_loss:
+        improvement = best_val_loss - avg_val_loss
+        if improvement > 0.003:
             best_val_loss = avg_val_loss
             save_checkpoint(
                 {"model": model.state_dict(), "meta": meta, "cfg": cfg},
@@ -226,11 +252,15 @@ def train(config, output_dir, seed):
             "train_kl": avg_train_kl,
             "train_tv": avg_train_tv,
             "train_home": avg_train_home,
+            "train_tod": avg_train_tod,
+            "train_presence": avg_train_presence,
             "val_loss": avg_val_loss,
             "val_ce": avg_val_ce,
             "val_kl": avg_val_kl,
             "val_tv": avg_val_tv,
             "val_home": avg_val_home,
+            "val_tod": avg_val_tod,
+            "val_presence": avg_val_presence,
             "num_train_batches": num_train_batches,
             "num_val_batches": num_val_batches,
         }
