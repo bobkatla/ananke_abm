@@ -1,9 +1,9 @@
 #!/bin/bash
 
 uv run rgen_schedule prepare-crf-data \
-    --vae_ckpt src/output/rgen/runs/exp_phase2/checkpoints/last.pt \
-    --split_pt src/output/rgen/train_10min_splits.pt \
-    --outdir src/output/rgen/crf_data \
+    --vae_ckpt src/output/new_rgen/runs/exp_phase2/checkpoints/last.pt \
+    --split_pt src/output/neW_rgen/train_5min_splits.pt \
+    --outdir src/output/new_rgen/crf_data \
     --batch_size 64
 
 uv run rgen_schedule train-crf \
