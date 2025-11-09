@@ -6,7 +6,7 @@ from ananke_abm.models.gen_schedule.utils.cfg import ensure_dir
 from ananke_abm.models.gen_schedule.evals.metrics import tod_marginals, minutes_share, bigram_matrix_rowcond
 from ananke_abm.models.gen_schedule.viz.plots import plot_unaries_summary, plot_minutes_share, plot_tod_marginal, plot_bigram_delta
 
-def visualize(samples_npz_path, samples_meta_path, outdir_path, reference_grid_path):
+def visualize(samples_npz_path, samples_meta_path, outdir_path, reference_grid_path, use_logits=True):
     """
     Produce sanity plots for a sampled population:
     - Mean unaries over time (U_mean_logits)
@@ -19,7 +19,6 @@ def visualize(samples_npz_path, samples_meta_path, outdir_path, reference_grid_p
     # load generated population artifact
     synth_npz = np.load(samples_npz_path)
     generated_labels = synth_npz["Y_generated"].astype(np.int64)     # (N, L)
-    U_mean_logits = synth_npz["U_mean_logits"].astype(np.float32)    # (L, P)
 
     with open(samples_meta_path, "r", encoding="utf-8") as f_meta:
         meta = json.load(f_meta)
@@ -47,15 +46,16 @@ def visualize(samples_npz_path, samples_meta_path, outdir_path, reference_grid_p
         ref_bigram = synth_bigram
 
     # 1. Mean unaries (logits over time)
-    U_mean_logits = synth_npz["U_mean_logits"].astype(np.float32)  # (T,P)
-    U_std_logits = synth_npz["U_std_logits"].astype(np.float32)    # (T,P)
+    if use_logits:
+        U_mean_logits = synth_npz["U_mean_logits"].astype(np.float32)  # (T,P)
+        U_std_logits = synth_npz["U_std_logits"].astype(np.float32)    # (T,P)
 
-    plot_unaries_summary(
-        U_mean_logits=U_mean_logits,
-        U_std_logits=U_std_logits,
-        purposes=purpose_names_ordered,
-        outdir=os.path.join(outdir_path, "unaries"),
-    )
+        plot_unaries_summary(
+            U_mean_logits=U_mean_logits,
+            U_std_logits=U_std_logits,
+            purposes=purpose_names_ordered,
+            outdir=os.path.join(outdir_path, "unaries"),
+        )
     # 2. Minutes share bar chart
     plot_minutes_share(
         share_syn=synth_minutes_share,

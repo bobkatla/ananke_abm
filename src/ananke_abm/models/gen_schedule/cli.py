@@ -79,9 +79,11 @@ def eval_population(samples_npz_path, samples_meta_path, reference_grid_path, ou
               help="Directory to write plots.")
 @click.option("--reference", "reference_grid_path", type=click.Path(), default="",
               help="Optional reference prepared grid npz (real data) to overlay.")
-def viz_population(samples_npz_path, samples_meta_path, outdir_path, reference_grid_path):
+@click.option("--not-use-logits", is_flag=True, default=True, show_default=True,
+                help="If set, will not plot unaries using U_mean_logits and U_std_logits from the samples npz.")
+def viz_population(samples_npz_path, samples_meta_path, outdir_path, reference_grid_path, not_use_logits):
     from ananke_abm.models.gen_schedule.pipeline.viz import visualize
-    visualize(samples_npz_path, samples_meta_path, outdir_path, reference_grid_path)
+    visualize(samples_npz_path, samples_meta_path, outdir_path, reference_grid_path, not_use_logits)
     click.echo(f"Visualization complete. Plots saved to {outdir_path}.")
 
 
