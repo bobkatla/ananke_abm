@@ -10,6 +10,6 @@ uv run rgen_schedule prepare \
 
 uv run rgen_schedule compute-pds \
   --grid src/output/new_rgen/train_5min.npz \
-  --out src/output/new_rgen/runs/exp_phase2/phase2 \
+  --out src/output/new_rgen/runs/pmd/pmd_sample \
   --grid-min 5 \
   --purpose-json src/output/new_rgen/train_5min_purpose_map.json
