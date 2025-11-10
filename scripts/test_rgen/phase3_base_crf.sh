@@ -3,7 +3,7 @@
 # Sample using CRF decoding from the trained decoder (phase1 model)
 uv run rgen_schedule sample-population \
   --ckpt src/output/new_rgen/runs/exp_phase1/checkpoints/last.pt \
-  --num-samples 42891 \
+  --num-samples 42817 \
   --outprefix src/output/new_rgen/runs/base_w_crf/samples_base_5min_crf \
   --decode-mode crf \
   --crf-path src/output/new_rgen/crf_data_base/crf_linear.pt

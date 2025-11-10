@@ -9,7 +9,7 @@ uv run rgen_schedule fit \
 # 3) Sample schedules (argmax decode) from the trained decoder
 uv run rgen_schedule sample-population \
   --ckpt src/output/new_rgen/runs/exp_phase1/checkpoints/last.pt \
-  --num-samples 42891 \
+  --num-samples 42817 \
   --outprefix src/output/new_rgen/runs/exp_phase1/samples_5min \
   --decode-mode argmax \
 
