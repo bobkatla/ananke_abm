@@ -25,4 +25,4 @@ model:
   cnn_channels: [64, 64]
   cnn_kernel: 5
   cnn_dropout: 0.1
-  pds_path: src/output/new_rgen/runs/exp_phase2/phase2_pds.npz
+  pds_path: src/output/new_rgen/runs/pmd/pmd_sample.npz
