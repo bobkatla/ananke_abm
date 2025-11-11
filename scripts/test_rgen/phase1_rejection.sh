@@ -10,20 +10,21 @@
 uv run rgen_schedule sample-population \
   --ckpt src/output/new_rgen/runs/base_cnn/checkpoints/last.pt \
   --num-samples 42817 \
-  --outprefix src/output/new_rgen/runs/base_cnn/samples_5min \
+  --outprefix src/output/new_rgen/runs/base_cnn_rejection/samples_5min \
   --decode-mode argmax \
+  --reject-all-home
 
 # 4) Evaluate the sampled schedules against the reference
 uv run rgen_schedule eval-population \
-  --samples src/output/new_rgen/runs/base_cnn/samples_5min.npz \
-  --samples-meta src/output/new_rgen/runs/base_cnn/samples_5min_meta.json \
+  --samples src/output/new_rgen/runs/base_cnn_rejection/samples_5min.npz \
+  --samples-meta src/output/new_rgen/runs/base_cnn_rejection/samples_5min_meta.json \
   --reference src/output/new_rgen/full_train_5min.npz \
-  --out-json src/output/new_rgen/runs/base_cnn/eval_report.json
+  --out-json src/output/new_rgen/runs/base_cnn_rejection/eval_report.json
 
 # 5) Generate diagnostic plots of the learned unaries
 uv run rgen_schedule viz-population \
-  --samples src/output/new_rgen/runs/base_cnn/samples_5min.npz \
-  --samples-meta src/output/new_rgen/runs/base_cnn/samples_5min_meta.json \
+  --samples src/output/new_rgen/runs/base_cnn_rejection/samples_5min.npz \
+  --samples-meta src/output/new_rgen/runs/base_cnn_rejection/samples_5min_meta.json \
   --reference src/output/new_rgen/full_train_5min.npz \
-  --outdir src/output/new_rgen/runs/base_cnn/plots
+  --outdir src/output/new_rgen/runs/base_cnn_rejection/plots
 # End of script
