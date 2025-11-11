@@ -55,8 +55,17 @@ def crf_decode_batch(logits_batch, crf_model, enforce_nonhome):
         return crf_model.decode(logits_batch, enforce_nonhome=enforce_nonhome)
 
 
-def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons,
-           decode_mode="argmax", crf_path=None, enforce_nonhome=False):
+def sample(
+    ckpt_path,
+    num_samples,
+    outprefix,
+    seed,
+    csv_max_persons,
+    decode_mode="argmax",
+    crf_path=None,
+    enforce_nonhome=False,
+    reject_all_home: bool = False,
+):
     """
     Generate a synthetic population from a trained checkpoint and save:
     - <prefix>.npz              : machine artifact with generated_labels and mean logits
@@ -76,6 +85,7 @@ def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons,
     num_time_bins = meta["L"]
     latent_dim = cfg["model"]["z_dim"]
     P = len(purpose_map)
+    home_idx = purpose_map.get("Home", None)
 
     # Init model
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -90,8 +100,10 @@ def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons,
             raise ValueError("decode_mode='crf' requires crf_path")
         from ananke_abm.models.gen_schedule.models.crf.model import TransitionCRF
         crf_ckpt = torch.load(crf_path, map_location="cpu")
-        home_idx = crf_ckpt.get("home_idx", None)
-        crf_model = TransitionCRF(num_purposes=P, home_idx=home_idx).to(device)
+        crf_home_idx = crf_ckpt.get("home_idx", None)
+        assert crf_home_idx == home_idx, \
+            f"CRF home_idx {crf_home_idx} does not match VAE home_idx {home_idx}"
+        crf_model = TransitionCRF(num_purposes=P, home_idx=crf_home_idx).to(device)
         crf_model.load_state_dict(crf_ckpt["A_state_dict"])
         crf_model.eval()
         for p in crf_model.parameters():
@@ -107,7 +119,6 @@ def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons,
     all_generated_batches = []
 
     # running stats for logits across *individuals*
-    # We'll keep mean and M2 (for variance) over the population for each (t,p)
     U_running_mean_flat = None          # shape (T*P,) float64
     U_running_M2_flat = None            # shape (T*P,) float64
     U_running_count = 0                 # scalar: how many individuals we've seen
@@ -142,11 +153,12 @@ def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons,
                 delta2 = x - U_running_mean_flat
                 U_running_M2_flat = U_running_M2_flat + delta * delta2
 
+    # --------- MAIN SAMPLING LOOP (with rejection) ---------
     with torch.no_grad():
-        remaining = num_samples
+        remaining = num_samples   ### we track how many accepted samples we still need
+
         while remaining > 0:
-            current_bs = min(batch_size_generate, remaining)
-            remaining -= current_bs
+            current_bs = batch_size_generate
 
             # sample latent
             Z = torch.randn(current_bs, latent_dim, device=device, dtype=model_dtype)
@@ -158,27 +170,58 @@ def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons,
             if decode_mode == "argmax":
                 y_labels = torch.argmax(U_logits, dim=-1)  # (B, num_time_bins)
             elif decode_mode == "crf":
-                y_labels = crf_decode_batch(U_logits, crf_model, enforce_nonhome=enforce_nonhome)  # (B, num_time_bins)
+                y_labels = crf_decode_batch(
+                    U_logits, crf_model, enforce_nonhome=enforce_nonhome
+                )  # (B, num_time_bins)
             else:
                 raise ValueError(f"Unknown decode_mode: {decode_mode}")
 
+            # --------- NEW: rejection of "all-Home" days ----------
+            if reject_all_home and home_idx is not None:
+                # keep any person for whom at least one bin != Home
+                # y_labels: (B, T)
+                keep_mask = (y_labels != home_idx).any(dim=1)  # (B,)
+            else:
+                keep_mask = torch.ones(
+                    y_labels.size(0), dtype=torch.bool, device=y_labels.device
+                )
+
+            keep_indices = torch.nonzero(keep_mask, as_tuple=False).squeeze(1)
+            keep_count = int(keep_indices.numel())
+
+            if keep_count == 0:
+                # nothing accepted in this batch, try again
+                continue
+
+            # If we only need 'remaining' more samples, cap to that
+            if keep_count > remaining:
+                keep_indices = keep_indices[:remaining]
+                keep_count = remaining
+
+            # Subselect accepted individuals
+            y_keep = y_labels[keep_indices]        # (keep_count, T)
+            U_keep = U_logits[keep_indices]        # (keep_count, T, P)
+            Z_keep = Z[keep_indices]               # (keep_count, latent_dim)
+
             all_generated_batches.append(
-                y_labels.cpu().numpy().astype(np.int64)
+                y_keep.cpu().numpy().astype(np.int64)
             )
 
-            # update logits running stats (convert to float64 on CPU)
-            update_running_stats_batch(U_logits.cpu().to(torch.float64))
+            # update logits running stats on accepted subset
+            update_running_stats_batch(U_keep.cpu().to(torch.float64))
 
-            # accumulate latent stats
-            latent_sum += Z.sum(dim=0).cpu().to(torch.float64)
-            latent_sq_sum += (Z ** 2).sum(dim=0).cpu().to(torch.float64)
-            latent_total_count += current_bs
+            # accumulate latent stats on accepted subset
+            latent_sum += Z_keep.sum(dim=0).cpu().to(torch.float64)
+            latent_sq_sum += (Z_keep ** 2).sum(dim=0).cpu().to(torch.float64)
+            latent_total_count += keep_count
 
-        # stack all generated label sequences
-        generated_labels = np.concatenate(all_generated_batches, axis=0)  # (num_samples, num_time_bins)
+            remaining -= keep_count
+
+        # stack all generated label sequences, should be exactly num_samples
+        generated_labels = np.concatenate(all_generated_batches, axis=0)  # (>=num_samples, T)
+        generated_labels = generated_labels[:num_samples]  # just in case
 
         # finalize logits stats
-        # reshape running mean / var back to (T,P)
         if U_running_count > 0:
             U_mean_logits = U_running_mean_flat.reshape(num_time_bins, P)  # (T,P)
             if U_running_count > 1:
@@ -199,13 +242,7 @@ def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons,
     latent_std = np.sqrt(np.maximum(latent_var, 1e-12))
     Z_stats = np.stack([latent_mean, latent_std], axis=0).astype(np.float32)  # (2, latent_dim)
 
-    # summarize latent sampling stats
-    latent_mean = (latent_sum / max(1, latent_total_count)).numpy()
-    latent_var = (latent_sq_sum / max(1, latent_total_count)).numpy() - latent_mean**2
-    latent_std = np.sqrt(np.maximum(latent_var, 1e-12))
-    Z_stats = np.stack([latent_mean, latent_std], axis=0)  # (2, latent_dim)
-
-   
+    # --------- preview CSV, npz, meta ---------
     preview_rows = []
     preview_count = min(csv_max_persons, generated_labels.shape[0])
     for i in range(preview_count):
@@ -256,6 +293,7 @@ def sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons,
         "decode_mode": decode_mode,
         "crf_path": crf_path,
         "pds_method": cfg["model"].get("method", "auto_pds"),
+        "reject_all_home": bool(reject_all_home),
     }
     with open(meta_json_path, "w", encoding="utf-8") as f_meta:
         json.dump(meta_out, f_meta, indent=2)

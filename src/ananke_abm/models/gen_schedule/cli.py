@@ -50,9 +50,11 @@ def fit(config, output_dir, seed):
               help="Path to trained CRF model checkpoint (required if decode-mode is 'crf').")
 @click.option("--enforce-nonhome", is_flag=True, default=False, show_default=True,
               help="If set with decode-mode 'crf', ensures at least one non-Home activity in each schedule.")
-def sample_population(ckpt_path, num_samples, outprefix, seed, csv_max_persons, decode_mode, crf_path, enforce_nonhome):
+@click.option("--reject-all-home", is_flag=True, default=False, show_default=True,
+                help="If set, uses rejection sampling to ensure no all-Home schedules are generated.")
+def sample_population(ckpt_path, num_samples, outprefix, seed, csv_max_persons, decode_mode, crf_path, enforce_nonhome, reject_all_home):
     from ananke_abm.models.gen_schedule.pipeline.sample import sample
-    sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons, decode_mode, crf_path, enforce_nonhome)
+    sample(ckpt_path, num_samples, outprefix, seed, csv_max_persons, decode_mode, crf_path, enforce_nonhome, reject_all_home)
     click.echo(f"Sampled {num_samples} individuals to {outprefix}.npz and related files.")
 
 
