@@ -293,27 +293,16 @@ def metric_raw_home_patterns(ref: Dict, models: List[Dict], outdir: str):
     if "Home" in purpose_map:
         home_idx = int(purpose_map["Home"])
     else:
-        first_col = Y_ref[:, 0]
-        vals, counts = np.unique(first_col, return_counts=True)
-        home_idx = int(vals[np.argmax(counts)])
+        raise ValueError(
+            "'Home' not found in ref purpose_map; cannot determine home index."
+        )
 
     def _compute_for_dataset(name: str, Y: np.ndarray) -> Dict[str, float]:
         N, T_local = Y.shape
         if N == 0 or T_local == 0:
-            return {
-                "model": name,
-                "N_persons": int(N),
-                "start_home_count": 0,
-                "start_home_pct": 0.0,
-                "end_home_count": 0,
-                "end_home_pct": 0.0,
-                "home_bound_count": 0,
-                "home_bound_pct": 0.0,
-                "non_home_bound_count": 0,
-                "non_home_bound_pct": 0.0,
-                "home_all_day_count": 0,
-                "home_all_day_pct": 0.0,
-            }
+            raise ValueError(
+                f"Dataset {name} has no persons or zero-length schedules."
+            )
 
         start_home = (Y[:, 0] == home_idx)
         end_home = (Y[:, -1] == home_idx)
