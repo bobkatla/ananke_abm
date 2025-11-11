@@ -3,16 +3,16 @@ data:
   split_pt: src/output/new_rgen/train_5min_splits.pt
 train:
   epochs: 500
-  min_epochs: 1000
-  patience: 1000
+  min_epochs: 500
+  patience: 0
   batch_size: 1024
   lr: 0.001
   weight_decay: 0.0001
-  grad_clip: 1.0
-  beta_target: 1.0
-  beta_warm_frac: 0.3
-  lambda_tv: 0.01
-  lambda_home: 0.1
+  grad_clip: 5.0
+  beta_target: 2.0
+  beta_warm_frac: 0.1
+  lambda_tv: 0.02
+  lambda_home: 0.2
   # population calibration losses
   lambda_tod: 0.3
   lambda_presence: 0.3
