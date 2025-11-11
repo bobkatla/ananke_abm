@@ -1,6 +1,57 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+
+class ResidualConvBlock1D(nn.Module):
+    """
+    Residual 1D conv block:
+      in:  (B, C_in, T)
+      out: (B, C_out, T)
+
+    Block:
+      x -> Conv1d -> BN -> ReLU -> Dropout
+         -> Conv1d -> BN
+      out = ReLU(h + skip)
+      where skip is either identity (if C_in == C_out) or 1x1 conv.
+    """
+
+    def __init__(self, in_ch, out_ch, kernel_size, dropout):
+        super().__init__()
+        padding = kernel_size // 2
+
+        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, padding=padding)
+        self.bn1 = nn.BatchNorm1d(out_ch)
+
+        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size=kernel_size, padding=padding)
+        self.bn2 = nn.BatchNorm1d(out_ch)
+
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(dropout)
+
+        # projection for skip if channel dims differ
+        if in_ch != out_ch:
+            self.skip_proj = nn.Conv1d(in_ch, out_ch, kernel_size=1)
+        else:
+            self.skip_proj = None
+
+    def forward(self, x):
+        # x: (B, C_in, T)
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.skip_proj is not None:
+            residual = self.skip_proj(residual)
+
+        out = out + residual
+        out = self.relu(out)
+        return out
 
 
 def reparameterize(mu, logvar):
@@ -39,10 +90,11 @@ class ScheduleEncoderCNN(nn.Module):
         in_ch = emb_dim
         for ch in cnn_channels:
             convs.append(
-                nn.Sequential(
-                    nn.Conv1d(in_ch, ch, kernel_size=cnn_kernel, padding=cnn_kernel // 2),
-                    nn.ReLU(inplace=True),
-                    nn.Dropout(cnn_dropout),
+                ResidualConvBlock1D(
+                    in_ch=in_ch,
+                    out_ch=ch,
+                    kernel_size=cnn_kernel,
+                    dropout=cnn_dropout,
                 )
             )
             in_ch = ch
