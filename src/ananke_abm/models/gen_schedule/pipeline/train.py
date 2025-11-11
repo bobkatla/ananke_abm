@@ -17,12 +17,28 @@ from ananke_abm.models.gen_schedule.losses.utils_loss_pds import (
     loss_time_of_day_marginal,
     loss_presence_rate,
 )
+import click
+import time
 
+def print_out_params(config):
+    click.echo("Data sources:")
+    for k, v in config["data"].items():
+        click.echo(f"  {k}: {v}")
+    click.echo("Model parameters:")
+    for k, v in config["model"].items():
+        click.echo(f"  {k}: {v}")
+    click.echo("Training parameters:")
+    for k, v in config["train"].items():
+        click.echo(f"  {k}: {v}")
         
 def train(config, output_dir, seed):
     cfg = load_config(config)
     set_seed(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    click.echo(f"Using device: {device}")
+    print_out_params(cfg)
+    click.echo(f"Output directory: {output_dir}")
 
     outdir = output_dir
     ensure_dir(outdir)
@@ -37,10 +53,10 @@ def train(config, output_dir, seed):
     purpose_map = meta["purpose_map"]                  # {purpose_name: index}
     home_idx = purpose_map.get("Home", None)
     if home_idx is None:
-        # fallback: most common first label in dataset
-        tmp_ref = np.load(data_npz_path)["Y"].astype(np.int64)
-        vals, counts = np.unique(tmp_ref[:, 0], return_counts=True)
-        home_idx = int(vals[np.argmax(counts)])
+        raise ValueError("Purpose map must contain 'Home' purpose for home loss computation.")
+    
+    # Begin count time
+    start_time = time.time()
 
     splits_path = cfg["data"]["split_pt"]
     split_obj = torch.load(splits_path, weights_only=False)
@@ -265,6 +281,10 @@ def train(config, output_dir, seed):
             "num_val_batches": num_val_batches,
         }
         store_logs.append(log_record)
+    
+    end_time = time.time()
+    total_time = end_time - start_time
+    click.echo(f"Training completed in {total_time:.2f} seconds.")
     
     log_df = pd.DataFrame(store_logs)
     log_df.to_csv(os.path.join(outdir, "training_log.csv"), index=False)

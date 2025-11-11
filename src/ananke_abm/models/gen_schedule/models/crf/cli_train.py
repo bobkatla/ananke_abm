@@ -6,6 +6,7 @@ import torch
 import numpy as np
 from torch.utils.data import TensorDataset, DataLoader
 from torch import optim
+import time
 
 from ananke_abm.models.gen_schedule.models.crf.model import TransitionCRF
 
@@ -60,6 +61,9 @@ def train_crf_cmd(cfg_path):
     best_val = None
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
+    
+    start_time = time.time()
+
     for epoch in range(1, num_epochs + 1):
         crf.train()
         train_losses = []
@@ -103,4 +107,7 @@ def train_crf_cmd(cfg_path):
                 save_path
             )
 
+    end_time = time.time()
+    total_time = end_time - start_time
+    click.echo(f"Training CRF completed in {total_time:.2f} seconds.")
     click.echo(f"Saved best CRF to {save_path} with val_nll={best_val:.4f}")

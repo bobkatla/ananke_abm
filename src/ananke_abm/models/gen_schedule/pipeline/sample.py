@@ -5,6 +5,8 @@ import numpy as np
 import torch
 from ananke_abm.models.gen_schedule.utils.seed import set_seed
 from ananke_abm.models.gen_schedule.models.factory import build_model
+import time
+import click
 
 
  # -------------- CSV preview reconstruction --------------
@@ -88,10 +90,12 @@ def sample(
     home_idx = purpose_map.get("Home", None)
 
     # Init model
+    start_time = time.time()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = build_model(cfg, meta).to(device)
     model.load_state_dict(ckpt_obj["model"])
     model.eval()
+    click.echo(f"[sample:{decode_mode}] Loaded model from {ckpt_path}, using {device}.")
 
     # Optional CRF model (only if decode_mode == "crf")
     crf_model = None
@@ -241,6 +245,9 @@ def sample(
     latent_var = (latent_sq_sum / max(1, latent_total_count)).numpy() - latent_mean ** 2
     latent_std = np.sqrt(np.maximum(latent_var, 1e-12))
     Z_stats = np.stack([latent_mean, latent_std], axis=0).astype(np.float32)  # (2, latent_dim)
+    end_time = time.time()
+    total_time = end_time - start_time
+    click.echo(f"[sample:{decode_mode}] Sampling completed in {total_time:.2f} seconds.")
 
     # --------- preview CSV, npz, meta ---------
     preview_rows = []
