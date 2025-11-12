@@ -75,15 +75,16 @@ def _hist_prob(values: List[int], bin_edges: np.ndarray) -> np.ndarray:
 
 # -------- metric entry point --------
 
-def metric_duration_jsd_ngram(ref: Dict, models: List[Dict], outdir: str, n: int = 1,
-                              max_minutes: int = 1440, bin_width: int = 10):
+def metric_duration_jsd_ngram_specific(ref: Dict, models: List[Dict], outdir: str, n: int = 1,
+                              max_minutes: int = 1440, bin_width: int = 5, output_details: bool = False):
     """
     Duration JSD for n-grams (n=1..4).
     n=1 -> per-activity duration distributions from contiguous runs.
     n>=2 -> ordered segment n-grams; duration = sum of the n segment lengths (minutes).
+
     Writes:
-      duration_jsd_n{n}.csv: model, key, count_ref, count_model, jsd
-    Note: keys are ints for n=1 and tuples for n>=2; counts are sample counts used to form histograms.
+      duration_jsd_macro_n{n}.csv: model, macro_jsd, weighted_jsd, K_keys
+      duration_jsd_n{n}.csv      : model, key, count_ref, count_model, jsd   (ONLY for n==1)
     """
     ensure_dir(outdir)
 
@@ -93,64 +94,122 @@ def metric_duration_jsd_ngram(ref: Dict, models: List[Dict], outdir: str, n: int
 
     segs_ref = _segments_from_Y(Y_ref)
     if n == 1:
-        dur_ref = _collect_durations_activity(segs_ref, P, grid_min)               # dict p -> [mins]
+        dur_ref = _collect_durations_activity(segs_ref, P, grid_min)      # p -> [mins]
         keys_ref = sorted(dur_ref.keys())
     else:
-        dur_ref = _collect_durations_ngram_segments(segs_ref, n, grid_min)         # dict (p1..pn) -> [mins]
+        dur_ref = _collect_durations_ngram_segments(segs_ref, n, grid_min)  # (p1..pn) -> [mins]
         keys_ref = sorted(dur_ref.keys())
 
     # fixed duration bins
     bin_edges = np.arange(0, max_minutes + bin_width, bin_width, dtype=np.float64)
 
-    rows = []
-    # reference self-row (optional summary per key)
-    # We will only write model rows for comparatives + one summary "ref" row per key with jsd=0
+    # ---- per-key reference histograms and counts (for weighting) ----
+    ref_hist = {}
+    ref_counts = {}
     for key in keys_ref:
-        rows.append({
-            "model": "ref",
-            "key": key if isinstance(key, tuple) else int(key),
-            "count_ref": len(dur_ref[key]),
-            "count_model": 0,
-            "jsd": 0.0
-        })
+        vals = dur_ref.get(key, [])
+        ref_hist[key] = _hist_prob(vals, bin_edges)
+        ref_counts[key] = len(vals)
 
+    # ---- macro summary rows (always) ----
+    macro_rows = []
+    # reference summary row
+    K = len(keys_ref)
+    macro_rows.append({"model": "ref", "macro_jsd": 0.0, "weighted_jsd": 0.0, "K_keys": K})
+
+    # optional detailed rows (only for n==1)
+    detail_rows = []
+    if output_details:
+        for key in keys_ref:
+            detail_rows.append({
+                "model": "ref",
+                "key": int(key),
+                "count_ref": ref_counts[key],
+                "count_model": 0,
+                "jsd": 0.0
+            })
+
+    # ---- models ----
     for m in models:
         Y_m = m["Y"]
         segs_m = _segments_from_Y(Y_m)
-
-        if n == 1:
+        if output_details:
             dur_m = _collect_durations_activity(segs_m, P, grid_min)
             all_keys = sorted(set(keys_ref) | set(dur_m.keys()))
         else:
             dur_m = _collect_durations_ngram_segments(segs_m, n, grid_min)
             all_keys = sorted(set(keys_ref) | set(dur_m.keys()))
 
+        jsd_vals = []
+        weights = []
         for key in all_keys:
-            ref_vals = dur_ref.get(key, [])
-            mod_vals = dur_m.get(key, [])
-            p = _hist_prob(ref_vals, bin_edges)
-            q = _hist_prob(mod_vals, bin_edges)
+            p = ref_hist.get(key, np.zeros(len(bin_edges) - 1, dtype=np.float64))
+            q = _hist_prob(dur_m.get(key, []), bin_edges)
             val = jsd(p, q)
-            rows.append({
-                "model": m["name"],
-                "key": key if isinstance(key, tuple) else int(key),
-                "count_ref": len(ref_vals),
-                "count_model": len(mod_vals),
-                "jsd": float(val)
-            })
+            jsd_vals.append(val)
+            # weight by ref sample count for this key (0 if unseen in ref)
+            weights.append(float(ref_counts.get(key, 0)))
 
-    # write CSV
-    path = os.path.join(outdir, f"duration_jsd_n{n}.csv")
-    # normalize key to string for CSV
-    for r in rows:
-        if isinstance(r["key"], tuple):
-            r["key"] = "|".join(str(x) for x in r["key"])
-    fieldnames = ["model", "key", "count_ref", "count_model", "jsd"]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+            if n == 1:
+                detail_rows.append({
+                    "model": m["name"],
+                    "key": int(key),
+                    "count_ref": ref_counts.get(key, 0),
+                    "count_model": len(dur_m.get(key, [])),
+                    "jsd": float(val)
+                })
+
+        # macro = unweighted mean over union keys
+        macro = float(np.mean(jsd_vals)) if jsd_vals else 0.0
+        # weighted by ref counts over keys that appear in ref
+        w = np.asarray(weights, dtype=np.float64)
+        v = np.asarray(jsd_vals, dtype=np.float64)
+        if w.sum() > 0:
+            wmacro = float((w * v).sum() / w.sum())
+        else:
+            wmacro = 0.0
+
+        macro_rows.append({
+            "model": m["name"],
+            "macro_jsd": macro,
+            "weighted_jsd": wmacro,
+            "K_keys": int(len(all_keys))
+        })
+
+    # ---- write macro summary (always) ----
+    macro_path = os.path.join(outdir, f"duration_jsd_macro_n{n}.csv")
+    with open(macro_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["model", "macro_jsd", "weighted_jsd", "K_keys"])
         w.writeheader()
-        for r in rows:
+        for r in macro_rows:
             w.writerow(r)
+
+    # ---- write details (only n==1) ----
+    if output_details:
+        detail_path = os.path.join(outdir, f"duration_jsd_n{n}.csv")
+        with open(detail_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["model", "key", "count_ref", "count_model", "jsd"])
+            w.writeheader()
+            for r in detail_rows:
+                w.writerow(r)
+
+
+def metric_duration_jsd_ngram(ref: Dict, models: List[Dict], outdir: str):
+    """
+    Detailed I want
+    """
+    for n in [1, 2, 3, 4]:
+        metric_duration_jsd_ngram_specific(
+            ref=ref,
+            models=models,
+            outdir=outdir,
+            n=n,
+            max_minutes=1440,
+            bin_width=5,
+            output_details=(n == 1)
+        )
+        
+
 
 # ---------- registry ----------
 DURATION_FUNCS = {
