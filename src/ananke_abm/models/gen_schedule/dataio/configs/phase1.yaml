@@ -8,11 +8,11 @@ train:
   batch_size: 1024
   lr: 0.001
   weight_decay: 0.0001
-  grad_clip: 5.0
-  beta_target: 2.0
-  beta_warm_frac: 0.1
-  lambda_tv: 0.02
-  lambda_home: 0.2
+  grad_clip: 1.0
+  beta_target: 1.0
+  beta_warm_frac: 0.3
+  lambda_tv: 0.01
+  lambda_home: 0.1
 
 model:
   method: "baseline_cnn"
@@ -20,7 +20,7 @@ model:
   emb_dim: 256
   cnn_channels: [64, 64]
   cnn_kernel: 5
-  cnn_dropout: 0.2
+  cnn_dropout: 0.1
 
 # model:
 #   method: "baseline_rnn"
