@@ -1,3 +1,5 @@
+# utils.py  (replace the relevant parts)
+
 import numpy as np
 import os
 import json
@@ -24,13 +26,17 @@ def _load_one_npz_with_meta(npz_path: str, meta_path: str, name: str) -> Dict:
     purpose_map = meta["purpose_map"]
     grid_min = meta.get("grid_min", None)
     horizon_min = meta.get("horizon_min", None)
+    # Prefer explicit L from meta, otherwise infer from Y
+    T_meta = meta.get("L", None)
+    T = int(T_meta) if T_meta is not None else int(Y.shape[1])
 
     return {
         "name": name,
-        "Y": Y,                       # (N,T)
-        "purpose_map": purpose_map,   # {name: idx}
-        "grid_min": grid_min,
-        "horizon_min": horizon_min,
+        "Y": Y,                         # (N, T)
+        "purpose_map": purpose_map,     # {name: idx}
+        "grid_min": grid_min,           # may be None
+        "horizon_min": horizon_min,     # may be None
+        "T": T,
     }
 
 
@@ -93,6 +99,45 @@ def load_comparison_models(compare_dir: str) -> List[Dict]:
 
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
+
+
+# --------------------------------------------------------------------------
+# NEW: enforce same temporal grid between reference and all models
+# --------------------------------------------------------------------------
+
+def assert_same_temporal_grid(ref: Dict, models: List[Dict]) -> None:
+    """
+    Enforce that reference and all synthetic models share the same temporal grid.
+    Checks:
+      - T (number of bins) must match ref["T"]
+      - If grid_min is present for both, they must match
+      - If horizon_min is present for both, they must match
+    Raises AssertionError with a precise message if any mismatch is found.
+    """
+    T_ref = ref["T"]
+    grid_ref = ref.get("grid_min", None)
+    horizon_ref = ref.get("horizon_min", None)
+
+    for m in models:
+        # T must match exactly
+        if m["T"] != T_ref:
+            raise AssertionError(
+                f"Temporal mismatch: ref T={T_ref}, model '{m['name']}' T={m['T']}."
+            )
+
+        # grid_min must match when both are known
+        if (grid_ref is not None) and (m.get("grid_min", None) is not None):
+            if m["grid_min"] != grid_ref:
+                raise AssertionError(
+                    f"grid_min mismatch: ref={grid_ref}, model '{m['name']}'={m['grid_min']}."
+                )
+
+        # horizon_min must match when both are known
+        if (horizon_ref is not None) and (m.get("horizon_min", None) is not None):
+            if m["horizon_min"] != horizon_ref:
+                raise AssertionError(
+                    f"horizon_min mismatch: ref={horizon_ref}, model '{m['name']}'={m['horizon_min']}."
+                )
 
 
 # ---------------------------------------------------------------------

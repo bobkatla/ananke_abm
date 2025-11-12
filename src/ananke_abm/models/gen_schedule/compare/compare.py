@@ -1,5 +1,5 @@
 from ananke_abm.models.gen_schedule.compare.extract_metrics.metrics import METRIC_FUNCS
-from ananke_abm.models.gen_schedule.compare.utils import load_reference, load_comparison_models, ensure_dir
+from ananke_abm.models.gen_schedule.compare.utils import load_reference, load_comparison_models, ensure_dir, assert_same_temporal_grid
 
 import click
 
@@ -31,6 +31,7 @@ def metric_tables_cli(ref_npz, ref_meta, compare_dir, metrics, outdir):
     # load data
     ref = load_reference(ref_npz, ref_meta)
     models = load_comparison_models(compare_dir)
+    assert_same_temporal_grid(ref, models)
 
     # sanity: same T between ref and models
     T_ref = ref["Y"].shape[1]
@@ -60,7 +61,3 @@ def metric_tables_cli(ref_npz, ref_meta, compare_dir, metrics, outdir):
         func = METRIC_FUNCS[mname]
         click.echo(f"[eval-tables] running metric '{mname}' (stub)...")
         func(ref, models, outdir)
-
-
-if __name__ == "__main__":
-    eval_tables_cli()

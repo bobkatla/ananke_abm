@@ -1,159 +1,188 @@
 import os
-import numpy as np
 import csv
+import numpy as np
 from typing import Dict, List, Tuple
-from ananke_abm.models.gen_schedule.losses.jsd import jsd
 from ananke_abm.models.gen_schedule.compare.utils import ensure_dir
+from ananke_abm.models.gen_schedule.losses.jsd import jsd
 
 
-def _extract_ngrams(Y: np.ndarray, n: int) -> List[Tuple[Tuple[int, ...], int]]:
+def _ngram_start_histograms(Y: np.ndarray, n: int) -> Tuple[Dict[Tuple[int, ...], np.ndarray], int]:
     """
-    Extract all overlapping n-grams and their start bin index.
-    Returns list of (ngram_tuple, start_bin)
+    For each n-gram key, build a histogram over *start bins* t=0..T-n
+    counting how often that n-gram starts at t across all sequences.
+
+    Returns:
+      hists: dict key -> np.ndarray shape (Tn,) with start-time counts
+      Tn   : number of valid start positions (T - n + 1)
     """
     N, T = Y.shape
-    res = []
-    for seq in Y:
-        for t in range(T - n + 1):
-            ngram = tuple(seq[t:t+n])
-            res.append((ngram, t))
-    return res
+    if n < 1 or n > T:
+        return {}, max(0, T - n + 1)
+
+    Tn = T - n + 1
+    hists: Dict[Tuple[int, ...], np.ndarray] = {}
+
+    for i in range(N):
+        seq = Y[i]
+        # sliding windows of length n
+        for t in range(Tn):
+            key = tuple(int(x) for x in seq[t:t+n])
+            h = hists.get(key)
+            if h is None:
+                h = np.zeros(Tn, dtype=np.float64)
+                hists[key] = h
+            h[t] += 1.0
+
+    return hists, Tn
 
 
-def _tod_histograms_from_ngrams(ngrams, grid_min, horizon_min, binsize_min=10):
+def _normalize_hist(h: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    s = float(h.sum())
+    if s < eps:
+        return np.zeros_like(h, dtype=np.float64)
+    return (h.astype(np.float64) / s)
+
+
+def _tod_jsd_core(Y_ref: np.ndarray, Y_syn: np.ndarray, n: int) -> Tuple[float, float]:
     """
-    Build normalized histogram per n-gram of start times.
-    Returns dict: {ngram_tuple: (hist, bin_edges)}
+    Compute macro-averaged and reference-weighted JSD between *start-time*
+    distributions of n-grams in ref vs syn.
+
+    Critical: both sides use the same Tn = (T_ref - n + 1) across all models.
     """
-    if not ngrams:
-        return {}
+    # Build reference histograms and fix Tn from REF (authoritative)
+    h_ref, Tn = _ngram_start_histograms(Y_ref, n)
 
-    L = horizon_min // binsize_min
-    hist_dict = {}
-    for ng, t in ngrams:
-        start_min = t * grid_min
-        bucket = int(start_min // binsize_min)
-        if ng not in hist_dict:
-            hist_dict[ng] = np.zeros(L, dtype=np.float64)
-        hist_dict[ng][bucket] += 1
+    # Build synthetic histograms; if a key exists only on one side,
+    # we still include it (the missing side becomes all-zeros over Tn).
+    h_syn, _ = _ngram_start_histograms(Y_syn, n)
 
-    # normalize to probabilities
-    for ng in hist_dict.keys():
-        s = hist_dict[ng].sum()
-        if s > 0:
-            hist_dict[ng] /= s
-    return hist_dict
+    keys = sorted(set(h_ref.keys()) | set(h_syn.keys()))
+    if not keys:
+        return 0.0, 0.0
 
+    # Precompute ref weights (support) for weighted averaging
+    ref_support = {k: float(h_ref.get(k, np.zeros(Tn)).sum()) for k in keys}
+    total_support = sum(ref_support.values())
+    # Avoid zero total support; if zero, fall back to macro
+    use_weights = total_support > 0.0
 
-def _tod_jsd_core(ref_Y: np.ndarray, syn_Y: np.ndarray,
-                  grid_min: int, horizon_min: int,
-                  n: int, outdir: str,
-                  purpose_map: Dict[str, int],
-                  detail: bool = False):
-    """
-    Compute JSD between time-of-day distributions for all n-grams.
-    Returns macro and weighted averages.
-    """
-    ensure_dir(outdir)
-    inv_map = {v: k for k, v in purpose_map.items()}
+    jsd_vals = []
+    weights = []
 
-    # 1. Extract n-grams
-    ref_ngrams = _extract_ngrams(ref_Y, n)
-    syn_ngrams = _extract_ngrams(syn_Y, n)
+    for k in keys:
+        # Get histograms; if missing on a side, use zeros of shape (Tn,)
+        h_r = h_ref.get(k)
+        if h_r is None:
+            h_r = np.zeros(Tn, dtype=np.float64)
+        else:
+            # Guard against shape drift from earlier bugs: coerce to Tn
+            if h_r.shape[0] != Tn:
+                # pad or trim deterministically; but this should not happen after fix
+                tmp = np.zeros(Tn, dtype=np.float64)
+                tmp[:min(Tn, h_r.shape[0])] = h_r[:min(Tn, h_r.shape[0])]
+                h_r = tmp
 
-    # 2. Histograms of start times
-    ref_hist = _tod_histograms_from_ngrams(ref_ngrams, grid_min, horizon_min)
-    syn_hist = _tod_histograms_from_ngrams(syn_ngrams, grid_min, horizon_min)
+        h_s = h_syn.get(k)
+        if h_s is None:
+            h_s = np.zeros(Tn, dtype=np.float64)
+        else:
+            if h_s.shape[0] != Tn:
+                tmp = np.zeros(Tn, dtype=np.float64)
+                tmp[:min(Tn, h_s.shape[0])] = h_s[:min(Tn, h_s.shape[0])]
+                h_s = tmp
 
-    # 3. Collect union of n-grams
-    all_ngrams = set(ref_hist.keys()) | set(syn_hist.keys())
-    jsd_list = []
-    weighted_sum = 0.0
-    total_ref_count = sum(v.sum() for v in ref_hist.values()) + 1e-9
+        p = _normalize_hist(h_r)  # (Tn,)
+        q = _normalize_hist(h_s)  # (Tn,)
 
-    # Optional detailed table for n=1
-    if detail:
-        det_rows = []
+        # Now p and q ALWAYS have the same length (Tn)
+        jsd_val = float(jsd(p, q))
+        jsd_vals.append(jsd_val)
+        weights.append(ref_support[k])
 
-    for ng in all_ngrams:
-        p = ref_hist.get(ng, np.zeros(horizon_min // grid_min, dtype=np.float64))
-        q = syn_hist.get(ng, np.zeros_like(p))
-        val = jsd(p, q)
-        jsd_list.append(val)
+    macro = float(np.mean(jsd_vals)) if jsd_vals else 0.0
+    if use_weights:
+        w = np.array(weights, dtype=np.float64)
+        w /= (w.sum() if w.sum() > 0 else 1.0)
+        weighted = float((w * np.array(jsd_vals, dtype=np.float64)).sum())
+    else:
+        weighted = macro
 
-        w = ref_hist.get(ng, np.zeros_like(p)).sum()
-        weighted_sum += w * val
-
-        if detail:
-            label = "→".join(inv_map[i] for i in ng)
-            ref_count = ref_hist.get(ng, np.zeros_like(p)).sum()
-            syn_count = syn_hist.get(ng, np.zeros_like(p)).sum()
-            ref_mean = float(np.argmax(p) * grid_min) if ref_count > 0 else np.nan
-            syn_mean = float(np.argmax(q) * grid_min) if syn_count > 0 else np.nan
-            det_rows.append({
-                "ngram_label": label,
-                "ref_count": ref_count,
-                "syn_count": syn_count,
-                "jsd": val,
-                "ref_mean_start_min": ref_mean,
-                "syn_mean_start_min": syn_mean,
-            })
-
-    macro_jsd = float(np.mean(jsd_list)) if jsd_list else 0.0
-    weighted_jsd = float(weighted_sum / total_ref_count) if total_ref_count > 0 else 0.0
-
-    if detail:
-        detail_path = os.path.join(outdir, f"tod_jsd_detail_n{n}.csv")
-        with open(detail_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=["ngram_label", "ref_count", "syn_count", "jsd",
-                            "ref_mean_start_min", "syn_mean_start_min"]
-            )
-            writer.writeheader()
-            for row in det_rows:
-                writer.writerow(row)
-
-    return macro_jsd, weighted_jsd
+    return macro, weighted
 
 
 def metric_tod_jsd_ngram(ref: Dict, models: List[Dict], outdir: str):
     """
-    Compute ToD JSD for n=1..4.  Only n=1 produces detail file.
-    Writes one summary CSV for each n.
+    Writes:
+      - tod_jsd_macro.csv        : columns [n, model, tod_jsd_macro]
+      - tod_jsd_weighted.csv     : columns [n, model, tod_jsd_weighted]
+      - tod_jsd_detail_n1.csv    : optional detailed per-activity (n=1) JSD by start bin
+                                   (kept small; higher n omitted due to size)
     """
     ensure_dir(outdir)
-    grid_min = ref["grid_min"]
-    horizon_min = ref["horizon_min"]
-    purpose_map = ref["purpose_map"]
 
-    ref_Y = ref["Y"]
+    Y_ref = ref["Y"]
+    # authoritative T from ref; models have been grid-checked elsewhere
+    T_ref = Y_ref.shape[1]
 
-    for n in [1, 2, 3, 4]:
-        rows = [{"model": "ref", "macro_jsd": 0.0, "weighted_jsd": 0.0}]
+    # n in {1,2,3,4} but do not exceed T_ref
+    ns = [n for n in (1, 2, 3, 4) if n <= T_ref]
+
+    macro_rows = []
+    weighted_rows = []
+
+    for n in ns:
+        # Reference vs each model
         for m in models:
-            macro, weighted = _tod_jsd_core(
-                ref_Y,
-                m["Y"],
-                grid_min,
-                horizon_min,
-                n,
-                outdir,
-                purpose_map,
-                detail=(n == 1)
-            )
-            rows.append({
-                "model": m["name"],
-                "macro_jsd": macro,
-                "weighted_jsd": weighted
-            })
+            name = m["name"]
+            macro, weighted = _tod_jsd_core(Y_ref, m["Y"], n)
+            macro_rows.append({"n": n, "model": name, "tod_jsd_macro": macro})
+            weighted_rows.append({"n": n, "model": name, "tod_jsd_weighted": weighted})
 
-        csv_path = os.path.join(outdir, f"tod_jsd_n{n}.csv")
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["model", "macro_jsd", "weighted_jsd"])
-            writer.writeheader()
-            for r in rows:
-                writer.writerow(r)
+    # Save macro table
+    with open(os.path.join(outdir, "tod_jsd_macro.csv"), "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["n", "model", "tod_jsd_macro"])
+        writer.writeheader()
+        for r in macro_rows:
+            writer.writerow(r)
+
+    # Save weighted table
+    with open(os.path.join(outdir, "tod_jsd_weighted.csv"), "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["n", "model", "tod_jsd_weighted"])
+        writer.writeheader()
+        for r in weighted_rows:
+            writer.writerow(r)
+
+    # Optional detail for n=1 only (kept compact)
+    # We export per-purpose start-time JSD between ref and each model for n=1.
+    # For n=1, keys are single labels (tuples of length 1).
+    n = 1
+    if n <= T_ref:
+        # Build per-key per-time distributions once for ref
+        h_ref, Tn = _ngram_start_histograms(Y_ref, n)
+        # Normalize to distributions
+        p_ref = {k: _normalize_hist(h) for k, h in h_ref.items()}
+
+        # union of keys across all models with ref
+        keys_union = set(p_ref.keys())
+        for m in models:
+            h_syn_m, _ = _ngram_start_histograms(m["Y"], n)
+            keys_union |= set(h_syn_m.keys())
+        keys_sorted = sorted(keys_union)
+
+        # write rows: key (as tuple), model, JSD
+        detail_path = os.path.join(outdir, "tod_jsd_detail_n1.csv")
+        with open(detail_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["key", "model", "jsd"])
+            for m in models:
+                name = m["name"]
+                h_syn_m, _ = _ngram_start_histograms(m["Y"], n)
+                for k in keys_sorted:
+                    pr = p_ref.get(k, np.zeros(Tn, dtype=np.float64))
+                    ps = _normalize_hist(h_syn_m.get(k, np.zeros(Tn, dtype=np.float64)))
+                    # Both pr and ps are length Tn by construction
+                    writer.writerow([str(k), name, float(jsd(pr, ps))])
 
 TOD_FUNCS = {
     "tod_jsd_ngram": metric_tod_jsd_ngram,

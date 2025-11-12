@@ -1,165 +1,156 @@
+# duration_jsd.py
 import os
-import numpy as np
 import csv
+import numpy as np
 from typing import Dict, List, Tuple
 from ananke_abm.models.gen_schedule.losses.jsd import jsd
 from ananke_abm.models.gen_schedule.compare.utils import ensure_dir
 
+# -------- helpers --------
 
-# ---------- helpers ----------
-
-def _extract_segments(Y: np.ndarray, grid_min: int) -> List[Tuple[int, int]]:
+def _segments_from_Y(Y: np.ndarray) -> List[List[Tuple[int, int, int]]]:
     """
-    Extract (purpose, duration_min) for all contiguous segments.
+    Convert each row of Y (T-long labels) into segments:
+      returns per-person list of (label, start_bin, length_bins).
     """
-    N, T = Y.shape
     out = []
-    for seq in Y:
-        curr = seq[0]
-        length = 1
+    for row in Y:
+        segs = []
+        T = row.shape[0]
+        s = 0
+        cur = row[0]
         for t in range(1, T):
-            if seq[t] == curr:
-                length += 1
-            else:
-                out.append((curr, length * grid_min))
-                curr = seq[t]
-                length = 1
-        out.append((curr, length * grid_min))
+            if row[t] != cur:
+                segs.append((int(cur), s, t - s))
+                cur = row[t]
+                s = t
+        segs.append((int(cur), s, T - s))
+        out.append(segs)
     return out
 
-
-def _extract_ngrams_with_duration(Y: np.ndarray, n: int, grid_min: int) -> List[Tuple[Tuple[int, ...], float]]:
+def _collect_durations_activity(segs_all: List[List[Tuple[int, int, int]]], P: int, grid_min: int) -> Dict[int, List[int]]:
     """
-    Extract (ngram_tuple, duration_min) where duration spans n consecutive bins.
-    For n>1, duration = n * grid_min.
+    For n=1: durations per activity from contiguous runs.
+    Returns: dict p -> list of durations in minutes.
     """
-    N, T = Y.shape
-    res = []
-    for seq in Y:
-        for t in range(T - n + 1):
-            ng = tuple(seq[t:t + n])
-            res.append((ng, n * grid_min))
-    return res
+    d = {p: [] for p in range(P)}
+    for segs in segs_all:
+        for p, _, ln in segs:
+            d[p].append(int(ln * grid_min))
+    return d
 
-
-def _duration_histograms(items: List[Tuple[Tuple[int, ...], float]],
-                         horizon_min: int, binsize_min: int = 10):
+def _collect_durations_ngram_segments(
+    segs_all: List[List[Tuple[int, int, int]]],
+    n: int,
+    grid_min: int
+) -> Dict[Tuple[int, ...], List[int]]:
     """
-    items: list of (ngram_tuple, duration_min)
-    Returns: dict {ngram_tuple: hist (normalized), bin_edges}
+    For n>=2: scan OVER SEGMENTS, not bins.
+    Collect total duration (sum over the n matched segment lengths) in minutes
+    for each ordered segment n-gram key = (p1,...,pn).
     """
-    if not items:
-        return {}
-    L = horizon_min // binsize_min + 1
-    hists = {}
-    for ng, dur in items:
-        bucket = int(min(L - 1, dur // binsize_min))
-        if ng not in hists:
-            hists[ng] = np.zeros(L, dtype=np.float64)
-        hists[ng][bucket] += 1
-    for ng in hists:
-        s = hists[ng].sum()
-        if s > 0:
-            hists[ng] /= s
-    return hists
+    d: Dict[Tuple[int, ...], List[int]] = {}
+    for segs in segs_all:
+        S = len(segs)
+        if S < n:
+            continue
+        # slide window over segments
+        for i in range(S - n + 1):
+            key = tuple(segs[i + k][0] for k in range(n))
+            tot_bins = sum(segs[i + k][2] for k in range(n))
+            dur_min = int(tot_bins * grid_min)
+            d.setdefault(key, []).append(dur_min)
+    return d
 
-
-# ---------- main metric ----------
-
-def _duration_jsd_core(ref_Y: np.ndarray, syn_Y: np.ndarray,
-                       grid_min: int, horizon_min: int,
-                       n: int, outdir: str,
-                       purpose_map: Dict[str, int],
-                       detail: bool = False):
-    ensure_dir(outdir)
-    inv_map = {v: k for k, v in purpose_map.items()}
-
-    # 1. Extract n-grams with durations
-    ref_items = _extract_ngrams_with_duration(ref_Y, n, grid_min)
-    syn_items = _extract_ngrams_with_duration(syn_Y, n, grid_min)
-
-    # 2. Build duration histograms
-    ref_hist = _duration_histograms(ref_items, horizon_min)
-    syn_hist = _duration_histograms(syn_items, horizon_min)
-
-    # 3. Compute JSD for each ngram
-    all_ngrams = set(ref_hist.keys()) | set(syn_hist.keys())
-    jsd_list = []
-    weighted_sum = 0.0
-    total_ref_count = sum(v.sum() for v in ref_hist.values()) + 1e-9
-
-    if detail:
-        det_rows = []
-
-    for ng in all_ngrams:
-        p = ref_hist.get(ng, np.zeros(horizon_min // grid_min + 1, dtype=np.float64))
-        q = syn_hist.get(ng, np.zeros_like(p))
-        val = jsd(p, q)
-        jsd_list.append(val)
-        w = ref_hist.get(ng, np.zeros_like(p)).sum()
-        weighted_sum += w * val
-
-        if detail:
-            label = "→".join(inv_map[i] for i in ng)
-            ref_count = ref_hist.get(ng, np.zeros_like(p)).sum()
-            syn_count = syn_hist.get(ng, np.zeros_like(p)).sum()
-            det_rows.append({
-                "ngram_label": label,
-                "ref_count": ref_count,
-                "syn_count": syn_count,
-                "jsd": val
-            })
-
-    macro_jsd = float(np.mean(jsd_list)) if jsd_list else 0.0
-    weighted_jsd = float(weighted_sum / total_ref_count) if total_ref_count > 0 else 0.0
-
-    if detail:
-        detail_path = os.path.join(outdir, f"duration_jsd_detail_n{n}.csv")
-        with open(detail_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["ngram_label", "ref_count", "syn_count", "jsd"])
-            writer.writeheader()
-            for row in det_rows:
-                writer.writerow(row)
-
-    return macro_jsd, weighted_jsd
-
-
-def metric_duration_jsd_ngram(ref: Dict, models: List[Dict], outdir: str):
+def _hist_prob(values: List[int], bin_edges: np.ndarray) -> np.ndarray:
     """
-    Compute Duration JSD for n=1..4.  Only n=1 produces detail file.
+    Turn raw duration samples (minutes) into a probability vector via fixed bins.
+    """
+    if len(values) == 0:
+        return np.zeros(len(bin_edges) - 1, dtype=np.float64)
+    hist, _ = np.histogram(np.asarray(values, dtype=np.float64), bins=bin_edges)
+    hist = hist.astype(np.float64)
+    s = hist.sum()
+    return hist / s if s > 0 else np.zeros_like(hist)
+
+# -------- metric entry point --------
+
+def metric_duration_jsd_ngram(ref: Dict, models: List[Dict], outdir: str, n: int = 1,
+                              max_minutes: int = 1440, bin_width: int = 10):
+    """
+    Duration JSD for n-grams (n=1..4).
+    n=1 -> per-activity duration distributions from contiguous runs.
+    n>=2 -> ordered segment n-grams; duration = sum of the n segment lengths (minutes).
+    Writes:
+      duration_jsd_n{n}.csv: model, key, count_ref, count_model, jsd
+    Note: keys are ints for n=1 and tuples for n>=2; counts are sample counts used to form histograms.
     """
     ensure_dir(outdir)
-    grid_min = ref["grid_min"]
-    horizon_min = ref["horizon_min"]
-    purpose_map = ref["purpose_map"]
-    ref_Y = ref["Y"]
 
-    for n in [1, 2, 3, 4]:
-        rows = [{"model": "ref", "macro_jsd": 0.0, "weighted_jsd": 0.0}]
-        for m in models:
-            macro, weighted = _duration_jsd_core(
-                ref_Y,
-                m["Y"],
-                grid_min,
-                horizon_min,
-                n,
-                outdir,
-                purpose_map,
-                detail=(n == 1)
-            )
+    Y_ref = ref["Y"]
+    grid_min = int(ref["grid_min"])
+    P = len(ref["purpose_map"])
+
+    segs_ref = _segments_from_Y(Y_ref)
+    if n == 1:
+        dur_ref = _collect_durations_activity(segs_ref, P, grid_min)               # dict p -> [mins]
+        keys_ref = sorted(dur_ref.keys())
+    else:
+        dur_ref = _collect_durations_ngram_segments(segs_ref, n, grid_min)         # dict (p1..pn) -> [mins]
+        keys_ref = sorted(dur_ref.keys())
+
+    # fixed duration bins
+    bin_edges = np.arange(0, max_minutes + bin_width, bin_width, dtype=np.float64)
+
+    rows = []
+    # reference self-row (optional summary per key)
+    # We will only write model rows for comparatives + one summary "ref" row per key with jsd=0
+    for key in keys_ref:
+        rows.append({
+            "model": "ref",
+            "key": key if isinstance(key, tuple) else int(key),
+            "count_ref": len(dur_ref[key]),
+            "count_model": 0,
+            "jsd": 0.0
+        })
+
+    for m in models:
+        Y_m = m["Y"]
+        segs_m = _segments_from_Y(Y_m)
+
+        if n == 1:
+            dur_m = _collect_durations_activity(segs_m, P, grid_min)
+            all_keys = sorted(set(keys_ref) | set(dur_m.keys()))
+        else:
+            dur_m = _collect_durations_ngram_segments(segs_m, n, grid_min)
+            all_keys = sorted(set(keys_ref) | set(dur_m.keys()))
+
+        for key in all_keys:
+            ref_vals = dur_ref.get(key, [])
+            mod_vals = dur_m.get(key, [])
+            p = _hist_prob(ref_vals, bin_edges)
+            q = _hist_prob(mod_vals, bin_edges)
+            val = jsd(p, q)
             rows.append({
                 "model": m["name"],
-                "macro_jsd": macro,
-                "weighted_jsd": weighted
+                "key": key if isinstance(key, tuple) else int(key),
+                "count_ref": len(ref_vals),
+                "count_model": len(mod_vals),
+                "jsd": float(val)
             })
 
-        csv_path = os.path.join(outdir, f"duration_jsd_n{n}.csv")
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["model", "macro_jsd", "weighted_jsd"])
-            writer.writeheader()
-            for r in rows:
-                writer.writerow(r)
-
+    # write CSV
+    path = os.path.join(outdir, f"duration_jsd_n{n}.csv")
+    # normalize key to string for CSV
+    for r in rows:
+        if isinstance(r["key"], tuple):
+            r["key"] = "|".join(str(x) for x in r["key"])
+    fieldnames = ["model", "key", "count_ref", "count_model", "jsd"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
 
 # ---------- registry ----------
 DURATION_FUNCS = {
