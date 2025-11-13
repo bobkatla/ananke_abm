@@ -176,8 +176,22 @@ def align_distributions(
     p_syn = np.array([probs_syn.get(k, 0.0) for k in keys], dtype=np.float64)
     return keys, p_ref, p_syn
 
+def compute_srmse_from_probs(p_ref: np.ndarray, p_syn: np.ndarray, eps: float = 1e-12) -> float:
+    """
+    Standardized Root Mean Square Error (SRMSE) as defined in
+    Kim & Bansal (2023), Eq. (13).
+    """
+    if p_ref.size == 0:
+        return 0.0
 
-def compute_srmse_from_probs(
+    Nb = len(p_ref)
+    rmse = np.sqrt(np.sum((p_syn - p_ref) ** 2) / max(Nb, 1))
+    mean_ref = np.sum(p_ref) / max(Nb, 1)
+    if mean_ref < eps:
+        return 0.0
+    return rmse / mean_ref
+
+def compute_basic_srmse_from_probs(
     p_ref: np.ndarray,
     p_syn: np.ndarray,
     eps: float = 1e-12,
