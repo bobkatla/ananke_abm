@@ -19,8 +19,11 @@ def rasterize_person(person_df, purpose_map, grid_min: int, horizon_min: int = 1
       - every activity gets at least one bin,
       - activities appear in the correct order,
       - if multiple short activities would map to the same bin, later ones are pushed
-        to the next free bin (so each gets its own bin).
+        to the next free bin (so each gets its own bin),
+      - home-bound behavior is maintained (sequences end with "Home" activities).
 
+    Post-processing ensures home-bound behavior by shifting non-home segments when needed.
+    
     person_df is assumed to be sorted in activity order (e.g. by stopno).
     """
     L = horizon_min // grid_min
@@ -58,6 +61,77 @@ def rasterize_person(person_df, purpose_map, grid_min: int, horizon_min: int = 1
         arr[a:b] = p_idx
         next_free_bin = b
 
+    # Post-processing: ensure home-bound behavior
+    arr = _ensure_homebound_postprocess(arr, purpose_map)
+    
+    return arr
+
+def _ensure_homebound_postprocess(arr, purpose_map, buffer_size=1):
+    """
+    Post-processing to ensure home-bound behavior by adjusting activities that don't end at home.
+    
+    Algorithm:
+    1. Check if the sequence ends with home
+    2. If not, scan backwards to find consecutive non-home segments from the end
+    3. Find a preceding home segment that's longer than buffer_size
+    4. Shift the non-home segment backwards to create space for home at the end
+    """
+    home_idx = purpose_map.get("Home", 0)
+    L = len(arr)
+    
+    # Check if already ends with home
+    if arr[L-1] == home_idx:
+        return arr
+    
+    # Find the end of the non-home segment (scanning backwards from end)
+    non_home_end = L - 1
+    non_home_start = non_home_end
+    
+    # Scan backwards to find the full consecutive non-home segment
+    while non_home_start >= 0 and arr[non_home_start] != home_idx:
+        non_home_start -= 1
+    
+    # non_home_start now points to the last home bin before the non-home segment
+    # non_home segment is from (non_home_start + 1) to non_home_end (inclusive)
+    
+    if non_home_start < 0:
+        # Edge case: no home activities found before the non-home segment
+        # Force the last buffer_size bins to be home
+        arr[L-buffer_size:] = home_idx
+        return arr
+    
+    # Find the home segment that precedes the non-home segment
+    home_segment_end = non_home_start
+    home_segment_start = home_segment_end
+    
+    # Scan backwards to find the full consecutive home segment
+    while home_segment_start >= 0 and arr[home_segment_start] == home_idx:
+        home_segment_start -= 1
+    
+    home_segment_start += 1  # Adjust to the actual start of home segment
+    home_segment_length = home_segment_end - home_segment_start + 1
+    
+    # Check if home segment is long enough to "borrow" buffer_size bins
+    if home_segment_length > buffer_size:
+        # Shift the non-home segment backwards by buffer_size
+        non_home_length = non_home_end - non_home_start
+        
+        # Copy the non-home segment to its new position
+        new_start = non_home_start + 1 - buffer_size
+        new_end = new_start + non_home_length - 1
+        
+        # Ensure we don't go below index 0
+        if new_start >= 0:
+            arr[new_start:new_end+1] = arr[non_home_start+1:non_home_end+1]
+            # Fill the freed space at the end with home
+            arr[new_end+1:] = home_idx
+        else:
+            # Not enough space to shift, just force the end to be home
+            arr[L-buffer_size:] = home_idx
+    else:
+        # Home segment is too short, just force the end to be home
+        arr[L-buffer_size:] = home_idx
+    
     return arr
 
 def compute_empirical_tod(Y, P):
