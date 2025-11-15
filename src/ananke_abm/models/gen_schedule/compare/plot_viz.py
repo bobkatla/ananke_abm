@@ -13,16 +13,21 @@ import click
               help="Reference grid npz containing Y or Y_generated")
 @click.option("--ref_meta", type=click.Path(exists=True), required=True,
               help="Reference meta json (purpose_map, grid_min, horizon_min)")
+@click.option("--train_npz", type=click.Path(exists=True), required=True,
+              help="Training grid npz containing Y or Y_generated")
+@click.option("--train_meta", type=click.Path(exists=True), required=True,
+              help="Training meta json (purpose_map, grid_min, horizon_min)")
 @click.option("--compare_dir", type=click.Path(exists=True), required=True,
               help="Directory with model .npz and matching meta json")
 @click.option("--outdir", type=click.Path(), required=True,
               help="Output directory to write all metric CSVs (later phases)")
-def plot_overview(ref_npz, ref_meta, compare_dir, outdir):
+def plot_overview(ref_npz, ref_meta, train_npz, train_meta, compare_dir, outdir):
     ensure_dir(outdir)
 
     # load data
     ref = load_reference(ref_npz, ref_meta)
     models = load_comparison_models(compare_dir)
+    train_data = load_reference(train_npz, train_meta)
     assert_same_temporal_grid(ref, models)
 
     # sanity: same T between ref and models
@@ -34,10 +39,21 @@ def plot_overview(ref_npz, ref_meta, compare_dir, outdir):
                 f"Time bins mismatch: ref has T={T_ref}, model {m['name']} has T={T_m}"
             )
     
+    # plot_tod_by_purpose(
+    #     Y_list=[ref["Y"]] + [m["Y"] for m in models],
+    #     dataset_names=["reference"] + [m["name"] for m in models],
+    #     purpose_maps=[ref["purpose_map"]] + [m["purpose_map"] for m in models],
+    #     time_grid=5,
+    #     colors=None,
+    #     start_time_min=0,
+    #     outdir=outdir,
+    #     show=False,
+    # )
+
     plot_tod_by_purpose(
-        Y_list=[ref["Y"]] + [m["Y"] for m in models],
-        dataset_names=["reference"] + [m["name"] for m in models],
-        purpose_maps=[ref["purpose_map"]] + [m["purpose_map"] for m in models],
+        Y_list=[ref["Y"]] + [train_data["Y"]],
+        dataset_names=["reference"] + ["training"],
+        purpose_maps=[ref["purpose_map"]] + [train_data["purpose_map"]],
         time_grid=5,
         colors=None,
         start_time_min=0,
