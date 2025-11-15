@@ -4,6 +4,7 @@ from ananke_abm.models.gen_schedule.models.crf.cli_prepare import prepare_crf_da
 from ananke_abm.models.gen_schedule.models.crf.cli_train import train_crf_cmd
 from ananke_abm.models.gen_schedule.pipeline.comparisons import compare_samples
 from ananke_abm.models.gen_schedule.compare.compare import metric_tables_cli
+from ananke_abm.models.gen_schedule.compare.plot_viz import plot_overview
 
 
 @click.group()
@@ -95,3 +96,4 @@ main.add_command(prepare_crf_data)
 main.add_command(train_crf_cmd)
 main.add_command(compare_samples)
 main.add_command(metric_tables_cli)
+main.add_command(plot_overview)
