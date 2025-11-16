@@ -11,8 +11,8 @@ train:
   grad_clip: 1.0
   beta_target: 1.0
   beta_warm_frac: 0.3
-  lambda_tv: 0.01
-  lambda_home: 0.1
+  lambda_tv: 0
+  lambda_home: 0
 
 model:
   method: "baseline_cnn"
