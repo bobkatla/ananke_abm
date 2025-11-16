@@ -220,7 +220,7 @@ def plot_duration_boxplots(
         ax.set_xticklabels(purpose_names, rotation=45, ha="right")
 
         ax.set_ylabel("Duration (minutes)")
-        ax.set_title("Activity episode durations by purpose")
+        # ax.set_title("Activity episode durations by purpose")
 
         ax.grid(axis="y", alpha=0.3)
 
@@ -282,7 +282,7 @@ def plot_duration_boxplots(
             ax.set_xticklabels(dataset_names, rotation=30, ha="right")
 
             ax.set_ylabel("Duration (minutes)")
-            ax.set_title(f"Activity episode durations – {p_name}")
+            # ax.set_title(f"Activity episode durations – {p_name}")
 
             ax.grid(axis="y", alpha=0.3)
 

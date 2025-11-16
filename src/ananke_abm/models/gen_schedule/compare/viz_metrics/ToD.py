@@ -169,7 +169,7 @@ def plot_tod_by_purpose(
                 **plot_kwargs,
             )
 
-        ax.set_title(f"Time-of-day probability – {p_name}")
+        # ax.set_title(f"Time-of-day probability – {p_name}")
         ax.set_xlabel("Time of day (hours)")
         ax.set_ylabel(f"P(activity = {p_name})")
 
