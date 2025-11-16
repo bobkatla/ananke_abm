@@ -1,7 +1,16 @@
 
-from ananke_abm.models.gen_schedule.compare.utils import load_reference, load_comparison_models, ensure_dir, assert_same_temporal_grid
+from ananke_abm.models.gen_schedule.compare.utils import (
+    load_reference,
+    load_comparison_models,
+    ensure_dir,
+    assert_same_temporal_grid,
+    schedule_counts,
+    ngram_counts,
+)
 from ananke_abm.models.gen_schedule.compare.viz_metrics.ToD import plot_tod_by_purpose
 from ananke_abm.models.gen_schedule.compare.viz_metrics.duration import plot_duration_boxplots
+from ananke_abm.models.gen_schedule.compare.viz_metrics.lorenz import plot_lorenz_for_models
+import numpy as np
 import click
 
 
@@ -34,11 +43,11 @@ def plot_overview(ref_npz, ref_meta, train_npz, train_meta, compare_dir, outdir)
     predefined_colors = {
         "reference": "black",
         "training": "gray",
-        "base_cnn": "blue",
-        "cnn_crf": "orange",
-        "cnn_crf_reject": "green",
-        "cnn_crf_nonhome": "red",
-        "syn_contrnn": "purple",
+        "VAE_CNN": "blue",
+        "VAE_CNN_CRF": "orange",
+        "VAE_CNN_CRF_rejection": "green",
+        "VAE_CNN_CRF_constrained": "red",
+        "ContRNN": "purple",
     }
 
     # sanity: same T between ref and models
@@ -50,9 +59,24 @@ def plot_overview(ref_npz, ref_meta, train_npz, train_meta, compare_dir, outdir)
                 f"Time bins mismatch: ref has T={T_ref}, model {m['name']} has T={T_m}"
             )
         
+    counts_ref = np.array(list(schedule_counts(ref["Y"]).values()), dtype=np.float64)
+    to_plot_models = {"Reference": counts_ref}
+    for m in models:
+        counts_syn = np.array(list(schedule_counts(m["Y"]).values()), dtype=np.float64)
+        to_plot_models[m["name"]] = counts_syn
+
+    plot_lorenz_for_models(
+        model_counts=to_plot_models,
+        title="",
+        output_dir=outdir,
+        show=False,
+        prefix="models_compare",
+        colors=predefined_colors
+    )
+        
     # plot_duration_boxplots(
     #     Y_list=[ref["Y"]] + [m["Y"] for m in models],
-    #     dataset_names=["reference"] + [m["name"] for m in models],
+    #     dataset_names=["Reference"] + [m["name"] for m in models],
     #     purpose_maps=[ref["purpose_map"]] + [m["purpose_map"] for m in models],
     #     colors=[predefined_colors.get("reference", "black")] +
     #            [predefined_colors.get(m["name"], None) for m in models],
@@ -62,20 +86,20 @@ def plot_overview(ref_npz, ref_meta, train_npz, train_meta, compare_dir, outdir)
     #     layout="separate"
     # )
 
-    plot_duration_boxplots(
-        Y_list=[ref["Y"], train_data["Y"]],
-        dataset_names=["Reference", "Sample"],
-        purpose_maps=[ref["purpose_map"], train_data["purpose_map"]],
-        colors=[predefined_colors["reference"], predefined_colors["training"]],
-        output_dir=outdir,
-        show=False,
-        prefix="ref_vs_train",
-        layout="compressed"
-    )
+    # plot_duration_boxplots(
+    #     Y_list=[ref["Y"], train_data["Y"]],
+    #     dataset_names=["Reference", "Sample"],
+    #     purpose_maps=[ref["purpose_map"], train_data["purpose_map"]],
+    #     colors=[predefined_colors["reference"], predefined_colors["training"]],
+    #     output_dir=outdir,
+    #     show=False,
+    #     prefix="ref_vs_train",
+    #     layout="compressed"
+    # )
     
     # plot_tod_by_purpose(
     #     Y_list=[ref["Y"]] + [m["Y"] for m in models],
-    #     dataset_names=["reference"] + [m["name"] for m in models],
+    #     dataset_names=["Reference"] + [m["name"] for m in models],
     #     purpose_maps=[ref["purpose_map"]] + [m["purpose_map"] for m in models],
     #     time_grid=5,
     #     colors=[predefined_colors.get("reference", "black")] +
@@ -86,14 +110,14 @@ def plot_overview(ref_npz, ref_meta, train_npz, train_meta, compare_dir, outdir)
     #     prefix="models_compare"
     # )
 
-    plot_tod_by_purpose(
-        Y_list=[ref["Y"], train_data["Y"]],
-        dataset_names=["Reference", "Sample"],
-        purpose_maps=[ref["purpose_map"], train_data["purpose_map"]],
-        time_grid=5,
-        colors=[predefined_colors["reference"], predefined_colors["training"]],
-        start_time_min=0,
-        outdir=outdir,
-        show=False,
-        prefix="ref_vs_train"
-    )
+    # plot_tod_by_purpose(
+    #     Y_list=[ref["Y"], train_data["Y"]],
+    #     dataset_names=["Reference", "Sample"],
+    #     purpose_maps=[ref["purpose_map"], train_data["purpose_map"]],
+    #     time_grid=5,
+    #     colors=[predefined_colors["reference"], predefined_colors["training"]],
+    #     start_time_min=0,
+    #     outdir=outdir,
+    #     show=False,
+    #     prefix="ref_vs_train"
+    # )
