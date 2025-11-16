@@ -1,6 +1,7 @@
 
 from ananke_abm.models.gen_schedule.compare.utils import load_reference, load_comparison_models, ensure_dir, assert_same_temporal_grid
 from ananke_abm.models.gen_schedule.compare.viz_metrics.ToD import plot_tod_by_purpose
+from ananke_abm.models.gen_schedule.compare.viz_metrics.duration import plot_duration_boxplots
 import click
 
 
@@ -48,28 +49,51 @@ def plot_overview(ref_npz, ref_meta, train_npz, train_meta, compare_dir, outdir)
             raise AssertionError(
                 f"Time bins mismatch: ref has T={T_ref}, model {m['name']} has T={T_m}"
             )
-    
-    plot_tod_by_purpose(
-        Y_list=[ref["Y"]] + [m["Y"] for m in models],
-        dataset_names=["reference"] + [m["name"] for m in models],
-        purpose_maps=[ref["purpose_map"]] + [m["purpose_map"] for m in models],
-        time_grid=5,
-        colors=[predefined_colors.get("reference", "black")] +
-               [predefined_colors.get(m["name"], None) for m in models],
-        start_time_min=0,
-        outdir=outdir,
-        show=False,
-        prefix="models_compare"
-    )
+        
+    # plot_duration_boxplots(
+    #     Y_list=[ref["Y"]] + [m["Y"] for m in models],
+    #     dataset_names=["reference"] + [m["name"] for m in models],
+    #     purpose_maps=[ref["purpose_map"]] + [m["purpose_map"] for m in models],
+    #     colors=[predefined_colors.get("reference", "black")] +
+    #            [predefined_colors.get(m["name"], None) for m in models],
+    #     output_dir=outdir,
+    #     show=False,
+    #     prefix="models_compare",
+    #     layout="separate"
+    # )
 
-    plot_tod_by_purpose(
+    plot_duration_boxplots(
         Y_list=[ref["Y"], train_data["Y"]],
         dataset_names=["reference", "training"],
         purpose_maps=[ref["purpose_map"], train_data["purpose_map"]],
-        time_grid=5,
         colors=[predefined_colors["reference"], predefined_colors["training"]],
-        start_time_min=0,
-        outdir=outdir,
+        output_dir=outdir,
         show=False,
-        prefix="ref_vs_train"
+        prefix="ref_vs_train",
+        layout="compressed"
     )
+    
+    # plot_tod_by_purpose(
+    #     Y_list=[ref["Y"]] + [m["Y"] for m in models],
+    #     dataset_names=["reference"] + [m["name"] for m in models],
+    #     purpose_maps=[ref["purpose_map"]] + [m["purpose_map"] for m in models],
+    #     time_grid=5,
+    #     colors=[predefined_colors.get("reference", "black")] +
+    #            [predefined_colors.get(m["name"], None) for m in models],
+    #     start_time_min=0,
+    #     outdir=outdir,
+    #     show=False,
+    #     prefix="models_compare"
+    # )
+
+    # plot_tod_by_purpose(
+    #     Y_list=[ref["Y"], train_data["Y"]],
+    #     dataset_names=["reference", "training"],
+    #     purpose_maps=[ref["purpose_map"], train_data["purpose_map"]],
+    #     time_grid=5,
+    #     colors=[predefined_colors["reference"], predefined_colors["training"]],
+    #     start_time_min=0,
+    #     outdir=outdir,
+    #     show=False,
+    #     prefix="ref_vs_train"
+    # )
