@@ -64,7 +64,7 @@ def plot_overview(ref_npz, ref_meta, train_npz, train_meta, compare_dir, outdir)
 
     plot_duration_boxplots(
         Y_list=[ref["Y"], train_data["Y"]],
-        dataset_names=["reference", "training"],
+        dataset_names=["Reference", "Sample"],
         purpose_maps=[ref["purpose_map"], train_data["purpose_map"]],
         colors=[predefined_colors["reference"], predefined_colors["training"]],
         output_dir=outdir,
@@ -86,14 +86,14 @@ def plot_overview(ref_npz, ref_meta, train_npz, train_meta, compare_dir, outdir)
     #     prefix="models_compare"
     # )
 
-    # plot_tod_by_purpose(
-    #     Y_list=[ref["Y"], train_data["Y"]],
-    #     dataset_names=["reference", "training"],
-    #     purpose_maps=[ref["purpose_map"], train_data["purpose_map"]],
-    #     time_grid=5,
-    #     colors=[predefined_colors["reference"], predefined_colors["training"]],
-    #     start_time_min=0,
-    #     outdir=outdir,
-    #     show=False,
-    #     prefix="ref_vs_train"
-    # )
+    plot_tod_by_purpose(
+        Y_list=[ref["Y"], train_data["Y"]],
+        dataset_names=["Reference", "Sample"],
+        purpose_maps=[ref["purpose_map"], train_data["purpose_map"]],
+        time_grid=5,
+        colors=[predefined_colors["reference"], predefined_colors["training"]],
+        start_time_min=0,
+        outdir=outdir,
+        show=False,
+        prefix="ref_vs_train"
+    )
