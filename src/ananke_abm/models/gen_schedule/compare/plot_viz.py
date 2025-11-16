@@ -30,6 +30,16 @@ def plot_overview(ref_npz, ref_meta, train_npz, train_meta, compare_dir, outdir)
     train_data = load_reference(train_npz, train_meta)
     assert_same_temporal_grid(ref, models)
 
+    predefined_colors = {
+        "reference": "black",
+        "training": "gray",
+        "base_cnn": "blue",
+        "cnn_crf": "orange",
+        "cnn_crf_reject": "green",
+        "cnn_crf_nonhome": "red",
+        "syn_contrnn": "purple",
+    }
+
     # sanity: same T between ref and models
     T_ref = ref["Y"].shape[1]
     for m in models:
@@ -39,24 +49,27 @@ def plot_overview(ref_npz, ref_meta, train_npz, train_meta, compare_dir, outdir)
                 f"Time bins mismatch: ref has T={T_ref}, model {m['name']} has T={T_m}"
             )
     
-    # plot_tod_by_purpose(
-    #     Y_list=[ref["Y"]] + [m["Y"] for m in models],
-    #     dataset_names=["reference"] + [m["name"] for m in models],
-    #     purpose_maps=[ref["purpose_map"]] + [m["purpose_map"] for m in models],
-    #     time_grid=5,
-    #     colors=None,
-    #     start_time_min=0,
-    #     outdir=outdir,
-    #     show=False,
-    # )
-
     plot_tod_by_purpose(
-        Y_list=[ref["Y"]] + [train_data["Y"]],
-        dataset_names=["reference"] + ["training"],
-        purpose_maps=[ref["purpose_map"]] + [train_data["purpose_map"]],
+        Y_list=[ref["Y"]] + [m["Y"] for m in models],
+        dataset_names=["reference"] + [m["name"] for m in models],
+        purpose_maps=[ref["purpose_map"]] + [m["purpose_map"] for m in models],
         time_grid=5,
-        colors=None,
+        colors=[predefined_colors.get("reference", "black")] +
+               [predefined_colors.get(m["name"], None) for m in models],
         start_time_min=0,
         outdir=outdir,
         show=False,
+        prefix="models_compare"
+    )
+
+    plot_tod_by_purpose(
+        Y_list=[ref["Y"], train_data["Y"]],
+        dataset_names=["reference", "training"],
+        purpose_maps=[ref["purpose_map"], train_data["purpose_map"]],
+        time_grid=5,
+        colors=[predefined_colors["reference"], predefined_colors["training"]],
+        start_time_min=0,
+        outdir=outdir,
+        show=False,
+        prefix="ref_vs_train"
     )

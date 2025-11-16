@@ -40,11 +40,14 @@ def plot_tod_by_purpose(
     start_time_min: int = 0,
     outdir: Optional[str] = None,
     show: bool = False,
+    prefix: str = ""
 ):
     """
     Plot time-of-day probability curves for each purpose.
 
     One figure per purpose. Within each figure, one line per dataset.
+    Grayscale-friendly: all lines are designed to be distinguishable by
+    marker shape and line style, not just color.
 
     Parameters
     ----------
@@ -57,7 +60,8 @@ def plot_tod_by_purpose(
         Names for each dataset, used in legends. Same length as Y_list.
     colors : list of str, optional
         Optional list of Matplotlib colors for each dataset. If provided,
-        must have same length as Y_list.
+        they are used, but markers/linestyles still ensure grayscale
+        distinguishability. If None, all lines are black.
     time_grid : int, default 5
         Bin size in minutes. Used to map bin index to time in minutes:
         t_min = start_time_min + bin_idx * time_grid.
@@ -123,17 +127,40 @@ def plot_tod_by_purpose(
             )
         tod_list.append(tod)
 
+    # Grayscale-friendly styles: markers + linestyles
+    marker_cycle = ["o", "s", "^", "D", "v", "x", "+", ">", "<", "p"]
+    linestyle_cycle = ["-", "--", "-.", ":"]
+    n_markers = len(marker_cycle)
+    n_linestyles = len(linestyle_cycle)
+
     figs: List[plt.Figure] = []
 
     # Plot one figure per purpose (index order)
     for p_idx, p_name in enumerate(purpose_names):
         fig, ax = plt.subplots()
 
+        # Mark only some points to avoid clutter
+        mark_interval = max(T // 12, 1)  # roughly one marker per hour if grid_min=5
+        markevery = slice(0, None, mark_interval)
+
         for d_idx, (tod_m, ds_name) in enumerate(zip(tod_list, dataset_names)):
             y = tod_m[:, p_idx]
-            plot_kwargs = {}
+
+            # Style selection
+            marker = marker_cycle[d_idx % n_markers]
+            linestyle = linestyle_cycle[(d_idx // n_markers) % n_linestyles]
+
+            plot_kwargs = {
+                "marker": marker,
+                "linestyle": linestyle,
+                "markevery": markevery,
+            }
+
+            # Color handling: default black for all if no colors specified
             if colors is not None:
                 plot_kwargs["color"] = colors[d_idx]
+            else:
+                plot_kwargs["color"] = "black"
 
             ax.plot(
                 t_hours,
@@ -159,10 +186,14 @@ def plot_tod_by_purpose(
         figs.append(fig)
 
     if outdir is not None:
-        for fig in figs:
-            fig.savefig(f"{outdir}/tod_purpose_{fig.axes[0].get_title().replace(' ', '_')}.png")
+        import os
+        os.makedirs(outdir, exist_ok=True)
+        for p_idx, fig in enumerate(figs):
+            p_name = purpose_names[p_idx]
+            safe_p_name = p_name.replace(" ", "_").replace("/", "_")
+            outpath = os.path.join(outdir, f"{prefix}_tod_prob_{safe_p_name}.png")
+            fig.savefig(outpath)
             plt.close(fig)
-
     if show:
         for fig in figs:
             fig.show()
